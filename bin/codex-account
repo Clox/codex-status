@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+config_home=${XDG_CONFIG_HOME:-"$HOME/.config"}
+config_file="$config_home/codex-account-switcher/accounts.conf"
+
+if [[ ! -r $config_file ]]; then
+  printf 'Missing configuration: %s\nRun the repository installer first.\n' "$config_file" >&2
+  exit 78
+fi
+
+# This file is created locally with mode 0600. It must never be committed.
+# shellcheck source=/dev/null
+source "$config_file"
+
+usage() {
+  printf 'Usage: codex-account <1|2|3> [--desktop] [desktop arguments...]\n' >&2
+  exit 64
+}
+
+[[ $# -ge 1 ]] || usage
+account_number=$1
+case "$account_number" in
+  1) account_selector=${ACCOUNT_1:?ACCOUNT_1 is not configured} ;;
+  2) account_selector=${ACCOUNT_2:?ACCOUNT_2 is not configured} ;;
+  3) account_selector=${ACCOUNT_3:?ACCOUNT_3 is not configured} ;;
+  *) usage ;;
+esac
+shift
+
+launch_desktop=false
+if [[ ${1:-} == '--desktop' ]]; then
+  launch_desktop=true
+  shift
+fi
+
+desktop_running() {
+  pgrep -x ChatGPT >/dev/null 2>&1 ||
+    pgrep -f "^${CHATGPT_BINARY_PATTERN}( |$)" >/dev/null 2>&1
+}
+
+if [[ $launch_desktop == true ]] && desktop_running; then
+  notify-send 'Codex-kontobyte' 'Avslutar Codex Desktop innan kontobytet.' 2>/dev/null || true
+  pkill -TERM -x ChatGPT >/dev/null 2>&1 || true
+  if desktop_running; then
+    pkill -TERM -f "^${CHATGPT_BINARY_PATTERN}( |$)" >/dev/null 2>&1 || true
+  fi
+
+  for ((attempt = 0; attempt < 75; attempt++)); do
+    desktop_running || break
+    sleep 0.2
+  done
+
+  if desktop_running; then
+    message='Codex Desktop stängdes inte inom 15 sekunder. Kontobytet avbröts; avsluta appen manuellt och försök igen.'
+    notify-send 'Codex-kontobyte stoppat' "$message" 2>/dev/null || true
+    printf '%s\n' "$message" >&2
+    exit 2
+  fi
+fi
+
+export CODEX_HOME
+export PATH="$NODE_BIN_DIR:${PATH:-/usr/local/bin:/usr/bin:/bin}"
+
+if ! "$CODEX_AUTH_BIN" switch "$account_selector"; then
+  message='codex-auth kunde inte byta konto. Kör codex-auth list i en terminal för detaljer.'
+  notify-send 'Codex-kontobyte misslyckades' "$message" 2>/dev/null || true
+  printf '%s\n' "$message" >&2
+  exit 1
+fi
+
+if [[ $launch_desktop == true ]]; then
+  notify-send 'Codex-konto valt' 'Startar Codex Desktop med det valda kontot.' 2>/dev/null || true
+  exec "$CHATGPT_LAUNCHER" "$@"
+fi
+
+printf 'Konto %s är nu valt. Starta om Codex Desktop eller kör "Developer: Reload Window" i VS Code.\n' "$account_number"

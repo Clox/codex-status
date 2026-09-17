@@ -1,0 +1,103 @@
+#!/usr/bin/env node
+
+const fs = require('fs');
+const path = require('path');
+
+const registryPath = path.join(process.env.CODEX_HOME || path.join(process.env.HOME, '.codex'), 'accounts', 'registry.json');
+const input = fs.readFileSync(0, 'utf8').replace(/\r/g, '');
+const pendingRow = /^(1|2|3)$/.test(process.env.CODEX_PENDING_ROW || '')
+  ? process.env.CODEX_PENDING_ROW
+  : null;
+
+function plain(value) {
+  return value.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '');
+}
+
+function formatRemaining(epochSeconds) {
+  if (!Number.isFinite(epochSeconds)) return '?';
+  const minutes = Math.max(0, Math.ceil((epochSeconds * 1000 - Date.now()) / 60000));
+  const hours = Math.floor(minutes / 60);
+  return `${hours}:${String(minutes % 60).padStart(2, '0')}`;
+}
+
+function accountIdentifiers(account) {
+  return [account.email, account.account_name, account.alias]
+    .filter(value => typeof value === 'string' && value.length > 0)
+    .map(value => value.toLocaleLowerCase('sv-SE'));
+}
+
+let accounts = [];
+try {
+  const registry = JSON.parse(fs.readFileSync(registryPath, 'utf8'));
+  accounts = Array.isArray(registry.accounts)
+    ? registry.accounts
+    : Object.values(registry.accounts || {});
+} catch {
+  process.stdout.write(input);
+  process.exit(0);
+}
+
+const lines = input.split('\n');
+const output = [];
+const header = lines.map(plain).find(line =>
+  line.includes('ACCOUNT') && line.includes('5H USAGE') && line.includes('WEEKLY USAGE')
+);
+
+if (!header) {
+  process.stdout.write(input);
+  process.exit(0);
+}
+
+const columns = {
+  account: header.indexOf('ACCOUNT'),
+  plan: header.indexOf('PLAN'),
+  fiveHour: header.indexOf('5H USAGE'),
+  weekly: header.indexOf('WEEKLY USAGE'),
+  activity: header.indexOf('LAST ACTIVITY'),
+};
+
+function fit(value, width) {
+  if (value.length >= width) return value.slice(0, width);
+  return value.padEnd(width, ' ');
+}
+
+for (const line of lines) {
+  const visible = plain(line);
+  const rowMatch = visible.match(/^\s*\*?\s*0?(\d+)\s+/);
+  if (!rowMatch || Object.values(columns).some(position => position < 0)) {
+    output.push(line);
+    continue;
+  }
+
+  const shown = visible
+    .slice(columns.account, columns.plan)
+    .trim()
+    .toLocaleLowerCase('sv-SE')
+    .replace(/\.+$/, '');
+  const account = accounts.find(candidate =>
+    accountIdentifiers(candidate).some(identifier => identifier === shown || identifier.startsWith(shown))
+  );
+  if (!account) {
+    output.push(line);
+    continue;
+  }
+
+  const usage = account.last_usage || {};
+  const fivePercent = visible.slice(columns.fiveHour, columns.weekly).match(/\d+%/)?.[0] || '?%';
+  const weeklyPercent = visible.slice(columns.weekly, columns.activity).match(/\d+%/)?.[0] || '?%';
+  const fiveHour = `${fivePercent} (${formatRemaining(usage.primary?.resets_at)})`;
+  const weekly = `${weeklyPercent} (${formatRemaining(usage.secondary?.resets_at)})`;
+  const prefix = visible.slice(0, columns.fiveHour);
+  const activity = visible.slice(columns.activity).trimEnd();
+  const active = /^\s*\*/.test(visible);
+  const pending = pendingRow === rowMatch[1];
+  const color = active ? '\x1b[32m' : pending ? '\x1b[33m' : '\x1b[2m';
+  const rendered =
+    prefix +
+    fit(fiveHour, columns.weekly - columns.fiveHour) +
+    fit(weekly, columns.activity - columns.weekly) +
+    activity;
+  output.push(`${color}${rendered}\x1b[0m`);
+}
+
+process.stdout.write(output.join('\n'));

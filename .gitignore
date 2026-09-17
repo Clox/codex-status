@@ -1,0 +1,8 @@
+# Authentication and runtime state must never live beside these templates.
+accounts.conf
+auth.json
+*.auth.json
+registry.json
+*.sqlite
+*.sqlite-*
+rollout-*.jsonl

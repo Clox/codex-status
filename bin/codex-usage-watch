@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+config_home=${XDG_CONFIG_HOME:-"$HOME/.config"}
+config_file="$config_home/codex-account-switcher/accounts.conf"
+if [[ ! -r $config_file ]]; then
+  printf 'Missing configuration: %s\nRun the repository installer first.\n' "$config_file" >&2
+  exit 78
+fi
+# shellcheck source=/dev/null
+source "$config_file"
+
+export CODEX_HOME
+export PATH="$NODE_BIN_DIR:${PATH:-/usr/local/bin:/usr/bin:/bin}"
+printf '\033]0;Codex-kontostatus\007'
+
+saved_stty=''
+cleanup() {
+  if [[ -n $saved_stty ]]; then
+    stty "$saved_stty" </dev/tty 2>/dev/null || true
+    tput smam 2>/dev/null || true
+    tput cnorm 2>/dev/null || true
+    tput rmcup 2>/dev/null || true
+  fi
+}
+
+if [[ -t 0 && -t 1 ]]; then
+  saved_stty=$(stty -g </dev/tty)
+  trap cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+  stty -echo </dev/tty
+  tput smcup
+  tput civis
+fi
+
+pending_row=''
+pending_since=0
+
+draw_frame() {
+  local frame_to_draw=$1
+  tput rmam 2>/dev/null || printf '\033[?7l'
+  tput cup 0 0 2>/dev/null || printf '\033[H'
+  tput ed 2>/dev/null || printf '\033[J'
+  printf '%s\n' "$frame_to_draw"
+  printf '\033[2mTryck 1, 2 eller 3 för att byta konto. Ctrl+C stänger.\033[0m\n'
+  tput ed 2>/dev/null || printf '\033[J'
+  tput smam 2>/dev/null || printf '\033[?7h'
+}
+
+highlight_pending_frame() {
+  local target_row=$1
+  printf '%s\n' "$frame" | awk -v row="$target_row" '
+    BEGIN { escape = sprintf("%c", 27); dim = escape "[2m"; yellow = escape "[33m" }
+    {
+      visible = $0
+      gsub(escape "\\[[0-9;]*m", "", visible)
+      if (visible ~ "^[[:space:]]+0?" row "[[:space:]]" && index($0, dim) == 1) {
+        sub("^" escape "\\[2m", yellow)
+      }
+      print
+    }
+  '
+}
+
+while true; do
+  columns=$(tput cols 2>/dev/null || printf '100')
+  [[ $columns =~ ^[0-9]+$ ]] || columns=100
+
+  if frame=$(
+    script -qefc "stty cols $columns; exec \"$CODEX_AUTH_BIN\" list --skip-api" /dev/null </dev/null |
+      CODEX_PENDING_ROW="$pending_row" "$USAGE_ANNOTATOR"
+  ); then
+    if [[ -n $pending_row && $frame =~ \*[[:space:]]+0?${pending_row}[[:space:]] ]]; then
+      pending_row=''
+      pending_since=0
+    elif [[ -n $pending_row && $((SECONDS - pending_since)) -ge 60 ]]; then
+      pending_row=''
+      pending_since=0
+    fi
+    draw_frame "$frame"
+  fi
+
+  key=''
+  if IFS= read -rsn 1 -t 10 key </dev/tty; then
+    case "$key" in
+      1|2|3)
+        if pgrep -f "^${ACCOUNT_SWITCHER} [123] --desktop( |$)" >/dev/null 2>&1; then
+          notify-send 'Codex-kontobyte pågår' 'Vänta tills det pågående kontobytet är klart.' 2>/dev/null || true
+        else
+          pending_row=$key
+          pending_since=$SECONDS
+          frame=$(highlight_pending_frame "$key")
+          draw_frame "$frame"
+          gtk-launch "codex-account${key}.desktop" >/dev/null 2>&1 &
+        fi
+        ;;
+    esac
+  fi
+done
