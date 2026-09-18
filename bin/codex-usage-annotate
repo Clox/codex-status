@@ -38,15 +38,17 @@ try {
 }
 
 const lines = input.split('\n');
-const output = [];
-const header = lines.map(plain).find(line =>
+const visibleLines = lines.map(plain);
+const headerIndex = visibleLines.findIndex(line =>
   line.includes('ACCOUNT') && line.includes('5H USAGE') && line.includes('WEEKLY USAGE')
 );
 
-if (!header) {
+if (headerIndex < 0) {
   process.stdout.write(input);
   process.exit(0);
 }
+
+const header = visibleLines[headerIndex];
 
 const columns = {
   account: header.indexOf('ACCOUNT'),
@@ -61,13 +63,11 @@ function fit(value, width) {
   return value.padEnd(width, ' ');
 }
 
-for (const line of lines) {
-  const visible = plain(line);
+const renderedRows = new Map();
+
+for (const [lineIndex, visible] of visibleLines.entries()) {
   const rowMatch = visible.match(/^\s*\*?\s*0?(\d+)\s+/);
-  if (!rowMatch || Object.values(columns).some(position => position < 0)) {
-    output.push(line);
-    continue;
-  }
+  if (!rowMatch || Object.values(columns).some(position => position < 0)) continue;
 
   const shown = visible
     .slice(columns.account, columns.plan)
@@ -77,27 +77,50 @@ for (const line of lines) {
   const account = accounts.find(candidate =>
     accountIdentifiers(candidate).some(identifier => identifier === shown || identifier.startsWith(shown))
   );
-  if (!account) {
-    output.push(line);
-    continue;
-  }
+  if (!account) continue;
 
   const usage = account.last_usage || {};
   const fivePercent = visible.slice(columns.fiveHour, columns.weekly).match(/\d+%/)?.[0] || '?%';
   const weeklyPercent = visible.slice(columns.weekly, columns.activity).match(/\d+%/)?.[0] || '?%';
   const fiveHour = `${fivePercent} (${formatRemaining(usage.primary?.resets_at)})`;
   const weekly = `${weeklyPercent} (${formatRemaining(usage.secondary?.resets_at)})`;
-  const prefix = visible.slice(0, columns.fiveHour);
-  const activity = visible.slice(columns.activity).trimEnd();
-  const active = /^\s*\*/.test(visible);
-  const pending = pendingRow === rowMatch[1];
-  const color = active ? '\x1b[32m' : pending ? '\x1b[33m' : '\x1b[2m';
-  const rendered =
-    prefix +
-    fit(fiveHour, columns.weekly - columns.fiveHour) +
-    fit(weekly, columns.activity - columns.weekly) +
-    activity;
-  output.push(`${color}${rendered}\x1b[0m`);
+  renderedRows.set(lineIndex, {
+    prefix: visible.slice(0, columns.fiveHour),
+    activity: visible.slice(columns.activity).trimEnd(),
+    fiveHour,
+    weekly,
+    active: /^\s*\*/.test(visible),
+    pending: pendingRow === rowMatch[1],
+  });
 }
+
+const fiveHourWidth = Math.max(
+  columns.weekly - columns.fiveHour,
+  ...Array.from(renderedRows.values(), row => row.fiveHour.length + 2)
+);
+const weeklyWidth = Math.max(
+  columns.activity - columns.weekly,
+  ...Array.from(renderedRows.values(), row => row.weekly.length + 2)
+);
+
+const output = lines.map((line, lineIndex) => {
+  if (lineIndex === headerIndex) {
+    return header.slice(0, columns.fiveHour) +
+      fit('5H USAGE', fiveHourWidth) +
+      fit('WEEKLY USAGE', weeklyWidth) +
+      header.slice(columns.activity).trimEnd();
+  }
+
+  const row = renderedRows.get(lineIndex);
+  if (!row) return line;
+
+  const color = row.active ? '\x1b[32m' : row.pending ? '\x1b[33m' : '\x1b[2m';
+  const rendered =
+    row.prefix +
+    fit(row.fiveHour, fiveHourWidth) +
+    fit(row.weekly, weeklyWidth) +
+    row.activity;
+  return `${color}${rendered}\x1b[0m`;
+});
 
 process.stdout.write(output.join('\n'));
