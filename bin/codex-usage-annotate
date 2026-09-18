@@ -7,6 +7,7 @@ const {
   recommendAccount,
   scoreAccount,
 } = require(path.join(__dirname, '..', 'lib', 'codex-account-ranking'));
+const { usageBlock } = require(path.join(__dirname, '..', 'lib', 'codex-usage-format'));
 
 const registryPath = path.join(process.env.CODEX_HOME || path.join(process.env.HOME, '.codex'), 'accounts', 'registry.json');
 const input = fs.readFileSync(0, 'utf8').replace(/\r/g, '');
@@ -98,8 +99,8 @@ for (const [lineIndex, visible] of visibleLines.entries()) {
   if (!fivePercentMatch || !weeklyPercentMatch) continue;
   const fiveHourRemaining = Number(fivePercentMatch[0]);
   const weeklyRemaining = Number(weeklyPercentMatch[0]);
-  const fivePercent = `${fiveHourRemaining}%`;
-  const weeklyPercent = `${weeklyRemaining}%`;
+  const fivePercent = `${fiveHourRemaining}% ${usageBlock(fiveHourRemaining)}`;
+  const weeklyPercent = `${weeklyRemaining}% ${usageBlock(weeklyRemaining)}`;
   const fiveHour = `${fivePercent} (${formatRemaining(usage.primary?.resets_at)})`;
   const weekly = `${weeklyPercent} (${formatRemaining(usage.secondary?.resets_at)})`;
   sourceRows.push({
@@ -141,19 +142,23 @@ for (const [index, lineIndex] of rowLineIndexes.entries()) {
 
 const fiveHourWidth = Math.max(
   columns.weekly - columns.fiveHour,
-  ...rankedRows.map(row => row.fiveHour.length + 2)
-);
-const weeklyUrgencyWidth = 8;
-const weeklyWidth = Math.max(
-  columns.activity - columns.weekly - weeklyUrgencyWidth,
-  'WEEKLY USAGE'.length + 2,
-  ...rankedRows.map(row => row.weekly.length + 2)
+  ...rankedRows.map(row => row.fiveHour.length + 1)
 );
 
 function formatWeeklyUrgency(row) {
   if (!Number.isFinite(row.weeklyResetHours)) return '?';
   return row.weeklyUrgency.toFixed(2);
 }
+
+const weeklyUrgencyWidth = Math.max(
+  'W%/H'.length + 2,
+  ...rankedRows.map(row => formatWeeklyUrgency(row).length + 1)
+);
+const weeklyWidth = Math.max(
+  columns.activity - columns.weekly - weeklyUrgencyWidth,
+  'WEEKLY USAGE'.length + 1,
+  ...rankedRows.map(row => row.weekly.length + 1)
+);
 
 function prefixForRank(row) {
   const markerAndRank = `${row.active ? '*' : ' '} ${String(row.rank).padStart(2, '0')}`;

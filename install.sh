@@ -62,6 +62,7 @@ backup_if_present "$local_bin/codex-account"
 backup_if_present "$local_bin/codex-usage-watch"
 backup_if_present "$local_bin/codex-usage-annotate"
 backup_if_present "$local_lib/codex-account-ranking.js"
+backup_if_present "$local_lib/codex-usage-format.js"
 for account_number in 1 2 3; do
   backup_if_present "$applications_dir/codex-account${account_number}.desktop"
 done
@@ -71,6 +72,7 @@ install -m 0755 "$bin_source/codex-account" "$local_bin/codex-account"
 install -m 0755 "$bin_source/codex-usage-watch" "$local_bin/codex-usage-watch"
 install -m 0755 "$bin_source/codex-usage-annotate" "$local_bin/codex-usage-annotate"
 install -m 0644 "$lib_source/codex-account-ranking.js" "$local_lib/codex-account-ranking.js"
+install -m 0644 "$lib_source/codex-usage-format.js" "$local_lib/codex-usage-format.js"
 
 escape_config_value() {
   printf '%q' "$1"

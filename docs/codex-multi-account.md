@@ -99,7 +99,7 @@ Open **Codex-kontostatus** for the compact status window. It refreshes every ten
 
 The status window and ChatGPT have independent lifetimes. Account switches and ChatGPT launches started from the status window run in a detached session, so closing the terminal does not terminate Desktop. Opening the status window by itself does not open ChatGPT.
 
-The status columns show remaining percentages and time until reset as `HH:MM`. `W%/H` shows weekly percentage remaining per hour until the weekly reset, which is the same urgency value used by the ranking. Local-only data is a cached observation, not a live server poll. An inactive account commonly remains stale until that account is used and a suitable local rate-limit event is written.
+The status columns show remaining percentages, a rounded eighth-block indicator (` `, `▁` through `█`), and time until reset as `HH:MM`. `W%/H` shows weekly percentage remaining per hour until the weekly reset, which is the same urgency value used by the ranking. Local-only data is a cached observation, not a live server poll. An inactive account commonly remains stale until that account is used and a suitable local rate-limit event is written.
 
 Ranking uses `weekly remaining / hours until weekly reset` as its primary signal. Accounts within 10% of the best weekly urgency form a group whose internal order is decided by current 5H quota plus a small bonus for a reset within the next hour. The recommendation has separate 10% hysteresis and requires at least a 10-point 5H advantage before switching between weekly-near-equals. These constants live together in `tools/workstation/codex-auth/lib/codex-account-ranking.js`.
 
@@ -132,6 +132,7 @@ Conversation visibility comes from the shared local state, not from copying auth
 - `$HOME/.local/bin/codex-usage-watch`
 - `$HOME/.local/bin/codex-usage-annotate`
 - `$HOME/.local/lib/codex-account-ranking.js`
+- `$HOME/.local/lib/codex-usage-format.js`
 - `$HOME/.local/share/applications/codex-account{1,2,3}.desktop`
 - `$HOME/.local/share/applications/codex-usage-watch.desktop`
 - GNOME Terminal profile `Codex-status`
