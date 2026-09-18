@@ -16,7 +16,7 @@ fail() {
   exit 1
 }
 
-for command_name in node npm gnome-terminal gsettings dconf script gtk-launch pgrep pkill; do
+for command_name in node npm gnome-terminal gsettings dconf script setsid pgrep pkill; do
   command -v "$command_name" >/dev/null 2>&1 || fail "required command is missing: $command_name"
 done
 

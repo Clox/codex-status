@@ -39,6 +39,10 @@ pending_source_row=''
 pending_since=0
 key_map=''
 
+launch_detached() {
+  setsid -f "$@" </dev/null >/dev/null 2>&1
+}
+
 draw_frame() {
   local frame_to_draw=$1
   tput rmam 2>/dev/null || printf '\033[?7l'
@@ -46,7 +50,7 @@ draw_frame() {
   tput ed 2>/dev/null || printf '\033[J'
   printf '%s\n' "$frame_to_draw"
   printf '\033[2mW%%/H = weekly %% kvar per timme till reset.\033[0m\n'
-  printf '\033[2mTryck 1, 2 eller 3 för att byta konto. Ctrl+C stänger.\033[0m\n'
+  printf '\033[2mTryck 1, 2 eller 3 för att öppna/byta konto. Ctrl+C stänger.\033[0m\n'
   tput ed 2>/dev/null || printf '\033[J'
   tput smam 2>/dev/null || printf '\033[?7h'
 }
@@ -106,14 +110,14 @@ while true; do
             continue
           fi
           if [[ $source_row == "$active_source_row" ]]; then
-            notify-send 'Codex-konto' 'Det valda kontot är redan aktivt.' 2>/dev/null || true
+            launch_detached "$CHATGPT_LAUNCHER"
             continue
           fi
           pending_source_row=$source_row
           pending_since=$SECONDS
           frame=$(highlight_pending_frame "$key")
           draw_frame "$frame"
-          gtk-launch "codex-account${source_row}.desktop" >/dev/null 2>&1 &
+          launch_detached "$ACCOUNT_SWITCHER" "$source_row" --desktop
         fi
         ;;
     esac
