@@ -35,8 +35,9 @@ if [[ -t 0 && -t 1 ]]; then
   tput civis
 fi
 
-pending_row=''
+pending_source_row=''
 pending_since=0
+key_map=''
 
 draw_frame() {
   local frame_to_draw=$1
@@ -44,6 +45,7 @@ draw_frame() {
   tput cup 0 0 2>/dev/null || printf '\033[H'
   tput ed 2>/dev/null || printf '\033[J'
   printf '%s\n' "$frame_to_draw"
+  printf '\033[2mW%%/H = weekly %% kvar per timme till reset.\033[0m\n'
   printf '\033[2mTryck 1, 2 eller 3 för att byta konto. Ctrl+C stänger.\033[0m\n'
   tput ed 2>/dev/null || printf '\033[J'
   tput smam 2>/dev/null || printf '\033[?7h'
@@ -52,12 +54,12 @@ draw_frame() {
 highlight_pending_frame() {
   local target_row=$1
   printf '%s\n' "$frame" | awk -v row="$target_row" '
-    BEGIN { escape = sprintf("%c", 27); dim = escape "[2m"; yellow = escape "[33m" }
+    BEGIN { escape = sprintf("%c", 27); dim = escape "[0;2m"; yellow = escape "[0;33m" }
     {
       visible = $0
       gsub(escape "\\[[0-9;]*m", "", visible)
       if (visible ~ "^[[:space:]]+0?" row "[[:space:]]" && index($0, dim) == 1) {
-        sub("^" escape "\\[2m", yellow)
+        sub("^" escape "\\[0;2m", yellow)
       }
       print
     }
@@ -67,16 +69,25 @@ highlight_pending_frame() {
 while true; do
   columns=$(tput cols 2>/dev/null || printf '100')
   [[ $columns =~ ^[0-9]+$ ]] || columns=100
+  status_now_ms=$(($(date +%s) * 1000))
 
-  if frame=$(
-    script -qefc "stty cols $columns; exec \"$CODEX_AUTH_BIN\" list --skip-api" /dev/null </dev/null |
-      CODEX_PENDING_ROW="$pending_row" "$USAGE_ANNOTATOR"
-  ); then
-    if [[ -n $pending_row && $frame =~ \*[[:space:]]+0?${pending_row}[[:space:]] ]]; then
-      pending_row=''
+  if raw_frame=$(
+    script -qefc "stty cols $columns; exec \"$CODEX_AUTH_BIN\" list --skip-api" /dev/null </dev/null
+  ) &&
+    frame=$(
+      printf '%s\n' "$raw_frame" |
+        CODEX_STATUS_RANKING=1 CODEX_PENDING_SOURCE_ROW="$pending_source_row" CODEX_STATUS_NOW_MS="$status_now_ms" "$USAGE_ANNOTATOR"
+    ) &&
+    key_map=$(
+      printf '%s\n' "$raw_frame" |
+        CODEX_STATUS_RANKING=1 CODEX_STATUS_NOW_MS="$status_now_ms" "$USAGE_ANNOTATOR" --key-map
+    ); then
+    active_source_row=$(printf '%s\n' "$key_map" | awk '$3 == "active" { print $2; exit }')
+    if [[ -n $pending_source_row && $pending_source_row == "$active_source_row" ]]; then
+      pending_source_row=''
       pending_since=0
-    elif [[ -n $pending_row && $((SECONDS - pending_since)) -ge 60 ]]; then
-      pending_row=''
+    elif [[ -n $pending_source_row && $((SECONDS - pending_since)) -ge 60 ]]; then
+      pending_source_row=''
       pending_since=0
     fi
     draw_frame "$frame"
@@ -89,11 +100,20 @@ while true; do
         if pgrep -f "^${ACCOUNT_SWITCHER} [123] --desktop( |$)" >/dev/null 2>&1; then
           notify-send 'Codex-kontobyte pågår' 'Vänta tills det pågående kontobytet är klart.' 2>/dev/null || true
         else
-          pending_row=$key
+          source_row=$(printf '%s\n' "$key_map" | awk -v rank="$key" '$1 == rank { print $2; exit }')
+          if [[ ! $source_row =~ ^[123]$ ]]; then
+            notify-send 'Codex-kontobyte stoppat' 'Kunde inte koppla rankingen till ett konto. Vänta på nästa uppdatering.' 2>/dev/null || true
+            continue
+          fi
+          if [[ $source_row == "$active_source_row" ]]; then
+            notify-send 'Codex-konto' 'Det valda kontot är redan aktivt.' 2>/dev/null || true
+            continue
+          fi
+          pending_source_row=$source_row
           pending_since=$SECONDS
           frame=$(highlight_pending_frame "$key")
           draw_frame "$frame"
-          gtk-launch "codex-account${key}.desktop" >/dev/null 2>&1 &
+          gtk-launch "codex-account${source_row}.desktop" >/dev/null 2>&1 &
         fi
         ;;
     esac

@@ -2,12 +2,23 @@
 
 const fs = require('fs');
 const path = require('path');
+const {
+  rankAccounts,
+  recommendAccount,
+  scoreAccount,
+} = require(path.join(__dirname, '..', 'lib', 'codex-account-ranking'));
 
 const registryPath = path.join(process.env.CODEX_HOME || path.join(process.env.HOME, '.codex'), 'accounts', 'registry.json');
 const input = fs.readFileSync(0, 'utf8').replace(/\r/g, '');
-const pendingRow = /^(1|2|3)$/.test(process.env.CODEX_PENDING_ROW || '')
-  ? process.env.CODEX_PENDING_ROW
+const mappingOnly = process.argv.includes('--key-map');
+const rankingEnabled = mappingOnly || process.env.CODEX_STATUS_RANKING === '1';
+const pendingSourceCandidate = process.env.CODEX_PENDING_SOURCE_ROW || process.env.CODEX_PENDING_ROW || '';
+const pendingSourceRow = /^(1|2|3)$/.test(pendingSourceCandidate)
+  ? pendingSourceCandidate
   : null;
+const nowMs = Number.isFinite(Number(process.env.CODEX_STATUS_NOW_MS))
+  ? Number(process.env.CODEX_STATUS_NOW_MS)
+  : Date.now();
 
 function plain(value) {
   return value.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '');
@@ -33,6 +44,7 @@ try {
     ? registry.accounts
     : Object.values(registry.accounts || {});
 } catch {
+  if (mappingOnly) process.exit(1);
   process.stdout.write(input);
   process.exit(0);
 }
@@ -44,6 +56,7 @@ const headerIndex = visibleLines.findIndex(line =>
 );
 
 if (headerIndex < 0) {
+  if (mappingOnly) process.exit(1);
   process.stdout.write(input);
   process.exit(0);
 }
@@ -63,7 +76,7 @@ function fit(value, width) {
   return value.padEnd(width, ' ');
 }
 
-const renderedRows = new Map();
+const sourceRows = [];
 
 for (const [lineIndex, visible] of visibleLines.entries()) {
   const rowMatch = visible.match(/^\s*\*?\s*0?(\d+)\s+/);
@@ -80,47 +93,113 @@ for (const [lineIndex, visible] of visibleLines.entries()) {
   if (!account) continue;
 
   const usage = account.last_usage || {};
-  const fivePercent = visible.slice(columns.fiveHour, columns.weekly).match(/\d+%/)?.[0] || '?%';
-  const weeklyPercent = visible.slice(columns.weekly, columns.activity).match(/\d+%/)?.[0] || '?%';
+  const fivePercentMatch = visible.slice(columns.fiveHour, columns.weekly).match(/\d+/);
+  const weeklyPercentMatch = visible.slice(columns.weekly, columns.activity).match(/\d+/);
+  if (!fivePercentMatch || !weeklyPercentMatch) continue;
+  const fiveHourRemaining = Number(fivePercentMatch[0]);
+  const weeklyRemaining = Number(weeklyPercentMatch[0]);
+  const fivePercent = `${fiveHourRemaining}%`;
+  const weeklyPercent = `${weeklyRemaining}%`;
   const fiveHour = `${fivePercent} (${formatRemaining(usage.primary?.resets_at)})`;
   const weekly = `${weeklyPercent} (${formatRemaining(usage.secondary?.resets_at)})`;
-  renderedRows.set(lineIndex, {
+  sourceRows.push({
+    sourceRow: rowMatch[1],
+    lineIndex,
+    label: visible.slice(columns.account, columns.plan).trim(),
     prefix: visible.slice(0, columns.fiveHour),
     activity: visible.slice(columns.activity).trimEnd(),
     fiveHour,
     weekly,
+    fiveHourRemaining,
+    fiveHourResetAt: usage.primary?.resets_at,
+    weeklyRemaining,
+    weeklyResetAt: usage.secondary?.resets_at,
     active: /^\s*\*/.test(visible),
-    pending: pendingRow === rowMatch[1],
   });
+}
+
+const rankedRows = rankingEnabled
+  ? rankAccounts(sourceRows, { nowMs })
+  : sourceRows.map((row, index) => ({
+      ...scoreAccount(row, { nowMs }),
+      rank: index + 1,
+    }));
+
+if (mappingOnly) {
+  process.stdout.write(rankedRows
+    .map(row => `${row.rank}\t${row.sourceRow}\t${row.active ? 'active' : '-'}`)
+    .join('\n'));
+  process.exit(0);
+}
+
+const recommendation = rankingEnabled ? recommendAccount(rankedRows) : null;
+const rankedByLineIndex = new Map();
+const rowLineIndexes = sourceRows.map(row => row.lineIndex).sort((left, right) => left - right);
+for (const [index, lineIndex] of rowLineIndexes.entries()) {
+  rankedByLineIndex.set(lineIndex, rankedRows[index]);
 }
 
 const fiveHourWidth = Math.max(
   columns.weekly - columns.fiveHour,
-  ...Array.from(renderedRows.values(), row => row.fiveHour.length + 2)
+  ...rankedRows.map(row => row.fiveHour.length + 2)
 );
+const weeklyUrgencyWidth = 8;
 const weeklyWidth = Math.max(
-  columns.activity - columns.weekly,
-  ...Array.from(renderedRows.values(), row => row.weekly.length + 2)
+  columns.activity - columns.weekly - weeklyUrgencyWidth,
+  'WEEKLY USAGE'.length + 2,
+  ...rankedRows.map(row => row.weekly.length + 2)
 );
+
+function formatWeeklyUrgency(row) {
+  if (!Number.isFinite(row.weeklyResetHours)) return '?';
+  return row.weeklyUrgency.toFixed(2);
+}
+
+function prefixForRank(row) {
+  const markerAndRank = `${row.active ? '*' : ' '} ${String(row.rank).padStart(2, '0')}`;
+  return row.prefix.replace(/^\s*\*?\s*0?\d+/, markerAndRank);
+}
 
 const output = lines.map((line, lineIndex) => {
   if (lineIndex === headerIndex) {
     return header.slice(0, columns.fiveHour) +
       fit('5H USAGE', fiveHourWidth) +
       fit('WEEKLY USAGE', weeklyWidth) +
+      fit('W%/H', weeklyUrgencyWidth) +
       header.slice(columns.activity).trimEnd();
   }
 
-  const row = renderedRows.get(lineIndex);
+  const row = rankedByLineIndex.get(lineIndex);
   if (!row) return line;
 
-  const color = row.active ? '\x1b[32m' : row.pending ? '\x1b[33m' : '\x1b[2m';
+  const pending = pendingSourceRow === row.sourceRow;
+  const color = row.active ? '\x1b[0;32m' : pending ? '\x1b[0;33m' : '\x1b[0;2m';
   const rendered =
-    row.prefix +
+    prefixForRank(row) +
     fit(row.fiveHour, fiveHourWidth) +
     fit(row.weekly, weeklyWidth) +
-    row.activity;
+    fit(formatWeeklyUrgency(row), weeklyUrgencyWidth) +
+    row.activity +
+    (row.active ? '  ACTIVE' : '');
   return `${color}${rendered}\x1b[0m`;
 });
 
-process.stdout.write(output.join('\n'));
+if (!recommendation) {
+  process.stdout.write(output.join('\n'));
+  process.exit(0);
+}
+
+const recommendationRank = recommendation.account?.rank;
+const recommendationLabel = recommendation.account?.label || 'current account';
+const recommendationLines = recommendation.action === 'switch'
+  ? [
+      '\x1b[1mRECOMMENDATION:\x1b[0m',
+      `Switch to ${recommendationLabel}`,
+      `Press [${recommendationRank}] to switch`,
+    ]
+  : [
+      '\x1b[1mRECOMMENDATION:\x1b[0m',
+      `Stay on ${recommendationLabel}`,
+    ];
+
+process.stdout.write(`${output.join('\n').trimEnd()}\n\n${recommendationLines.join('\n')}`);

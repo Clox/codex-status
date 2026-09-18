@@ -95,9 +95,11 @@ The scripts here terminate Codex Desktop politely and wait up to 15 seconds. The
 
 Open **Codex - Konto 1**, **Codex - Konto 2**, or **Codex - Konto 3** from the application menu. If Desktop is running, the launcher sends it `TERM`, waits for a clean exit, switches with `codex-auth`, and starts Desktop again. Closing an Electron window with its X may leave the process alive; Ctrl+Q normally exits the whole app, but the launcher handles the running process itself.
 
-Open **Codex-kontostatus** for the compact status window. It refreshes every ten seconds without clearing the visible terminal buffer. The active account is green. Pressing `1`, `2`, or `3` immediately marks the selected row yellow and launches the matching switch; it becomes green once `codex-auth` reports it active. Input other than those digits is ignored and the cursor, menu bar, and unnecessary scrollbar are hidden.
+Open **Codex-kontostatus** for the compact status window. It refreshes every ten seconds without clearing the visible terminal buffer. Accounts are automatically ranked by weekly urgency, with 5H availability breaking near-ties. The active account is green and explicitly marked `ACTIVE`; a recommendation below the table says whether to stay or switch. Pressing `1`, `2`, or `3` selects the account at that current rank, immediately marks it yellow, and launches the existing safe switcher; it becomes green once `codex-auth` reports it active. Input other than those digits is ignored and the cursor, menu bar, and unnecessary scrollbar are hidden.
 
-The status columns show remaining percentages and time until reset as `HH:MM`. Local-only data is a cached observation, not a live server poll. An inactive account commonly remains stale until that account is used and a suitable local rate-limit event is written.
+The status columns show remaining percentages and time until reset as `HH:MM`. `W%/H` shows weekly percentage remaining per hour until the weekly reset, which is the same urgency value used by the ranking. Local-only data is a cached observation, not a live server poll. An inactive account commonly remains stale until that account is used and a suitable local rate-limit event is written.
+
+Ranking uses `weekly remaining / hours until weekly reset` as its primary signal. Accounts within 10% of the best weekly urgency form a group whose internal order is decided by current 5H quota plus a small bonus for a reset within the next hour. The recommendation has separate 10% hysteresis and requires at least a 10-point 5H advantage before switching between weekly-near-equals. These constants live together in `tools/workstation/codex-auth/lib/codex-account-ranking.js`.
 
 The digit shortcuts intentionally act immediately. Do not programmatically restart or focus the status terminal while active Codex work is in progress: an accidentally delivered digit can initiate a real account switch and close Desktop.
 
@@ -127,6 +129,7 @@ Conversation visibility comes from the shared local state, not from copying auth
 - `$HOME/.local/bin/codex-account`
 - `$HOME/.local/bin/codex-usage-watch`
 - `$HOME/.local/bin/codex-usage-annotate`
+- `$HOME/.local/lib/codex-account-ranking.js`
 - `$HOME/.local/share/applications/codex-account{1,2,3}.desktop`
 - `$HOME/.local/share/applications/codex-usage-watch.desktop`
 - GNOME Terminal profile `Codex-status`

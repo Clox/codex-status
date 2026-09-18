@@ -3,7 +3,9 @@ set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 bin_source="$script_dir/bin"
+lib_source="$script_dir/lib"
 local_bin="$HOME/.local/bin"
+local_lib="$HOME/.local/lib"
 applications_dir="$HOME/.local/share/applications"
 config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/codex-account-switcher"
 config_file="$config_dir/accounts.conf"
@@ -45,7 +47,7 @@ read -r -p 'Row/account 3 selector: ' account_3
 [[ -n $account_1 && -n $account_2 && -n $account_3 ]] || fail 'all three account selectors are required'
 [[ $account_1 != "$account_2" && $account_1 != "$account_3" && $account_2 != "$account_3" ]] || fail 'account selectors must be unique'
 
-mkdir -p "$backup_dir" "$local_bin" "$applications_dir" "$config_dir"
+mkdir -p "$backup_dir" "$local_bin" "$local_lib" "$applications_dir" "$config_dir"
 chmod 700 "$config_dir"
 
 backup_if_present() {
@@ -59,6 +61,7 @@ backup_if_present "$config_file"
 backup_if_present "$local_bin/codex-account"
 backup_if_present "$local_bin/codex-usage-watch"
 backup_if_present "$local_bin/codex-usage-annotate"
+backup_if_present "$local_lib/codex-account-ranking.js"
 for account_number in 1 2 3; do
   backup_if_present "$applications_dir/codex-account${account_number}.desktop"
 done
@@ -67,6 +70,7 @@ backup_if_present "$applications_dir/codex-usage-watch.desktop"
 install -m 0755 "$bin_source/codex-account" "$local_bin/codex-account"
 install -m 0755 "$bin_source/codex-usage-watch" "$local_bin/codex-usage-watch"
 install -m 0755 "$bin_source/codex-usage-annotate" "$local_bin/codex-usage-annotate"
+install -m 0644 "$lib_source/codex-account-ranking.js" "$local_lib/codex-account-ranking.js"
 
 escape_config_value() {
   printf '%q' "$1"
