@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 const {
   USAGE_BLOCKS,
+  tableCell,
   usageBlock,
   weeklyUrgencyLabel,
 } = require('../lib/codex-usage-format');
@@ -40,4 +41,10 @@ test('shows normal W%/H after the weekly cycle has started', () => {
     weeklyResetHours: 168,
     weeklyUrgency: 100 / 168,
   }), '0.60');
+});
+
+test('renders a vertical boundary while preserving the cell content width', () => {
+  assert.equal(tableCell('ACCOUNT', 10), 'ACCOUNT  │ ');
+  assert.equal(tableCell('a-long-account', 10), 'a-long-ac│ ');
+  assert.equal(Array.from(tableCell('RESET', 9)).length, 10);
 });

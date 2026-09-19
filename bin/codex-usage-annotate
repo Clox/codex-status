@@ -11,6 +11,7 @@ const {
   formatResetValue,
 } = require(path.join(__dirname, '..', 'lib', 'codex-reset-credits'));
 const {
+  tableCell,
   usageBlock,
   weeklyUrgencyLabel,
 } = require(path.join(__dirname, '..', 'lib', 'codex-usage-format'));
@@ -158,7 +159,7 @@ for (const [index, lineIndex] of rowLineIndexes.entries()) {
 }
 
 const fiveHourWidth = Math.max(
-  columns.weekly - columns.fiveHour,
+  '5H USAGE'.length + 1,
   ...rankedRows.map(row => row.fiveHour.length + 1)
 );
 const resetValues = rankedRows.map(row => formatResetValue(row.resetCredits, nowMs));
@@ -166,39 +167,52 @@ const resetWidth = Math.max(
   'RESETS'.length + 1,
   ...resetValues.map(value => value.length + 1)
 );
-const accountAndPlanWidth = columns.fiveHour - columns.account;
-const accountWidth = Math.max(
-  'ACCOUNT'.length + 1,
-  accountAndPlanWidth - resetWidth
-);
-
 const weeklyUrgencyWidth = Math.max(
   'W%/H'.length + 2,
   ...rankedRows.map(row => weeklyUrgencyLabel(row).length + 1)
 );
 const weeklyWidth = Math.max(
-  columns.activity - columns.weekly - weeklyUrgencyWidth,
   'WEEKLY USAGE'.length + 1,
   ...rankedRows.map(row => row.weekly.length + 1)
+);
+const tableSeparatorOverhead = 5;
+const widthBeforeActivity = columns.activity - columns.account;
+const accountWidth = Math.max(
+  'ACCOUNT'.length + 1,
+  widthBeforeActivity - resetWidth - fiveHourWidth - weeklyWidth - weeklyUrgencyWidth - tableSeparatorOverhead
 );
 
 function prefixForRank(row) {
   const markerAndRank = `${row.active ? '*' : ' '} ${String(row.rank).padStart(2, '0')}`;
   const rankedPrefix = row.prefix.replace(/^\s*\*?\s*0?\d+/, markerAndRank);
   return rankedPrefix.slice(0, columns.account) +
-    fit(row.label, accountWidth) +
-    fit(formatResetValue(row.resetCredits, nowMs), resetWidth);
+    tableCell(row.label, accountWidth) +
+    tableCell(formatResetValue(row.resetCredits, nowMs), resetWidth);
+}
+
+const renderedHeader = header.slice(0, columns.account) +
+  tableCell('ACCOUNT', accountWidth) +
+  tableCell('RESETS', resetWidth) +
+  tableCell('5H USAGE', fiveHourWidth) +
+  tableCell('WEEKLY USAGE', weeklyWidth) +
+  tableCell('W%/H', weeklyUrgencyWidth) +
+  header.slice(columns.activity).trimEnd();
+
+function tableDivider(length) {
+  const divider = Array.from({ length }, () => '─');
+  for (const [index, character] of Array.from(renderedHeader).entries()) {
+    if (character === '│' && index < divider.length) divider[index] = '┼';
+  }
+  return divider.join('');
 }
 
 const output = lines.map((line, lineIndex) => {
   if (lineIndex === headerIndex) {
-    return header.slice(0, columns.account) +
-      fit('ACCOUNT', accountWidth) +
-      fit('RESETS', resetWidth) +
-      fit('5H USAGE', fiveHourWidth) +
-      fit('WEEKLY USAGE', weeklyWidth) +
-      fit('W%/H', weeklyUrgencyWidth) +
-      header.slice(columns.activity).trimEnd();
+    return renderedHeader;
+  }
+
+  if (lineIndex === headerIndex + 1 && /^\s*-+\s*$/.test(visibleLines[lineIndex])) {
+    return tableDivider(Math.max(plain(line).trimEnd().length, renderedHeader.length));
   }
 
   const row = rankedByLineIndex.get(lineIndex);
@@ -208,9 +222,9 @@ const output = lines.map((line, lineIndex) => {
   const color = row.active ? '\x1b[0;32m' : pending ? '\x1b[0;33m' : '\x1b[0;2m';
   const rendered =
     prefixForRank(row) +
-    fit(row.fiveHour, fiveHourWidth) +
-    fit(row.weekly, weeklyWidth) +
-    fit(weeklyUrgencyLabel(row), weeklyUrgencyWidth) +
+    tableCell(row.fiveHour, fiveHourWidth) +
+    tableCell(row.weekly, weeklyWidth) +
+    tableCell(weeklyUrgencyLabel(row), weeklyUrgencyWidth) +
     row.activity +
     (row.active ? '  ACTIVE' : '');
   return `${color}${rendered}\x1b[0m`;
