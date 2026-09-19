@@ -5,6 +5,7 @@ const test = require('node:test');
 const {
   USAGE_BLOCKS,
   usageBlock,
+  weeklyUrgencyLabel,
 } = require('../lib/codex-usage-format');
 
 test('maps the complete 0-100% scale to eighth-block glyphs', () => {
@@ -23,4 +24,20 @@ test('clamps out-of-range values and handles missing data', () => {
   assert.equal(usageBlock(-20), ' ');
   assert.equal(usageBlock(140), '█');
   assert.equal(usageBlock(Number.NaN), ' ');
+});
+
+test('shows START instead of a false W%/H value for an unstarted weekly cycle', () => {
+  assert.equal(weeklyUrgencyLabel({
+    needsActivation: true,
+    weeklyResetHours: 0,
+    weeklyUrgency: 0,
+  }), 'START');
+});
+
+test('shows normal W%/H after the weekly cycle has started', () => {
+  assert.equal(weeklyUrgencyLabel({
+    needsActivation: false,
+    weeklyResetHours: 168,
+    weeklyUrgency: 100 / 168,
+  }), '0.60');
 });

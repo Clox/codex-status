@@ -1,0 +1,122 @@
+#!/usr/bin/env node
+
+'use strict';
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { parseResetCreditsResponse } = require(path.join(__dirname, '..', 'lib', 'codex-reset-credits'));
+
+const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+const registryPath = path.join(codexHome, 'accounts', 'registry.json');
+const cachePath = process.env.RESET_CREDITS_CACHE || path.join(
+  process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache'),
+  'codex-account-switcher',
+  'reset-credits.json'
+);
+const maxAgeMs = Number(process.env.RESET_CREDITS_MAX_AGE_MS || 300_000);
+const nowMs = Date.now();
+
+function currentCacheIsFresh() {
+  try {
+    const stat = fs.statSync(cachePath);
+    return nowMs - stat.mtimeMs < maxAgeMs;
+  } catch {
+    return false;
+  }
+}
+
+function readJson(filename) {
+  return JSON.parse(fs.readFileSync(filename, 'utf8'));
+}
+
+function accountsFromRegistry(registry) {
+  return Array.isArray(registry.accounts)
+    ? registry.accounts
+    : Object.values(registry.accounts || {});
+}
+
+function findAuthFiles() {
+  const directory = path.join(codexHome, 'accounts');
+  return fs.readdirSync(directory)
+    .filter(filename => filename.endsWith('.auth.json'))
+    .map(filename => path.join(directory, filename));
+}
+
+function authByAccountId() {
+  const result = new Map();
+  for (const filename of findAuthFiles()) {
+    try {
+      const auth = readJson(filename);
+      if (auth?.tokens?.account_id && auth?.tokens?.access_token) {
+        result.set(auth.tokens.account_id, auth.tokens.access_token);
+      }
+    } catch {
+      // A concurrently refreshed auth file is retried at the next status refresh.
+    }
+  }
+  return result;
+}
+
+async function fetchResetCredits(accountId, accessToken) {
+  const response = await fetch('https://chatgpt.com/backend-api/wham/rate-limit-reset-credits', {
+    headers: {
+      Accept: 'application/json',
+      Authorization: `Bearer ${accessToken}`,
+      'ChatGPT-Account-Id': accountId,
+    },
+  });
+  if (!response.ok) throw new Error(`reset endpoint returned HTTP ${response.status}`);
+  return parseResetCreditsResponse(await response.json());
+}
+
+function writeCache(cache) {
+  const directory = path.dirname(cachePath);
+  if (!fs.existsSync(directory)) {
+    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    fs.chmodSync(directory, 0o700);
+  }
+  const temporaryPath = `${cachePath}.${process.pid}.tmp`;
+  fs.writeFileSync(temporaryPath, `${JSON.stringify(cache, null, 2)}\n`, { mode: 0o600 });
+  fs.renameSync(temporaryPath, cachePath);
+  fs.chmodSync(cachePath, 0o600);
+}
+
+async function main() {
+  if (currentCacheIsFresh()) return;
+
+  const registry = readJson(registryPath);
+  const accounts = accountsFromRegistry(registry);
+  const tokens = authByAccountId();
+  let oldAccounts = {};
+  try {
+    oldAccounts = readJson(cachePath).accounts || {};
+  } catch {}
+
+  const results = await Promise.all(accounts.map(async account => {
+    const accountId = account.chatgpt_account_id;
+    const accessToken = tokens.get(accountId);
+    if (!accountId || !accessToken) return [accountId, oldAccounts[accountId] ?? null];
+    try {
+      const resetInfo = await fetchResetCredits(accountId, accessToken);
+      if (!resetInfo) return [accountId, oldAccounts[accountId] ?? null];
+      return [accountId, {
+        availableCount: resetInfo.availableCount,
+        detailsComplete: resetInfo.detailsComplete,
+        expirationsMs: resetInfo.expirationsMs,
+        earliestExpirationMs: resetInfo.earliestExpirationMs,
+        fetchedAtMs: nowMs,
+      }];
+    } catch {
+      return [accountId, oldAccounts[accountId] ?? null];
+    }
+  }));
+
+  const cacheAccounts = Object.fromEntries(results.filter(([accountId, value]) => accountId && value));
+  writeCache({ version: 1, fetchedAtMs: nowMs, accounts: cacheAccounts });
+}
+
+main().catch(error => {
+  process.stderr.write(`Could not refresh Codex reset credits: ${error.message}\n`);
+  process.exitCode = 1;
+});

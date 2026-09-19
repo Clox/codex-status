@@ -7,9 +7,20 @@ const {
   recommendAccount,
   scoreAccount,
 } = require(path.join(__dirname, '..', 'lib', 'codex-account-ranking'));
-const { usageBlock } = require(path.join(__dirname, '..', 'lib', 'codex-usage-format'));
+const {
+  formatResetValue,
+} = require(path.join(__dirname, '..', 'lib', 'codex-reset-credits'));
+const {
+  usageBlock,
+  weeklyUrgencyLabel,
+} = require(path.join(__dirname, '..', 'lib', 'codex-usage-format'));
 
 const registryPath = path.join(process.env.CODEX_HOME || path.join(process.env.HOME, '.codex'), 'accounts', 'registry.json');
+const resetCreditsCachePath = process.env.RESET_CREDITS_CACHE || path.join(
+  process.env.XDG_CACHE_HOME || path.join(process.env.HOME, '.cache'),
+  'codex-account-switcher',
+  'reset-credits.json'
+);
 const input = fs.readFileSync(0, 'utf8').replace(/\r/g, '');
 const mappingOnly = process.argv.includes('--key-map');
 const rankingEnabled = mappingOnly || process.env.CODEX_STATUS_RANKING === '1';
@@ -27,7 +38,7 @@ function plain(value) {
 
 function formatRemaining(epochSeconds) {
   if (!Number.isFinite(epochSeconds)) return '?';
-  const minutes = Math.max(0, Math.ceil((epochSeconds * 1000 - Date.now()) / 60000));
+  const minutes = Math.max(0, Math.ceil((epochSeconds * 1000 - nowMs) / 60000));
   const hours = Math.floor(minutes / 60);
   return `${hours}:${String(minutes % 60).padStart(2, '0')}`;
 }
@@ -39,6 +50,7 @@ function accountIdentifiers(account) {
 }
 
 let accounts = [];
+let resetCreditsByAccountId = {};
 try {
   const registry = JSON.parse(fs.readFileSync(registryPath, 'utf8'));
   accounts = Array.isArray(registry.accounts)
@@ -49,6 +61,10 @@ try {
   process.stdout.write(input);
   process.exit(0);
 }
+
+try {
+  resetCreditsByAccountId = JSON.parse(fs.readFileSync(resetCreditsCachePath, 'utf8')).accounts || {};
+} catch {}
 
 const lines = input.split('\n');
 const visibleLines = lines.map(plain);
@@ -108,6 +124,7 @@ for (const [lineIndex, visible] of visibleLines.entries()) {
     lineIndex,
     label: visible.slice(columns.account, columns.plan).trim(),
     prefix: visible.slice(0, columns.fiveHour),
+    resetCredits: resetCreditsByAccountId[account.chatgpt_account_id] || null,
     activity: visible.slice(columns.activity).trimEnd(),
     fiveHour,
     weekly,
@@ -144,15 +161,20 @@ const fiveHourWidth = Math.max(
   columns.weekly - columns.fiveHour,
   ...rankedRows.map(row => row.fiveHour.length + 1)
 );
-
-function formatWeeklyUrgency(row) {
-  if (!Number.isFinite(row.weeklyResetHours)) return '?';
-  return row.weeklyUrgency.toFixed(2);
-}
+const resetValues = rankedRows.map(row => formatResetValue(row.resetCredits, nowMs));
+const resetWidth = Math.max(
+  'RESETS'.length + 1,
+  ...resetValues.map(value => value.length + 1)
+);
+const accountAndPlanWidth = columns.fiveHour - columns.account;
+const accountWidth = Math.max(
+  'ACCOUNT'.length + 1,
+  accountAndPlanWidth - resetWidth
+);
 
 const weeklyUrgencyWidth = Math.max(
   'W%/H'.length + 2,
-  ...rankedRows.map(row => formatWeeklyUrgency(row).length + 1)
+  ...rankedRows.map(row => weeklyUrgencyLabel(row).length + 1)
 );
 const weeklyWidth = Math.max(
   columns.activity - columns.weekly - weeklyUrgencyWidth,
@@ -162,12 +184,17 @@ const weeklyWidth = Math.max(
 
 function prefixForRank(row) {
   const markerAndRank = `${row.active ? '*' : ' '} ${String(row.rank).padStart(2, '0')}`;
-  return row.prefix.replace(/^\s*\*?\s*0?\d+/, markerAndRank);
+  const rankedPrefix = row.prefix.replace(/^\s*\*?\s*0?\d+/, markerAndRank);
+  return rankedPrefix.slice(0, columns.account) +
+    fit(row.label, accountWidth) +
+    fit(formatResetValue(row.resetCredits, nowMs), resetWidth);
 }
 
 const output = lines.map((line, lineIndex) => {
   if (lineIndex === headerIndex) {
-    return header.slice(0, columns.fiveHour) +
+    return header.slice(0, columns.account) +
+      fit('ACCOUNT', accountWidth) +
+      fit('RESETS', resetWidth) +
       fit('5H USAGE', fiveHourWidth) +
       fit('WEEKLY USAGE', weeklyWidth) +
       fit('W%/H', weeklyUrgencyWidth) +
@@ -183,7 +210,7 @@ const output = lines.map((line, lineIndex) => {
     prefixForRank(row) +
     fit(row.fiveHour, fiveHourWidth) +
     fit(row.weekly, weeklyWidth) +
-    fit(formatWeeklyUrgency(row), weeklyUrgencyWidth) +
+    fit(weeklyUrgencyLabel(row), weeklyUrgencyWidth) +
     row.activity +
     (row.active ? '  ACTIVE' : '');
   return `${color}${rendered}\x1b[0m`;
@@ -196,7 +223,20 @@ if (!recommendation) {
 
 const recommendationRank = recommendation.account?.rank;
 const recommendationLabel = recommendation.account?.label || 'current account';
-const recommendationLines = recommendation.action === 'switch'
+const recommendationLines = recommendation.reason === 'needs-activation'
+  ? recommendation.action === 'switch'
+    ? [
+        '\x1b[1mRECOMMENDATION:\x1b[0m',
+        `Activate ${recommendationLabel}`,
+        'Use it once to start its weekly cycle',
+        `Press [${recommendationRank}] to switch`,
+      ]
+    : [
+        '\x1b[1mRECOMMENDATION:\x1b[0m',
+        `Use ${recommendationLabel} once`,
+        'Start its weekly cycle',
+      ]
+  : recommendation.action === 'switch'
   ? [
       '\x1b[1mRECOMMENDATION:\x1b[0m',
       `Switch to ${recommendationLabel}`,

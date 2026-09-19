@@ -12,6 +12,7 @@ source "$config_file"
 
 export CODEX_HOME
 export PATH="$NODE_BIN_DIR:${PATH:-/usr/local/bin:/usr/bin:/bin}"
+export RESET_CREDITS_CACHE
 printf '\033]0;Codex-kontostatus\007'
 
 saved_stty=''
@@ -74,6 +75,8 @@ while true; do
   columns=$(tput cols 2>/dev/null || printf '100')
   [[ $columns =~ ^[0-9]+$ ]] || columns=100
   status_now_ms=$(($(date +%s) * 1000))
+
+  "$RESET_CREDITS_REFRESHER" >/dev/null 2>&1 || true
 
   if raw_frame=$(
     script -qefc "stty cols $columns; exec \"$CODEX_AUTH_BIN\" list --skip-api" /dev/null </dev/null

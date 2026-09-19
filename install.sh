@@ -61,7 +61,9 @@ backup_if_present "$config_file"
 backup_if_present "$local_bin/codex-account"
 backup_if_present "$local_bin/codex-usage-watch"
 backup_if_present "$local_bin/codex-usage-annotate"
+backup_if_present "$local_bin/codex-reset-credits-refresh"
 backup_if_present "$local_lib/codex-account-ranking.js"
+backup_if_present "$local_lib/codex-reset-credits.js"
 backup_if_present "$local_lib/codex-usage-format.js"
 for account_number in 1 2 3; do
   backup_if_present "$applications_dir/codex-account${account_number}.desktop"
@@ -71,7 +73,9 @@ backup_if_present "$applications_dir/codex-usage-watch.desktop"
 install -m 0755 "$bin_source/codex-account" "$local_bin/codex-account"
 install -m 0755 "$bin_source/codex-usage-watch" "$local_bin/codex-usage-watch"
 install -m 0755 "$bin_source/codex-usage-annotate" "$local_bin/codex-usage-annotate"
+install -m 0755 "$bin_source/codex-reset-credits-refresh" "$local_bin/codex-reset-credits-refresh"
 install -m 0644 "$lib_source/codex-account-ranking.js" "$local_lib/codex-account-ranking.js"
+install -m 0644 "$lib_source/codex-reset-credits.js" "$local_lib/codex-reset-credits.js"
 install -m 0644 "$lib_source/codex-usage-format.js" "$local_lib/codex-usage-format.js"
 
 escape_config_value() {
@@ -91,6 +95,8 @@ escape_config_value() {
   printf 'CHATGPT_BINARY_PATTERN=%s\n' "$(escape_config_value "$chatgpt_binary")"
   printf 'ACCOUNT_SWITCHER=%s\n' "$(escape_config_value "$local_bin/codex-account")"
   printf 'USAGE_ANNOTATOR=%s\n' "$(escape_config_value "$local_bin/codex-usage-annotate")"
+  printf 'RESET_CREDITS_REFRESHER=%s\n' "$(escape_config_value "$local_bin/codex-reset-credits-refresh")"
+  printf 'RESET_CREDITS_CACHE=%s\n' "$(escape_config_value "${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/reset-credits.json")"
 } >"$config_file"
 chmod 600 "$config_file"
 

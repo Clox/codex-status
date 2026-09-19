@@ -36,6 +36,52 @@ test('weekly urgency is remaining weekly percentage per reset hour', () => {
   assert.equal(scored.weeklyUrgency, 30);
 });
 
+test('100% weekly with no running window needs activation and ranks first', () => {
+  const ranked = rankAccounts([
+    account(1, { active: true, weeklyRemaining: 60 }),
+    account(2, { weeklyRemaining: 100, weeklyResetAt: NOW_MS / 1000 }),
+  ], { nowMs: NOW_MS });
+
+  assert.deepEqual(ranked.map(item => item.sourceRow), ['2', '1']);
+  assert.equal(ranked[0].needsActivation, true);
+  assert.equal(ranked[0].weeklyUrgency, 0);
+  assert.deepEqual(recommendAccount(ranked), {
+    action: 'switch',
+    account: ranked[0],
+    reason: 'needs-activation',
+  });
+});
+
+test('an active unstarted weekly cycle recommends one activation use without switching', () => {
+  const ranked = rankAccounts([
+    account(1, { active: true, weeklyRemaining: 100, weeklyResetAt: NOW_MS / 1000 }),
+    account(2, { weeklyRemaining: 60 }),
+  ], { nowMs: NOW_MS });
+
+  assert.equal(recommendAccount(ranked).action, 'stay');
+  assert.equal(recommendAccount(ranked).reason, 'needs-activation');
+});
+
+test('100% weekly with a new 168-hour window uses normal W%/H', () => {
+  const scored = scoreAccount(account(1, {
+    weeklyRemaining: 100,
+    weeklyResetAt: (NOW_MS + 168 * 3_600_000) / 1000,
+  }), { nowMs: NOW_MS });
+
+  assert.equal(scored.needsActivation, false);
+  assert.ok(Math.abs(scored.weeklyUrgency - 100 / 168) < 1e-12);
+});
+
+test('0% weekly with a future automatic reset never needs activation', () => {
+  const scored = scoreAccount(account(1, {
+    weeklyRemaining: 0,
+    weeklyResetAt: (NOW_MS + 30 * 60_000) / 1000,
+  }), { nowMs: NOW_MS });
+
+  assert.equal(scored.needsActivation, false);
+  assert.equal(scored.weeklyUrgency, 0);
+});
+
 test('a clear weekly-urgency winner ranks first despite weaker 5H', () => {
   assert.deepEqual(ranks([
     account(1, { weeklyRemaining: 60, weeklyResetAt: (NOW_MS + 2 * 3_600_000) / 1000, fiveHourRemaining: 20 }),

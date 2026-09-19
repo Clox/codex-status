@@ -99,7 +99,11 @@ Open **Codex-kontostatus** for the compact status window. It refreshes every ten
 
 The status window and ChatGPT have independent lifetimes. Account switches and ChatGPT launches started from the status window run in a detached session, so closing the terminal does not terminate Desktop. Opening the status window by itself does not open ChatGPT.
 
-The status columns show remaining percentages, a rounded eighth-block indicator (` `, `▁` through `█`), and time until reset as `HH:MM`. `W%/H` shows weekly percentage remaining per hour until the weekly reset, which is the same urgency value used by the ranking. Local-only data is a cached observation, not a live server poll. An inactive account commonly remains stale until that account is used and a suitable local rate-limit event is written.
+The `RESETS` column shows saved Codex resets as `XX×HHH:MM`: the available count and the countdown until the earliest expiration. A dash means no saved reset. Reset details are refreshed at most once every five minutes from Codex's read-only reset-credit endpoint and cached locally without tokens; all returned expiration times are retained in the private cache. If the service reports a count but omits one or more detail rows, the countdown is shown as unknown rather than guessing. Countdown hours are allowed to exceed 999 and the column expands only when necessary.
+
+The usage columns show remaining percentages, a rounded eighth-block indicator (` `, `▁` through `█`), and time until reset as `HH:MM`. `W%/H` shows weekly percentage remaining per hour until the weekly reset, which is the same urgency value used by the ranking. Usage data remains a cached local observation, not a live server poll. An inactive account commonly remains stale until that account is used and a suitable local rate-limit event is written. Saved-reset data is presentation-only and does not affect ranking or recommendation.
+
+After an automatic weekly reset, Codex can report `100%` with `0:00` until the account is used once. The status window treats this as `NEEDS_ACTIVATION`, shows `START` instead of a false W%/H value, and temporarily prioritizes one minimal use of that account. Once Codex reports a normal future weekly reset, ordinary ranking resumes automatically.
 
 Ranking uses `weekly remaining / hours until weekly reset` as its primary signal. Accounts within 10% of the best weekly urgency form a group whose internal order is decided by current 5H quota plus a small bonus for a reset within the next hour. Recommendation is deliberately more conservative than ranking: it has separate 10% weekly hysteresis, and a 5H advantage can only trigger a switch between weekly-near-equals when the active account's reset-aware 5H score is at or below 10 and the alternative still has both a 10-point and 10% relative advantage. These constants live together in `tools/workstation/codex-auth/lib/codex-account-ranking.js`.
 
@@ -131,8 +135,11 @@ Conversation visibility comes from the shared local state, not from copying auth
 - `$HOME/.local/bin/codex-account`
 - `$HOME/.local/bin/codex-usage-watch`
 - `$HOME/.local/bin/codex-usage-annotate`
+- `$HOME/.local/bin/codex-reset-credits-refresh`
 - `$HOME/.local/lib/codex-account-ranking.js`
+- `$HOME/.local/lib/codex-reset-credits.js`
 - `$HOME/.local/lib/codex-usage-format.js`
+- `$HOME/.cache/codex-account-switcher/reset-credits.json` — mode `0600`, token-free reset count/expiration cache
 - `$HOME/.local/share/applications/codex-account{1,2,3}.desktop`
 - `$HOME/.local/share/applications/codex-usage-watch.desktop`
 - GNOME Terminal profile `Codex-status`
