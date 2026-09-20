@@ -1,0 +1,42 @@
+#!/usr/bin/env node
+
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const {
+  resolveExpectedAccount,
+  verifyActiveAccountState,
+} = require(path.join(__dirname, '..', 'lib', 'codex-account-state'));
+
+function fail(message, code = 1) {
+  process.stderr.write(`${message}\n`);
+  process.exit(code);
+}
+
+const [command, codexHome, ...args] = process.argv.slice(2);
+if (!['resolve', 'verify'].includes(command) || !codexHome) {
+  fail('Usage: codex-account-state resolve <CODEX_HOME> <selector> | verify <CODEX_HOME> <account-id> <account-key>', 64);
+}
+
+function readJson(filename) {
+  return JSON.parse(fs.readFileSync(filename, 'utf8'));
+}
+
+try {
+  const registry = readJson(path.join(codexHome, 'accounts', 'registry.json'));
+  if (command === 'resolve') {
+    const [selector] = args;
+    if (!selector) fail('Missing account selector', 64);
+    const expected = resolveExpectedAccount(registry, selector);
+    process.stdout.write(`${expected.accountId}\t${expected.accountKey}\n`);
+  } else {
+    const [expectedAccountId, expectedAccountKey] = args;
+    if (!expectedAccountId || !expectedAccountKey) fail('Missing expected account state', 64);
+    const globalAuth = readJson(path.join(codexHome, 'auth.json'));
+    const result = verifyActiveAccountState({ registry, globalAuth, expectedAccountId, expectedAccountKey });
+    if (!result.ok) fail(`Account switch postcondition failed: ${result.errors.join(', ')}`, 3);
+  }
+} catch (error) {
+  fail(`Account state verification failed: ${error.message}`, 3);
+}

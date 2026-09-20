@@ -1,0 +1,19 @@
+[Unit]
+Description=Safely activate verified dormant Codex 5H windows
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/codex-five-hour-activation-worker
+TimeoutStartSec=5min
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.cache/codex-account-switcher
+RestrictSUIDSGID=true
+StandardOutput=journal
+StandardError=journal

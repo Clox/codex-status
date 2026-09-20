@@ -1,0 +1,201 @@
+#!/usr/bin/env node
+
+'use strict';
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const {
+  CACHE_VERSION,
+  DEFAULT_POLL_INTERVAL_MS,
+  refreshUsageCache,
+  shouldRefreshCache,
+} = require(path.join(__dirname, '..', 'lib', 'codex-usage-cache'));
+
+const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+const registryPath = path.join(codexHome, 'accounts', 'registry.json');
+const cachePath = process.env.USAGE_CACHE || path.join(
+  process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache'),
+  'codex-account-switcher',
+  'usage.json'
+);
+const pollIntervalMs = Number(process.env.USAGE_REFRESH_INTERVAL_MS || DEFAULT_POLL_INTERVAL_MS);
+const requestTimeoutMs = Number(process.env.USAGE_REQUEST_TIMEOUT_MS || 10_000);
+const lockPath = `${cachePath}.lock`;
+
+function readJson(filename) {
+  return JSON.parse(fs.readFileSync(filename, 'utf8'));
+}
+
+function readCache() {
+  try {
+    return readJson(cachePath);
+  } catch {
+    return {};
+  }
+}
+
+function accountsFromRegistry(registry) {
+  return Array.isArray(registry.accounts)
+    ? registry.accounts
+    : Object.values(registry.accounts || {});
+}
+
+function credentialsByAccountId() {
+  const credentials = new Map();
+  const directory = path.join(codexHome, 'accounts');
+  for (const filename of fs.readdirSync(directory).filter(name => name.endsWith('.auth.json'))) {
+    try {
+      const auth = readJson(path.join(directory, filename));
+      if (auth?.tokens?.account_id && auth?.tokens?.access_token) {
+        credentials.set(auth.tokens.account_id, auth.tokens.access_token);
+      }
+    } catch {
+      // A concurrent credential update is retried at the next scheduled refresh.
+    }
+  }
+  return credentials;
+}
+
+function ensurePrivateCacheDirectory() {
+  const directory = path.dirname(cachePath);
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  fs.chmodSync(directory, 0o700);
+}
+
+function writeCache(cache) {
+  ensurePrivateCacheDirectory();
+  const temporaryPath = `${cachePath}.${process.pid}.tmp`;
+  fs.writeFileSync(temporaryPath, `${JSON.stringify(cache, null, 2)}\n`, { mode: 0o600 });
+  fs.renameSync(temporaryPath, cachePath);
+  fs.chmodSync(cachePath, 0o600);
+}
+
+function acquireLock() {
+  ensurePrivateCacheDirectory();
+  try {
+    return fs.openSync(lockPath, 'wx', 0o600);
+  } catch (error) {
+    if (error.code !== 'EEXIST') throw error;
+    try {
+      if (Date.now() - fs.statSync(lockPath).mtimeMs > requestTimeoutMs * 2) {
+        fs.unlinkSync(lockPath);
+        return fs.openSync(lockPath, 'wx', 0o600);
+      }
+    } catch {}
+    return null;
+  }
+}
+
+async function fetchUsage(accountId, accessToken) {
+  let response;
+  try {
+    response = await fetch('https://chatgpt.com/backend-api/wham/usage', {
+      headers: {
+        Accept: 'application/json',
+        Authorization: `Bearer ${accessToken}`,
+        'ChatGPT-Account-Id': accountId,
+      },
+      signal: AbortSignal.timeout(requestTimeoutMs),
+    });
+  } catch (cause) {
+    const error = new Error('usage request failed');
+    error.errorKind = cause?.name === 'TimeoutError' || cause?.name === 'AbortError' ? 'timeout' : 'network';
+    error.httpStatus = null;
+    throw error;
+  }
+  if (!response.ok) {
+    const error = new Error('usage endpoint rejected request');
+    error.errorKind = response.status === 401
+      ? 'auth-401'
+      : response.status === 403
+        ? 'auth-403'
+        : response.status >= 500
+          ? 'server'
+          : 'http';
+    error.httpStatus = response.status;
+    throw error;
+  }
+  try {
+    const payload = await response.json();
+    const observedAtMs = Date.now();
+    const serverDateMs = Date.parse(response.headers.get('date') || '');
+    return {
+      payload,
+      observedAtMs,
+      serverObservedAtMs: Number.isFinite(serverDateMs) ? serverDateMs : null,
+    };
+  } catch {
+    const error = new Error('usage response was not valid JSON');
+    error.errorKind = 'protocol';
+    error.httpStatus = response.status;
+    throw error;
+  }
+}
+
+function withWorkerHeartbeat(cache, nowMs) {
+  return {
+    ...cache,
+    version: CACHE_VERSION,
+    worker: {
+      ...(cache.worker || {}),
+      version: CACHE_VERSION,
+      heartbeatAtMs: nowMs,
+    },
+  };
+}
+
+function withWorkerFatal(cache, nowMs, errorKind) {
+  return {
+    ...withWorkerHeartbeat(cache, nowMs),
+    lastAttemptAtMs: nowMs,
+    worker: {
+      ...(cache.worker || {}),
+      version: CACHE_VERSION,
+      heartbeatAtMs: nowMs,
+      lastStartedAtMs: nowMs,
+      lastFatalAtMs: nowMs,
+      fatalErrorKind: errorKind,
+    },
+  };
+}
+
+async function main() {
+  const lockFd = acquireLock();
+  if (lockFd === null) return;
+  try {
+    const previousCache = readCache();
+    const nowMs = Date.now();
+    if (!shouldRefreshCache(previousCache, nowMs, pollIntervalMs)) {
+      writeCache(withWorkerHeartbeat(previousCache, nowMs));
+      return;
+    }
+    try {
+      const registry = readJson(registryPath);
+      const cache = await refreshUsageCache({
+        accounts: accountsFromRegistry(registry),
+        credentialsByAccountId: credentialsByAccountId(),
+        previousCache,
+        fetchUsage,
+        nowMs,
+      });
+      writeCache(cache);
+    } catch (error) {
+      const errorKind = error?.code === 'ENOENT' || error instanceof SyntaxError
+        ? 'state-read'
+        : 'worker-fatal';
+      writeCache(withWorkerFatal(previousCache, nowMs, errorKind));
+      throw new Error(errorKind);
+    }
+  } finally {
+    fs.closeSync(lockFd);
+    try {
+      fs.unlinkSync(lockPath);
+    } catch {}
+  }
+}
+
+main().catch(error => {
+  process.stderr.write(`Codex usage refresh failed safely: ${error.message}\n`);
+  process.exitCode = 1;
+});

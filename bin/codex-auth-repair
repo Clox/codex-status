@@ -1,0 +1,320 @@
+#!/usr/bin/env node
+
+'use strict';
+
+const crypto = require('crypto');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const readline = require('readline/promises');
+const { spawnSync } = require('child_process');
+const {
+  acquireAccountActivationLock,
+  releaseAccountActivationLock,
+} = require(path.join(__dirname, '..', 'lib', 'codex-activation-lock'));
+const {
+  accountId,
+  accountsFromRegistry,
+  repairableAccounts,
+  validateInactivePrecondition,
+  validatePostImport,
+  validateStagedIdentity,
+} = require(path.join(__dirname, '..', 'lib', 'codex-auth-repair'));
+
+const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+const codexAuthBin = process.env.CODEX_AUTH_BIN || 'codex-auth';
+const usageRefresher = process.env.USAGE_REFRESHER || path.join(os.homedir(), '.local', 'bin', 'codex-usage-refresh');
+const usageCachePath = process.env.USAGE_CACHE || path.join(os.homedir(), '.cache', 'codex-account-switcher', 'usage.json');
+const codexLoginBin = process.env.CODEX_LOGIN_BIN || '/usr/lib/chatgpt/resources/codex';
+const registryPath = path.join(codexHome, 'accounts', 'registry.json');
+const globalAuthPath = path.join(codexHome, 'auth.json');
+const lockPath = `${usageCachePath}.auth-repair.lock`;
+const activationLockDirectory = path.join(path.dirname(usageCachePath), 'activation-locks');
+
+function fail(message, code = 1) {
+  const error = new Error(message);
+  error.exitCode = code;
+  throw error;
+}
+
+function readJson(filename) {
+  return JSON.parse(fs.readFileSync(filename, 'utf8'));
+}
+
+function hashFile(filename) {
+  return crypto.createHash('sha256').update(fs.readFileSync(filename)).digest('hex');
+}
+
+function atomicRestore(source, destination) {
+  const temporary = `${destination}.repair-${process.pid}.tmp`;
+  fs.copyFileSync(source, temporary);
+  fs.chmodSync(temporary, 0o600);
+  fs.renameSync(temporary, destination);
+}
+
+function snapshotFiles(home) {
+  const directory = path.join(home, 'accounts');
+  return fs.readdirSync(directory)
+    .filter(name => name.endsWith('.auth.json'))
+    .map(name => path.join(directory, name));
+}
+
+function findSnapshot(home, wantedAccountId) {
+  const matches = snapshotFiles(home).filter(filename => {
+    try {
+      return readJson(filename)?.tokens?.account_id === wantedAccountId;
+    } catch {
+      return false;
+    }
+  });
+  if (matches.length !== 1) fail(`Expected exactly one managed snapshot for the selected account; found ${matches.length}.`);
+  return matches[0];
+}
+
+function snapshotHashes(home) {
+  return new Map(snapshotFiles(home).map(filename => [path.basename(filename), hashFile(filename)]));
+}
+
+function assertOtherSnapshotsUnchanged(before, after, targetBasename) {
+  const names = new Set([...before.keys(), ...after.keys()]);
+  for (const name of names) {
+    if (name === targetBasename) continue;
+    if (before.get(name) !== after.get(name)) fail(`Another account snapshot changed unexpectedly: ${name}`);
+  }
+}
+
+function run(command, args, options = {}) {
+  const result = spawnSync(command, args, {
+    stdio: 'inherit',
+    ...options,
+  });
+  if (result.error) fail(`${path.basename(command)} could not start: ${result.error.message}`);
+  if (result.status !== 0) fail(`${path.basename(command)} exited without completing the repair.`);
+}
+
+function verifyFreshUsage(cachePath, wantedAccountId) {
+  const cache = readJson(cachePath);
+  const entry = cache?.accounts?.[wantedAccountId];
+  const ageMs = Date.now() - Number(entry?.refresh?.lastSuccessAt);
+  if (
+    entry?.refresh?.errorKind ||
+    entry?.refresh?.httpStatus !== 200 ||
+    !Number.isFinite(ageMs) ||
+    ageMs < 0 ||
+    ageMs > 180_000
+  ) {
+    fail('The repaired credential did not produce fresh verified server usage.');
+  }
+}
+
+function acquireLock() {
+  fs.mkdirSync(path.dirname(lockPath), { recursive: true, mode: 0o700 });
+  try {
+    const fd = fs.openSync(lockPath, 'wx', 0o600);
+    fs.writeFileSync(fd, `${process.pid}\n`);
+    return fd;
+  } catch (error) {
+    if (error.code !== 'EEXIST') throw error;
+    let pid = null;
+    try { pid = Number(fs.readFileSync(lockPath, 'utf8').trim()); } catch {}
+    try {
+      if (Number.isInteger(pid) && pid > 0) process.kill(pid, 0);
+      fail('Another authentication repair is already running.');
+    } catch (processError) {
+      if (processError.code !== 'ESRCH') throw processError;
+      fs.unlinkSync(lockPath);
+      return acquireLock();
+    }
+  }
+}
+
+async function chooseTarget(accounts) {
+  if (accounts.length === 1) return accounts[0];
+  process.stdout.write('Accounts requiring authentication repair:\n');
+  accounts.forEach((account, index) => process.stdout.write(`  ${index + 1}. ${account.email || account.alias || account.account_key}\n`));
+  const terminal = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = await terminal.question(`Choose account [1-${accounts.length}]: `);
+    const index = Number(answer) - 1;
+    if (!Number.isInteger(index) || index < 0 || index >= accounts.length) fail('Invalid account choice.', 64);
+    return accounts[index];
+  } finally {
+    terminal.close();
+  }
+}
+
+async function main() {
+  const lockFd = acquireLock();
+  let stagingRoot = null;
+  let rollbackRoot = null;
+  let mutationStarted = false;
+  let targetSnapshot = null;
+  let backupTarget = null;
+  let backupRegistry = null;
+  let backupGlobal = null;
+  let backupUsage = null;
+  let backupSnapshotsDirectory = null;
+  let beforeSnapshotHashes = null;
+  let accountActivationLock = null;
+
+  try {
+    const beforeRegistry = readJson(registryPath);
+    const beforeGlobalAuth = readJson(globalAuthPath);
+    const usageCache = readJson(usageCachePath);
+    const candidates = repairableAccounts(beforeRegistry, usageCache);
+    if (candidates.length === 0) fail('No account currently has a repairable authentication error.', 2);
+    const target = await chooseTarget(candidates);
+    const precondition = validateInactivePrecondition({ target, registry: beforeRegistry, globalAuth: beforeGlobalAuth });
+    if (!precondition.ok) {
+      if (precondition.errors.includes('target-is-active')) {
+        fail('The broken account is active. Switch to a different VERIFIED account first, then retry repair. Desktop and global auth were not changed.', 3);
+      }
+      fail(`Global auth/registry precondition failed: ${precondition.errors.join(', ')}`, 3);
+    }
+    accountActivationLock = acquireAccountActivationLock(activationLockDirectory, accountId(target));
+
+    const targetLabel = target.email || target.alias || target.account_key;
+    process.stdout.write(`\nRepairing authentication for ${targetLabel}.\n`);
+    process.stdout.write('The normal OpenAI ChatGPT login will open in your browser.\n');
+    process.stdout.write(`Make sure you sign in as ${targetLabel}. A different account will be rejected without changing your saved accounts.\n\n`);
+
+    if (process.argv.includes('--preflight')) {
+      process.stdout.write('Preflight complete. Interactive login was not started.\n');
+      return;
+    }
+
+    stagingRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-auth-repair-'));
+    fs.chmodSync(stagingRoot, 0o700);
+    fs.writeFileSync(path.join(stagingRoot, 'config.toml'), [
+      'cli_auth_credentials_store = "file"',
+      'forced_login_method = "chatgpt"',
+      '',
+    ].join('\n'), { mode: 0o600 });
+
+    const loginPath = `${path.dirname(codexLoginBin)}:${process.env.PATH || '/usr/local/bin:/usr/bin:/bin'}`;
+    run(codexAuthBin, ['login'], {
+      env: { ...process.env, CODEX_HOME: stagingRoot, PATH: loginPath },
+    });
+
+    const stagedRegistry = readJson(path.join(stagingRoot, 'accounts', 'registry.json'));
+    const stagedAuth = readJson(path.join(stagingRoot, 'auth.json'));
+    const stagedIdentity = validateStagedIdentity({ target, stagedRegistry, stagedAuth });
+    if (!stagedIdentity.ok) {
+      fail(`The browser login returned a different account; no saved state was changed (${stagedIdentity.errors.join(', ')}).`, 4);
+    }
+
+    const stagedUsageCache = path.join(stagingRoot, 'usage.json');
+    run(usageRefresher, [], {
+      env: {
+        ...process.env,
+        CODEX_HOME: stagingRoot,
+        USAGE_CACHE: stagedUsageCache,
+        USAGE_REFRESH_INTERVAL_MS: '0',
+      },
+    });
+    verifyFreshUsage(stagedUsageCache, accountId(target));
+
+    targetSnapshot = findSnapshot(codexHome, accountId(target));
+    beforeSnapshotHashes = snapshotHashes(codexHome);
+    rollbackRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-auth-repair-rollback-'));
+    fs.chmodSync(rollbackRoot, 0o700);
+    backupSnapshotsDirectory = path.join(rollbackRoot, 'snapshots');
+    fs.mkdirSync(backupSnapshotsDirectory, { mode: 0o700 });
+    backupTarget = path.join(rollbackRoot, 'target.auth.json');
+    backupRegistry = path.join(rollbackRoot, 'registry.json');
+    backupGlobal = path.join(rollbackRoot, 'global-auth.json');
+    backupUsage = path.join(rollbackRoot, 'usage.json');
+    fs.copyFileSync(targetSnapshot, backupTarget);
+    fs.copyFileSync(registryPath, backupRegistry);
+    fs.copyFileSync(globalAuthPath, backupGlobal);
+    if (fs.existsSync(usageCachePath)) fs.copyFileSync(usageCachePath, backupUsage);
+    for (const filename of snapshotFiles(codexHome)) {
+      const backup = path.join(backupSnapshotsDirectory, path.basename(filename));
+      fs.copyFileSync(filename, backup);
+      fs.chmodSync(backup, 0o600);
+    }
+    for (const filename of [backupTarget, backupRegistry, backupGlobal, ...(fs.existsSync(backupUsage) ? [backupUsage] : [])]) {
+      fs.chmodSync(filename, 0o600);
+    }
+
+    mutationStarted = true;
+    const importArgs = ['import', path.join(stagingRoot, 'auth.json')];
+    if (target.alias) importArgs.push('--alias', target.alias);
+    run(codexAuthBin, importArgs, { env: { ...process.env, CODEX_HOME: codexHome } });
+
+    const afterRegistry = readJson(registryPath);
+    const afterGlobalAuth = readJson(globalAuthPath);
+    const afterTargetSnapshot = findSnapshot(codexHome, accountId(target));
+    const afterTargetAuth = readJson(afterTargetSnapshot);
+    const postcondition = validatePostImport({
+      target,
+      beforeRegistry,
+      beforeGlobalAuth,
+      afterRegistry,
+      afterGlobalAuth,
+      afterTargetAuth,
+    });
+    if (!postcondition.ok) fail(`Repair postcondition failed: ${postcondition.errors.join(', ')}`, 5);
+    if (hashFile(globalAuthPath) !== hashFile(backupGlobal)) fail('Global auth changed during inactive-account repair.', 5);
+    assertOtherSnapshotsUnchanged(beforeSnapshotHashes, snapshotHashes(codexHome), path.basename(targetSnapshot));
+
+    run(usageRefresher, [], {
+      env: {
+        ...process.env,
+        CODEX_HOME: codexHome,
+        USAGE_CACHE: usageCachePath,
+        USAGE_REFRESH_INTERVAL_MS: '0',
+      },
+    });
+    verifyFreshUsage(usageCachePath, accountId(target));
+    mutationStarted = false;
+    process.stdout.write(`\nAuthentication repaired and server-verified for ${targetLabel}.\n`);
+    process.stdout.write('Desktop remained on the previously active account. The status window will update automatically.\n');
+  } catch (error) {
+    if (mutationStarted && targetSnapshot && backupTarget && backupRegistry && backupGlobal) {
+      try {
+        if (backupSnapshotsDirectory && beforeSnapshotHashes) {
+          for (const filename of snapshotFiles(codexHome)) {
+            if (!beforeSnapshotHashes.has(path.basename(filename))) fs.unlinkSync(filename);
+          }
+          for (const name of beforeSnapshotHashes.keys()) {
+            atomicRestore(path.join(backupSnapshotsDirectory, name), path.join(codexHome, 'accounts', name));
+          }
+        } else {
+          atomicRestore(backupTarget, targetSnapshot);
+        }
+        atomicRestore(backupRegistry, registryPath);
+        atomicRestore(backupGlobal, globalAuthPath);
+        if (backupUsage && fs.existsSync(backupUsage)) atomicRestore(backupUsage, usageCachePath);
+        process.stderr.write('Repair failed after staging; previous auth, registry, and usage error state were restored.\n');
+      } catch {
+        process.stderr.write('CRITICAL: automatic rollback could not be completed. Do not start or switch Desktop accounts until state is inspected.\n');
+      }
+    }
+    process.stderr.write(`Authentication repair did not complete: ${error.message}\n`);
+    process.exitCode = error.exitCode || 1;
+  } finally {
+    if (stagingRoot) fs.rmSync(stagingRoot, { recursive: true, force: true });
+    if (rollbackRoot) fs.rmSync(rollbackRoot, { recursive: true, force: true });
+    releaseAccountActivationLock(accountActivationLock);
+    try { fs.closeSync(lockFd); } catch {}
+    try { fs.unlinkSync(lockPath); } catch {}
+  }
+}
+
+async function holdTerminalIfRequested() {
+  if (!process.argv.includes('--hold') || !process.stdin.isTTY || !process.stdout.isTTY) return;
+  const terminal = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    await terminal.question('\nPress Enter to close this window.');
+  } finally {
+    terminal.close();
+  }
+}
+
+main()
+  .catch(error => {
+    process.stderr.write(`Authentication repair could not start: ${error.message}\n`);
+    process.exitCode = error.exitCode || 1;
+  })
+  .finally(holdTerminalIfRequested);

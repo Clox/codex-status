@@ -16,6 +16,7 @@ function account(sourceRow, overrides = {}) {
     sourceRow: String(sourceRow),
     label: `Account ${sourceRow}`,
     active: false,
+    usageQuality: 'verified',
     weeklyRemaining: 50,
     weeklyResetAt: resetInHours(5),
     fiveHourRemaining: 50,
@@ -39,7 +40,7 @@ test('weekly urgency is remaining weekly percentage per reset hour', () => {
 test('100% weekly with no running window needs activation and ranks first', () => {
   const ranked = rankAccounts([
     account(1, { active: true, weeklyRemaining: 60 }),
-    account(2, { weeklyRemaining: 100, weeklyResetAt: NOW_MS / 1000 }),
+    account(2, { usageFresh: true, weeklyRemaining: 100, weeklyResetAt: NOW_MS / 1000 }),
   ], { nowMs: NOW_MS });
 
   assert.deepEqual(ranked.map(item => item.sourceRow), ['2', '1']);
@@ -50,6 +51,56 @@ test('100% weekly with no running window needs activation and ranks first', () =
     account: ranked[0],
     reason: 'needs-activation',
   });
+});
+
+test('stale 100% weekly data never creates NEEDS_ACTIVATION', () => {
+  const scored = scoreAccount(account(1, {
+    usageQuality: 'stale',
+    weeklyRemaining: 100,
+    weeklyResetAt: NOW_MS / 1000,
+  }), { nowMs: NOW_MS });
+
+  assert.equal(scored.needsActivation, false);
+});
+
+test('VERIFIED accounts rank ahead of stronger stale and unverified values', () => {
+  const ranked = rankAccounts([
+    account(1, { usageQuality: 'stale', weeklyRemaining: 100, weeklyResetAt: (NOW_MS + 1 * 3_600_000) / 1000 }),
+    account(2, { usageQuality: 'verified', weeklyRemaining: 10, weeklyResetAt: (NOW_MS + 100 * 3_600_000) / 1000 }),
+    account(3, { usageQuality: 'unverified', weeklyRemaining: 100, weeklyResetAt: (NOW_MS + 1 * 3_600_000) / 1000 }),
+  ], { nowMs: NOW_MS });
+  assert.deepEqual(ranked.map(item => item.sourceRow), ['2', '1', '3']);
+});
+
+test('an UNVERIFIED active account pauses recommendation instead of saying stay', () => {
+  const ranked = rankAccounts([
+    account(1, { active: true, usageQuality: 'unverified', weeklyRemaining: 90, fiveHourRemaining: 90 }),
+    account(2, { usageQuality: 'verified', weeklyRemaining: 50, fiveHourRemaining: 50 }),
+  ], { nowMs: NOW_MS });
+  assert.deepEqual(recommendAccount(ranked), {
+    action: 'none',
+    account: ranked.find(item => item.sourceRow === '1'),
+    reason: 'active-unverified',
+  });
+});
+
+test('an exhausted verified active account pauses when no verified usable alternative exists', () => {
+  const ranked = rankAccounts([
+    account(1, { active: true, fiveHourRemaining: 0 }),
+    account(2, { usageQuality: 'unverified', fiveHourRemaining: 90, weeklyRemaining: 90 }),
+  ], { nowMs: NOW_MS });
+  const recommendation = recommendAccount(ranked);
+  assert.equal(recommendation.action, 'none');
+  assert.equal(recommendation.reason, 'insufficient-verified-data');
+});
+
+test('a stale active account pauses recommendation until refresh recovers', () => {
+  const ranked = rankAccounts([
+    account(1, { active: true, usageQuality: 'stale' }),
+    account(2, { usageQuality: 'verified' }),
+  ], { nowMs: NOW_MS });
+  assert.equal(recommendAccount(ranked).action, 'none');
+  assert.equal(recommendAccount(ranked).reason, 'active-stale');
 });
 
 test('an active unstarted weekly cycle recommends one activation use without switching', () => {
@@ -194,14 +245,14 @@ test('stays on the highest-weekly-urgency active account from the reported regre
   const resetInHours = hours => (NOW_MS + hours * 3_600_000) / 1000;
   const ranked = rankAccounts([
     account(1, {
-      label: 'alexander.',
+      label: 'account-a',
       fiveHourRemaining: 69,
       fiveHourResetAt: resetInHours(1 + 10 / 60),
       weeklyRemaining: 27,
       weeklyResetAt: resetInHours(24 + 20 / 60),
     }),
     account(2, {
-      label: 'marko.aik.',
+      label: 'account-b',
       active: true,
       fiveHourRemaining: 47,
       fiveHourResetAt: resetInHours(2 + 45 / 60),
@@ -209,7 +260,7 @@ test('stays on the highest-weekly-urgency active account from the reported regre
       weeklyResetAt: resetInHours(12),
     }),
     account(3, {
-      label: 'ogggan@gm.',
+      label: 'account-c',
       fiveHourRemaining: 100,
       fiveHourResetAt: resetInHours(0),
       weeklyRemaining: 42,

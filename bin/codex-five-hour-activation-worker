@@ -1,0 +1,202 @@
+#!/usr/bin/env node
+
+'use strict';
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { spawnSync } = require('child_process');
+const {
+  acquireAccountActivationLock,
+  releaseAccountActivationLock,
+} = require(path.join(__dirname, '..', 'lib', 'codex-activation-lock'));
+const {
+  configuredValue,
+  loadCredential,
+  readJson,
+} = require(path.join(__dirname, '..', 'lib', 'codex-activation-account'));
+const {
+  executeVerifiedFiveHourActivation,
+} = require(path.join(__dirname, '..', 'lib', 'codex-five-hour-activation'));
+const {
+  ACTIVATION_STATE_VERSION,
+  runFiveHourActivationCycle,
+  safeErrorKind,
+} = require(path.join(__dirname, '..', 'lib', 'codex-five-hour-worker'));
+const {
+  authStateMatches,
+  fetchFreshUsageObservation,
+  fingerprintAuthState,
+  generateAndCheckSchema,
+  runIsolatedCodexTurn,
+} = require(path.join(__dirname, '..', 'lib', 'codex-weekly-activation'));
+
+const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+const configFile = path.join(
+  process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'),
+  'codex-account-switcher',
+  'accounts.conf'
+);
+const cacheDirectory = path.join(
+  process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache'),
+  'codex-account-switcher'
+);
+const usageCacheFile = process.env.USAGE_CACHE || configuredValue(configFile, 'USAGE_CACHE') || path.join(cacheDirectory, 'usage.json');
+const stateFile = process.env.FIVE_HOUR_ACTIVATION_STATE ||
+  configuredValue(configFile, 'FIVE_HOUR_ACTIVATION_STATE') ||
+  path.join(cacheDirectory, 'five-hour-activation.json');
+const usageRefresher = process.env.USAGE_REFRESHER ||
+  configuredValue(configFile, 'USAGE_REFRESHER') ||
+  path.join(os.homedir(), '.local', 'bin', 'codex-usage-refresh');
+const codexBin = process.env.CODEX_ACTIVATION_BIN || '/usr/lib/chatgpt/resources/codex';
+const lockDirectory = path.join(cacheDirectory, 'activation-locks');
+
+function accountsFromRegistry(registry) {
+  return Array.isArray(registry.accounts)
+    ? registry.accounts
+    : Object.values(registry.accounts || {});
+}
+
+function readOptionalState() {
+  try {
+    return readJson(stateFile);
+  } catch (error) {
+    if (error.code === 'ENOENT') return {};
+    throw new Error('ACTIVATION_STATE_READ_FAILED');
+  }
+}
+
+function writeState(state) {
+  fs.mkdirSync(path.dirname(stateFile), { recursive: true, mode: 0o700 });
+  fs.chmodSync(path.dirname(stateFile), 0o700);
+  const temporary = `${stateFile}.${process.pid}.tmp`;
+  fs.writeFileSync(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+  fs.renameSync(temporary, stateFile);
+  fs.chmodSync(stateFile, 0o600);
+}
+
+function writeFatalState(previousState, error) {
+  const nowMs = Date.now();
+  writeState({
+    ...previousState,
+    version: ACTIVATION_STATE_VERSION,
+    enabled: true,
+    worker: {
+      ...(previousState?.worker || {}),
+      pid: null,
+      heartbeatAtMs: nowMs,
+      lastFatalAtMs: nowMs,
+      fatalErrorKind: safeErrorKind(error),
+    },
+    accounts: { ...(previousState?.accounts || {}) },
+  });
+}
+
+function forceUsageRefresh() {
+  const result = spawnSync(usageRefresher, [], {
+    env: {
+      ...process.env,
+      CODEX_HOME: codexHome,
+      USAGE_CACHE: usageCacheFile,
+      USAGE_REFRESH_INTERVAL_MS: '0',
+    },
+    stdio: 'ignore',
+    timeout: 45_000,
+  });
+  if (result.status !== 0) throw new Error('USAGE_REFRESHER_FAILED');
+}
+
+async function activateAccount(account, accountId, accessToken, usageCache, hooks) {
+  const accountLock = acquireAccountActivationLock(lockDirectory, accountId);
+  let tempRoot = null;
+
+  try {
+    tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-five-hour-worker-'));
+    fs.chmodSync(tempRoot, 0o700);
+    const privateHome = path.join(tempRoot, 'home');
+    const schemaDirectory = path.join(tempRoot, 'schema');
+    fs.mkdirSync(privateHome, { mode: 0o700 });
+    const fetchObservation = () => fetchFreshUsageObservation({ accountId, accessToken });
+    generateAndCheckSchema({ codexBin, privateHome, schemaDirectory });
+    const beforeFingerprint = fingerprintAuthState(codexHome);
+    let activationResult = null;
+    let activationError = null;
+    try {
+      activationResult = await executeVerifiedFiveHourActivation({
+        cache: usageCache,
+        accountId,
+        accessToken,
+        fetchObservation,
+        runTurn: async () => {
+          await hooks.beforeTurn();
+          await runIsolatedCodexTurn({
+            codexBin,
+            privateHome,
+            accountId,
+            accessToken,
+            planType: account.plan,
+          });
+        },
+      });
+    } catch (error) {
+      activationError = error;
+    }
+    const afterFingerprint = fingerprintAuthState(codexHome);
+    if (!authStateMatches(beforeFingerprint, afterFingerprint)) {
+      throw new Error('GLOBAL_AUTH_STATE_CHANGED');
+    }
+    if (activationError) throw activationError;
+    const observations = activationResult.after?.accounts?.[accountId]?.observations?.primary || [];
+    const activatedResetAt = Number(observations.at(-1)?.resetAt);
+    return { activatedResetAt: Number.isFinite(activatedResetAt) ? activatedResetAt : null };
+  } finally {
+    if (tempRoot) fs.rmSync(tempRoot, { recursive: true, force: true });
+    releaseAccountActivationLock(accountLock);
+  }
+}
+
+async function main() {
+  let previousState = {};
+  let workerLock = null;
+  try {
+    workerLock = acquireAccountActivationLock(lockDirectory, '__worker__');
+    previousState = readOptionalState();
+    forceUsageRefresh();
+    const registry = readJson(path.join(codexHome, 'accounts', 'registry.json'));
+    const accounts = accountsFromRegistry(registry);
+    const usageCache = readJson(usageCacheFile);
+    const finalState = await runFiveHourActivationCycle({
+      accounts,
+      usageCache,
+      previousState,
+      persistState: async state => writeState(state),
+      activateAccount: async (account, hooks) => {
+        const accountId = account.chatgpt_account_id || account.accountId;
+        const accessToken = loadCredential(codexHome, accountId);
+        return activateAccount(account, accountId, accessToken, usageCache, hooks);
+      },
+    });
+    const succeeded = Object.values(finalState.accounts).filter(entry => entry.phase === 'succeeded').length;
+    const blocked = Object.values(finalState.accounts).filter(entry => entry.phase === 'blocked').length;
+    process.stdout.write(`5H activation worker completed safely: succeeded=${succeeded}, blocked=${blocked}.\n`);
+  } catch (error) {
+    if (error?.message === 'ACTIVATION_ALREADY_RUNNING' && !workerLock) {
+      process.stdout.write('5H activation worker skipped: another instance is running.\n');
+      return;
+    }
+    if (error?.message !== 'ACTIVATION_STATE_READ_FAILED') {
+      try {
+        writeFatalState(previousState, error);
+      } catch {}
+    }
+    process.stderr.write(`5H activation worker failed safely (${safeErrorKind(error)}).\n`);
+    process.exitCode = 1;
+  } finally {
+    releaseAccountActivationLock(workerLock);
+  }
+}
+
+main().catch(error => {
+  process.stderr.write(`5H activation worker failed safely (${safeErrorKind(error)}).\n`);
+  process.exitCode = 1;
+});

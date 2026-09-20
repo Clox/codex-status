@@ -11,8 +11,25 @@ const {
   formatResetValue,
 } = require(path.join(__dirname, '..', 'lib', 'codex-reset-credits'));
 const {
+  assessCacheHealth,
+} = require(path.join(__dirname, '..', 'lib', 'codex-usage-cache'));
+const {
+  REPAIRABLE_ERROR_KINDS,
+} = require(path.join(__dirname, '..', 'lib', 'codex-auth-repair'));
+const {
+  accountIdentifiers,
+  normalizeAccountRow,
+  recommendationLines,
+  renderAccountTableRow,
+} = require(path.join(__dirname, '..', 'lib', 'codex-status-render'));
+const {
+  activationWorkerHealth,
+} = require(path.join(__dirname, '..', 'lib', 'codex-five-hour-worker'));
+const {
   tableCell,
-  usageBlock,
+  activationProblemLine,
+  activationWorkerProblem,
+  usageProblemLine,
   weeklyUrgencyLabel,
 } = require(path.join(__dirname, '..', 'lib', 'codex-usage-format'));
 
@@ -21,6 +38,16 @@ const resetCreditsCachePath = process.env.RESET_CREDITS_CACHE || path.join(
   process.env.XDG_CACHE_HOME || path.join(process.env.HOME, '.cache'),
   'codex-account-switcher',
   'reset-credits.json'
+);
+const usageCachePath = process.env.USAGE_CACHE || path.join(
+  process.env.XDG_CACHE_HOME || path.join(process.env.HOME, '.cache'),
+  'codex-account-switcher',
+  'usage.json'
+);
+const activationStatePath = process.env.FIVE_HOUR_ACTIVATION_STATE || path.join(
+  process.env.XDG_CACHE_HOME || path.join(process.env.HOME, '.cache'),
+  'codex-account-switcher',
+  'five-hour-activation.json'
 );
 const input = fs.readFileSync(0, 'utf8').replace(/\r/g, '');
 const mappingOnly = process.argv.includes('--key-map');
@@ -44,14 +71,23 @@ function formatRemaining(epochSeconds) {
   return `${hours}:${String(minutes % 60).padStart(2, '0')}`;
 }
 
-function accountIdentifiers(account) {
-  return [account.email, account.account_name, account.alias]
-    .filter(value => typeof value === 'string' && value.length > 0)
-    .map(value => value.toLocaleLowerCase('sv-SE'));
+function configuredAccountNumber(account) {
+  if (!account) return '-';
+  const identifiers = accountIdentifiers(account);
+  for (const number of ['1', '2', '3']) {
+    const selector = process.env[`ACCOUNT_${number}`]?.toLocaleLowerCase('sv-SE');
+    if (selector && identifiers.some(identifier => identifier.includes(selector) || selector.includes(identifier))) {
+      return number;
+    }
+  }
+  return '-';
 }
 
 let accounts = [];
 let resetCreditsByAccountId = {};
+let serverUsageByAccountId = {};
+let usageCacheState = {};
+let activationState = {};
 try {
   const registry = JSON.parse(fs.readFileSync(registryPath, 'utf8'));
   accounts = Array.isArray(registry.accounts)
@@ -66,6 +102,16 @@ try {
 try {
   resetCreditsByAccountId = JSON.parse(fs.readFileSync(resetCreditsCachePath, 'utf8')).accounts || {};
 } catch {}
+
+try {
+  usageCacheState = JSON.parse(fs.readFileSync(usageCachePath, 'utf8'));
+  serverUsageByAccountId = usageCacheState.accounts || {};
+} catch {}
+const cacheHealth = assessCacheHealth(usageCacheState, nowMs);
+try {
+  activationState = JSON.parse(fs.readFileSync(activationStatePath, 'utf8'));
+} catch {}
+const fiveHourWorkerHealth = activationWorkerHealth(activationState, nowMs);
 
 const lines = input.split('\n');
 const visibleLines = lines.map(plain);
@@ -100,41 +146,19 @@ for (const [lineIndex, visible] of visibleLines.entries()) {
   const rowMatch = visible.match(/^\s*\*?\s*0?(\d+)\s+/);
   if (!rowMatch || Object.values(columns).some(position => position < 0)) continue;
 
-  const shown = visible
-    .slice(columns.account, columns.plan)
-    .trim()
-    .toLocaleLowerCase('sv-SE')
-    .replace(/\.+$/, '');
-  const account = accounts.find(candidate =>
-    accountIdentifiers(candidate).some(identifier => identifier === shown || identifier.startsWith(shown))
-  );
-  if (!account) continue;
-
-  const usage = account.last_usage || {};
-  const fivePercentMatch = visible.slice(columns.fiveHour, columns.weekly).match(/\d+/);
-  const weeklyPercentMatch = visible.slice(columns.weekly, columns.activity).match(/\d+/);
-  if (!fivePercentMatch || !weeklyPercentMatch) continue;
-  const fiveHourRemaining = Number(fivePercentMatch[0]);
-  const weeklyRemaining = Number(weeklyPercentMatch[0]);
-  const fivePercent = `${fiveHourRemaining}% ${usageBlock(fiveHourRemaining)}`;
-  const weeklyPercent = `${weeklyRemaining}% ${usageBlock(weeklyRemaining)}`;
-  const fiveHour = `${fivePercent} (${formatRemaining(usage.primary?.resets_at)})`;
-  const weekly = `${weeklyPercent} (${formatRemaining(usage.secondary?.resets_at)})`;
-  sourceRows.push({
-    sourceRow: rowMatch[1],
+  sourceRows.push(normalizeAccountRow({
+    visible,
     lineIndex,
-    label: visible.slice(columns.account, columns.plan).trim(),
-    prefix: visible.slice(0, columns.fiveHour),
-    resetCredits: resetCreditsByAccountId[account.chatgpt_account_id] || null,
-    activity: visible.slice(columns.activity).trimEnd(),
-    fiveHour,
-    weekly,
-    fiveHourRemaining,
-    fiveHourResetAt: usage.primary?.resets_at,
-    weeklyRemaining,
-    weeklyResetAt: usage.secondary?.resets_at,
-    active: /^\s*\*/.test(visible),
-  });
+    rowMatch,
+    columns,
+    accounts,
+    serverUsageByAccountId,
+    resetCreditsByAccountId,
+    nowMs,
+    cacheHealth,
+    configuredAccountNumber,
+    formatRemaining,
+  }));
 }
 
 const rankedRows = rankingEnabled
@@ -146,7 +170,7 @@ const rankedRows = rankingEnabled
 
 if (mappingOnly) {
   process.stdout.write(rankedRows
-    .map(row => `${row.rank}\t${row.sourceRow}\t${row.active ? 'active' : '-'}`)
+    .map(row => `${row.rank}\t${row.sourceRow}\t${row.active ? 'active' : '-'}\t${row.accountNumber}`)
     .join('\n'));
   process.exit(0);
 }
@@ -182,14 +206,6 @@ const accountWidth = Math.max(
   widthBeforeActivity - resetWidth - fiveHourWidth - weeklyWidth - weeklyUrgencyWidth - tableSeparatorOverhead
 );
 
-function prefixForRank(row) {
-  const markerAndRank = `${row.active ? '*' : ' '} ${String(row.rank).padStart(2, '0')}`;
-  const rankedPrefix = row.prefix.replace(/^\s*\*?\s*0?\d+/, markerAndRank);
-  return rankedPrefix.slice(0, columns.account) +
-    tableCell(row.label, accountWidth) +
-    tableCell(formatResetValue(row.resetCredits, nowMs), resetWidth);
-}
-
 const renderedHeader = header.slice(0, columns.account) +
   tableCell('ACCOUNT', accountWidth) +
   tableCell('RESETS', resetWidth) +
@@ -219,46 +235,51 @@ const output = lines.map((line, lineIndex) => {
   if (!row) return line;
 
   const pending = pendingSourceRow === row.sourceRow;
-  const color = row.active ? '\x1b[0;32m' : pending ? '\x1b[0;33m' : '\x1b[0;2m';
-  const rendered =
-    prefixForRank(row) +
-    tableCell(row.fiveHour, fiveHourWidth) +
-    tableCell(row.weekly, weeklyWidth) +
-    tableCell(weeklyUrgencyLabel(row), weeklyUrgencyWidth) +
-    row.activity +
-    (row.active ? '  ACTIVE' : '');
+  const color = row.usageQuality === 'unverified'
+    ? '\x1b[1;31m'
+    : row.active
+      ? '\x1b[0;32m'
+      : pending
+        ? '\x1b[0;33m'
+        : '\x1b[0;2m';
+  const rendered = renderAccountTableRow(row, {
+    columns,
+    accountWidth,
+    resetWidth,
+    fiveHourWidth,
+    weeklyWidth,
+    weeklyUrgencyWidth,
+    nowMs,
+  });
   return `${color}${rendered}\x1b[0m`;
 });
 
-if (!recommendation) {
-  process.stdout.write(output.join('\n'));
-  process.exit(0);
+const renderedRecommendationLines = recommendationLines(recommendation);
+
+const usageQualityNotes = [];
+if (rankedRows.some(row => row.usageQuality === 'stale')) {
+  usageQualityNotes.push('~ = tillfälligt stale serverdata (3–15 minuter)');
 }
-
-const recommendationRank = recommendation.account?.rank;
-const recommendationLabel = recommendation.account?.label || 'current account';
-const recommendationLines = recommendation.reason === 'needs-activation'
-  ? recommendation.action === 'switch'
-    ? [
-        '\x1b[1mRECOMMENDATION:\x1b[0m',
-        `Activate ${recommendationLabel}`,
-        'Use it once to start its weekly cycle',
-        `Press [${recommendationRank}] to switch`,
-      ]
-    : [
-        '\x1b[1mRECOMMENDATION:\x1b[0m',
-        `Use ${recommendationLabel} once`,
-        'Start its weekly cycle',
-      ]
-  : recommendation.action === 'switch'
-  ? [
-      '\x1b[1mRECOMMENDATION:\x1b[0m',
-      `Switch to ${recommendationLabel}`,
-      `Press [${recommendationRank}] to switch`,
-    ]
-  : [
-      '\x1b[1mRECOMMENDATION:\x1b[0m',
-      `Stay on ${recommendationLabel}`,
-    ];
-
-process.stdout.write(`${output.join('\n').trimEnd()}\n\n${recommendationLines.join('\n')}`);
+if (rankedRows.some(row => row.usageQuality === 'unverified')) {
+  usageQualityNotes.push('AUTH/ERROR = historiska värden, ej verifierat beslutsunderlag');
+}
+const usageQualityLine = usageQualityNotes.length > 0
+  ? `\x1b[2m${usageQualityNotes.join('; ')}.\x1b[0m`
+  : null;
+const problems = [
+  activationWorkerProblem(fiveHourWorkerHealth),
+  ...rankedRows.flatMap(row => [
+    usageProblemLine(row),
+    activationProblemLine(row, activationState.accounts?.[row.accountId]),
+  ]),
+].filter(Boolean);
+const repairableProblemCount = rankedRows.filter(row =>
+  row.usageQuality === 'unverified' && REPAIRABLE_ERROR_KINDS.has(row.errorKind)
+).length;
+const problemSection = problems.length > 0
+  ? `\n\x1b[1;31mACCOUNT PROBLEMS:\x1b[0m\n${problems.map(line => `\x1b[31m${line}\x1b[0m`).join('\n')}${repairableProblemCount > 0 ? '\n\x1b[1;33mPress [R] to repair authentication\x1b[0m' : ''}`
+  : '';
+const footerParts = [renderedRecommendationLines.join('\n')];
+if (usageQualityLine) footerParts.push(usageQualityLine);
+const footer = `${footerParts.join('\n')}${problemSection}`;
+process.stdout.write(`${output.join('\n').trimEnd()}\n\n${footer}`);

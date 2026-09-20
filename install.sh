@@ -4,11 +4,13 @@ set -euo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 bin_source="$script_dir/bin"
 lib_source="$script_dir/lib"
+systemd_source="$script_dir/systemd"
 local_bin="$HOME/.local/bin"
 local_lib="$HOME/.local/lib"
 applications_dir="$HOME/.local/share/applications"
 config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/codex-account-switcher"
 config_file="$config_dir/accounts.conf"
+systemd_user_dir="$HOME/.config/systemd/user"
 backup_dir="$HOME/.local/state/codex-auth-setup-backups/$(date +%Y%m%d-%H%M%S)"
 
 fail() {
@@ -16,7 +18,7 @@ fail() {
   exit 1
 }
 
-for command_name in node npm gnome-terminal gsettings dconf script setsid pgrep pkill; do
+for command_name in node npm gnome-terminal gsettings dconf script setsid pgrep pkill systemctl; do
   command -v "$command_name" >/dev/null 2>&1 || fail "required command is missing: $command_name"
 done
 
@@ -40,15 +42,27 @@ chatgpt_binary=${CHATGPT_BINARY:-/usr/lib/chatgpt/ChatGPT}
 
 printf '\nAccounts currently known to codex-auth:\n'
 "$codex_auth_bin" list --skip-api || fail 'codex-auth list failed; complete fresh interactive logins first'
-printf '\nEnter an exact unique email or alias for each visible row. Values stay in a mode-0600 local file.\n'
-read -r -p 'Row/account 1 selector: ' account_1
-read -r -p 'Row/account 2 selector: ' account_2
-read -r -p 'Row/account 3 selector: ' account_3
+printf '\nEnter the exact unique email or alias that each numbered launcher should use. Values stay in a mode-0600 local file.\n'
+read -r -p 'Launcher/account 1 selector: ' account_1
+read -r -p 'Launcher/account 2 selector: ' account_2
+read -r -p 'Launcher/account 3 selector: ' account_3
 [[ -n $account_1 && -n $account_2 && -n $account_3 ]] || fail 'all three account selectors are required'
 [[ $account_1 != "$account_2" && $account_1 != "$account_3" && $account_2 != "$account_3" ]] || fail 'account selectors must be unique'
 
-mkdir -p "$backup_dir" "$local_bin" "$local_lib" "$applications_dir" "$config_dir"
+mkdir -p "$backup_dir" "$local_bin" "$local_lib" "$applications_dir" "$config_dir" "$systemd_user_dir"
 chmod 700 "$config_dir"
+
+status_was_running=false
+status_process_pattern="(^|[[:space:]])${local_bin}/codex-usage-watch([[:space:]]|$)"
+if pgrep -f "$status_process_pattern" >/dev/null 2>&1; then
+  status_was_running=true
+  pkill -TERM -f "$status_process_pattern" >/dev/null 2>&1 || true
+  for ((attempt = 0; attempt < 25; attempt++)); do
+    pgrep -f "$status_process_pattern" >/dev/null 2>&1 || break
+    sleep 0.2
+  done
+  pgrep -f "$status_process_pattern" >/dev/null 2>&1 && fail 'the old status window did not stop; close it and rerun the installer'
+fi
 
 backup_if_present() {
   local source_path=$1
@@ -59,24 +73,58 @@ backup_if_present() {
 
 backup_if_present "$config_file"
 backup_if_present "$local_bin/codex-account"
+backup_if_present "$local_bin/codex-account-state"
+backup_if_present "$local_bin/codex-auth-repair"
 backup_if_present "$local_bin/codex-usage-watch"
 backup_if_present "$local_bin/codex-usage-annotate"
+backup_if_present "$local_bin/codex-usage-refresh"
+backup_if_present "$local_bin/codex-weekly-activate"
+backup_if_present "$local_bin/codex-five-hour-activate"
+backup_if_present "$local_bin/codex-five-hour-activation-worker"
 backup_if_present "$local_bin/codex-reset-credits-refresh"
 backup_if_present "$local_lib/codex-account-ranking.js"
+backup_if_present "$local_lib/codex-account-state.js"
+backup_if_present "$local_lib/codex-auth-repair.js"
 backup_if_present "$local_lib/codex-reset-credits.js"
+backup_if_present "$local_lib/codex-status-render.js"
+backup_if_present "$local_lib/codex-usage-cache.js"
+backup_if_present "$local_lib/codex-weekly-activation.js"
+backup_if_present "$local_lib/codex-five-hour-activation.js"
+backup_if_present "$local_lib/codex-five-hour-worker.js"
+backup_if_present "$local_lib/codex-activation-lock.js"
+backup_if_present "$local_lib/codex-activation-account.js"
 backup_if_present "$local_lib/codex-usage-format.js"
 for account_number in 1 2 3; do
   backup_if_present "$applications_dir/codex-account${account_number}.desktop"
 done
 backup_if_present "$applications_dir/codex-usage-watch.desktop"
+backup_if_present "$systemd_user_dir/codex-five-hour-activation.service"
+backup_if_present "$systemd_user_dir/codex-five-hour-activation.timer"
 
 install -m 0755 "$bin_source/codex-account" "$local_bin/codex-account"
+install -m 0755 "$bin_source/codex-account-state" "$local_bin/codex-account-state"
+install -m 0755 "$bin_source/codex-auth-repair" "$local_bin/codex-auth-repair"
 install -m 0755 "$bin_source/codex-usage-watch" "$local_bin/codex-usage-watch"
 install -m 0755 "$bin_source/codex-usage-annotate" "$local_bin/codex-usage-annotate"
+install -m 0755 "$bin_source/codex-usage-refresh" "$local_bin/codex-usage-refresh"
+install -m 0755 "$bin_source/codex-weekly-activate" "$local_bin/codex-weekly-activate"
+install -m 0755 "$bin_source/codex-five-hour-activate" "$local_bin/codex-five-hour-activate"
+install -m 0755 "$bin_source/codex-five-hour-activation-worker" "$local_bin/codex-five-hour-activation-worker"
 install -m 0755 "$bin_source/codex-reset-credits-refresh" "$local_bin/codex-reset-credits-refresh"
 install -m 0644 "$lib_source/codex-account-ranking.js" "$local_lib/codex-account-ranking.js"
+install -m 0644 "$lib_source/codex-account-state.js" "$local_lib/codex-account-state.js"
+install -m 0644 "$lib_source/codex-auth-repair.js" "$local_lib/codex-auth-repair.js"
 install -m 0644 "$lib_source/codex-reset-credits.js" "$local_lib/codex-reset-credits.js"
+install -m 0644 "$lib_source/codex-status-render.js" "$local_lib/codex-status-render.js"
+install -m 0644 "$lib_source/codex-usage-cache.js" "$local_lib/codex-usage-cache.js"
+install -m 0644 "$lib_source/codex-weekly-activation.js" "$local_lib/codex-weekly-activation.js"
+install -m 0644 "$lib_source/codex-five-hour-activation.js" "$local_lib/codex-five-hour-activation.js"
+install -m 0644 "$lib_source/codex-five-hour-worker.js" "$local_lib/codex-five-hour-worker.js"
+install -m 0644 "$lib_source/codex-activation-lock.js" "$local_lib/codex-activation-lock.js"
+install -m 0644 "$lib_source/codex-activation-account.js" "$local_lib/codex-activation-account.js"
 install -m 0644 "$lib_source/codex-usage-format.js" "$local_lib/codex-usage-format.js"
+install -m 0644 "$systemd_source/codex-five-hour-activation.service" "$systemd_user_dir/codex-five-hour-activation.service"
+install -m 0644 "$systemd_source/codex-five-hour-activation.timer" "$systemd_user_dir/codex-five-hour-activation.timer"
 
 escape_config_value() {
   printf '%q' "$1"
@@ -94,11 +142,21 @@ escape_config_value() {
   printf 'CHATGPT_LAUNCHER=%s\n' "$(escape_config_value "$chatgpt_launcher")"
   printf 'CHATGPT_BINARY_PATTERN=%s\n' "$(escape_config_value "$chatgpt_binary")"
   printf 'ACCOUNT_SWITCHER=%s\n' "$(escape_config_value "$local_bin/codex-account")"
+  printf 'ACCOUNT_STATE_CHECKER=%s\n' "$(escape_config_value "$local_bin/codex-account-state")"
+  printf 'AUTH_REPAIRER=%s\n' "$(escape_config_value "$local_bin/codex-auth-repair")"
+  printf 'CODEX_LOGIN_BIN=%s\n' "$(escape_config_value "$(command -v codex)")"
   printf 'USAGE_ANNOTATOR=%s\n' "$(escape_config_value "$local_bin/codex-usage-annotate")"
+  printf 'USAGE_REFRESHER=%s\n' "$(escape_config_value "$local_bin/codex-usage-refresh")"
+  printf 'USAGE_CACHE=%s\n' "$(escape_config_value "${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/usage.json")"
+  printf 'USAGE_REFRESH_LOG=%s\n' "$(escape_config_value "${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/usage-refresh.log")"
+  printf 'FIVE_HOUR_ACTIVATION_STATE=%s\n' "$(escape_config_value "${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/five-hour-activation.json")"
   printf 'RESET_CREDITS_REFRESHER=%s\n' "$(escape_config_value "$local_bin/codex-reset-credits-refresh")"
   printf 'RESET_CREDITS_CACHE=%s\n' "$(escape_config_value "${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/reset-credits.json")"
 } >"$config_file"
 chmod 600 "$config_file"
+
+systemctl --user daemon-reload
+systemctl --user enable --now codex-five-hour-activation.timer
 
 for account_number in 1 2 3; do
   desktop_file="$applications_dir/codex-account${account_number}.desktop"
@@ -171,3 +229,7 @@ printf 'Local backup: %s\n' "$backup_dir"
 printf 'Private configuration: %s\n' "$config_file"
 printf 'Run "codex-auth config auto disable" for the stable restart workflow.\n'
 printf 'Review API/local usage mode with "codex-auth status".\n'
+if [[ $status_was_running == true ]]; then
+  setsid -f "$(command -v gnome-terminal)" --hide-menubar --profile="$profile_name" -- "$local_bin/codex-usage-watch" </dev/null >/dev/null 2>&1
+  printf 'Restarted the status window with the newly installed code.\n'
+fi

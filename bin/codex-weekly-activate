@@ -1,0 +1,119 @@
+#!/usr/bin/env node
+
+'use strict';
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const readline = require('readline/promises');
+const {
+  configuredSelector,
+  findAccount,
+  loadCredential,
+  readJson,
+} = require(path.join(__dirname, '..', 'lib', 'codex-activation-account'));
+const {
+  activatedResetHours,
+  authStateMatches,
+  executeVerifiedActivation,
+  fetchFreshUsage,
+  fingerprintAuthState,
+  generateAndCheckSchema,
+  isNeedsActivation,
+  runIsolatedCodexTurn,
+} = require(path.join(__dirname, '..', 'lib', 'codex-weekly-activation'));
+
+function fail(message, code = 1) {
+  process.stderr.write(`${message}\n`);
+  process.exitCode = code;
+}
+
+function usage() {
+  fail('Usage: codex-weekly-activate <1|2|3> [--execute]', 64);
+}
+
+function friendlyError(error, label) {
+  const code = error?.message || '';
+  if (code === 'USAGE_HTTP_401') return `${label}: server-auth svarar 401. Förnya kontots credential med en ny interaktiv inloggning.`;
+  if (code === 'ACCOUNT_NOT_NEEDS_ACTIVATION') return `${label} är inte längre NEEDS_ACTIVATION. Ingen Codex-turn skickades.`;
+  if (code === 'APP_SERVER_CAPABILITY_MISMATCH') return 'Den installerade Codex App Server-versionen saknar den verifierade experimentella protokollformen. Avbryter säkert.';
+  if (code === 'ACTIVATION_NOT_VERIFIED') return 'Turnen slutfördes, men servern rapporterade inte en rimlig ny weekly-reset kring 168 timmar. Ingen retry gjordes.';
+  if (code.startsWith('APP_SERVER_')) return `Den isolerade App Server-körningen avbröts säkert (${code}). Ingen retry gjordes.`;
+  if (code.startsWith('USAGE_')) return `Kunde inte verifiera färsk server-usage (${code}). Ingen Codex-turn skickades.`;
+  return `Activation avbröts säkert (${code || 'UNKNOWN_ERROR'}).`;
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+  if (args.length < 1 || !/^[123]$/.test(args[0]) || args.some((arg, index) => index > 0 && arg !== '--execute')) {
+    usage();
+    return;
+  }
+  const execute = args.includes('--execute');
+  const number = args[0];
+  const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+  const configFile = path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'codex-account-switcher', 'accounts.conf');
+  const codexBin = process.env.CODEX_ACTIVATION_BIN || '/usr/lib/chatgpt/resources/codex';
+  const selector = configuredSelector(configFile, number);
+  const registry = readJson(path.join(codexHome, 'accounts', 'registry.json'));
+  const accounts = Array.isArray(registry.accounts) ? registry.accounts : Object.values(registry.accounts || {});
+  const account = findAccount(accounts, selector);
+  const accountId = account.chatgpt_account_id || account.accountId;
+  const accessToken = loadCredential(codexHome, accountId);
+  const label = account.email || account.alias || account.account_name || `konto ${number}`;
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-weekly-activation-'));
+  fs.chmodSync(tempRoot, 0o700);
+  const privateHome = path.join(tempRoot, 'home');
+  const schemaDirectory = path.join(tempRoot, 'schema');
+  fs.mkdirSync(privateHome, { mode: 0o700 });
+
+  try {
+    generateAndCheckSchema({ codexBin, privateHome, schemaDirectory });
+    const preflight = await fetchFreshUsage({ accountId, accessToken });
+    if (!isNeedsActivation(preflight)) throw new Error('ACCOUNT_NOT_NEEDS_ACTIVATION');
+    process.stdout.write(`${label}: färsk server-data bekräftar NEEDS_ACTIVATION.\n`);
+    process.stdout.write('App Server-capability för isolerad ephemeral/read-only activation är verifierad.\n');
+    if (!execute) {
+      process.stdout.write(`Ingen riktig turn skickades. Kör samma kommando med --execute för att få den interaktiva bekräftelsespärren.\n`);
+      return;
+    }
+    if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error('INTERACTIVE_CONFIRMATION_REQUIRED');
+    const phrase = `ACTIVATE ${label}`;
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    const answer = await rl.question(`Detta förbrukar en riktig minimal Codex-turn. Skriv exakt "${phrase}": `);
+    rl.close();
+    if (answer !== phrase) throw new Error('CONFIRMATION_REJECTED');
+
+    const beforeFingerprint = fingerprintAuthState(codexHome);
+    let activationError = null;
+    let activationResult = null;
+    try {
+      activationResult = await executeVerifiedActivation({
+        fetchUsage: () => fetchFreshUsage({ accountId, accessToken }),
+        runTurn: () => runIsolatedCodexTurn({
+          codexBin,
+          privateHome,
+          accountId,
+          accessToken,
+          planType: account.plan,
+        }),
+      });
+    } catch (error) {
+      activationError = error;
+    }
+    const afterFingerprint = fingerprintAuthState(codexHome);
+    if (!authStateMatches(beforeFingerprint, afterFingerprint)) {
+      throw new Error('GLOBAL_AUTH_STATE_CHANGED');
+    }
+    process.stdout.write(`Global auth-state verifierad oförändrad (${Object.keys(afterFingerprint).length} filer).\n`);
+    if (activationError) throw activationError;
+    const resetHours = activatedResetHours(activationResult.after);
+    process.stdout.write(`Activation verifierad: weekly-reset är cirka ${resetHours.toFixed(1)} timmar bort.\n`);
+  } catch (error) {
+    fail(friendlyError(error, label));
+  } finally {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
+}
+
+main();

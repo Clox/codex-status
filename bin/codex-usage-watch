@@ -11,8 +11,18 @@ fi
 source "$config_file"
 
 export CODEX_HOME
+export ACCOUNT_1 ACCOUNT_2 ACCOUNT_3
 export PATH="$NODE_BIN_DIR:${PATH:-/usr/local/bin:/usr/bin:/bin}"
 export RESET_CREDITS_CACHE
+USAGE_REFRESHER=${USAGE_REFRESHER:-"$HOME/.local/bin/codex-usage-refresh"}
+USAGE_CACHE=${USAGE_CACHE:-"${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/usage.json"}
+AUTH_REPAIRER=${AUTH_REPAIRER:-"$HOME/.local/bin/codex-auth-repair"}
+CODEX_LOGIN_BIN=${CODEX_LOGIN_BIN:-"$(command -v codex)"}
+export CODEX_AUTH_BIN USAGE_REFRESHER USAGE_CACHE AUTH_REPAIRER CODEX_LOGIN_BIN
+FIVE_HOUR_ACTIVATION_STATE=${FIVE_HOUR_ACTIVATION_STATE:-"${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/five-hour-activation.json"}
+export FIVE_HOUR_ACTIVATION_STATE
+USAGE_REFRESH_LOG=${USAGE_REFRESH_LOG:-"${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/usage-refresh.log"}
+loaded_script_hash=$(sha256sum "$0" | awk '{ print $1 }')
 printf '\033]0;Codex-kontostatus\007'
 
 saved_stty=''
@@ -44,6 +54,16 @@ launch_detached() {
   setsid -f "$@" </dev/null >/dev/null 2>&1
 }
 
+launch_usage_refresh() {
+  mkdir -p "$(dirname -- "$USAGE_REFRESH_LOG")"
+  chmod 700 "$(dirname -- "$USAGE_REFRESH_LOG")"
+  if [[ -f $USAGE_REFRESH_LOG ]] && (( $(stat -c %s "$USAGE_REFRESH_LOG" 2>/dev/null || printf 0) > 65536 )); then
+    tail -n 100 "$USAGE_REFRESH_LOG" >"${USAGE_REFRESH_LOG}.tmp"
+    mv -f "${USAGE_REFRESH_LOG}.tmp" "$USAGE_REFRESH_LOG"
+  fi
+  setsid -f "$USAGE_REFRESHER" </dev/null >>"$USAGE_REFRESH_LOG" 2>&1
+}
+
 draw_frame() {
   local frame_to_draw=$1
   tput rmam 2>/dev/null || printf '\033[?7l'
@@ -72,10 +92,17 @@ highlight_pending_frame() {
 }
 
 while true; do
+  current_script_hash=$(sha256sum "$0" 2>/dev/null | awk '{ print $1 }')
+  if [[ -z $current_script_hash || $current_script_hash != "$loaded_script_hash" ]]; then
+    notify-send 'Codex-kontostatus uppdaterad' 'Statusfönstret stängs för att inte fortsätta med gammal kod. Öppna det igen.' 2>/dev/null || true
+    printf '\nStatusverktyget har uppdaterats. Öppna Codex-kontostatus igen.\n'
+    exit 75
+  fi
   columns=$(tput cols 2>/dev/null || printf '100')
   [[ $columns =~ ^[0-9]+$ ]] || columns=100
   status_now_ms=$(($(date +%s) * 1000))
 
+  launch_usage_refresh
   "$RESET_CREDITS_REFRESHER" >/dev/null 2>&1 || true
 
   if raw_frame=$(
@@ -108,8 +135,13 @@ while true; do
           notify-send 'Codex-kontobyte pågår' 'Vänta tills det pågående kontobytet är klart.' 2>/dev/null || true
         else
           source_row=$(printf '%s\n' "$key_map" | awk -v rank="$key" '$1 == rank { print $2; exit }')
+          launcher_account=$(printf '%s\n' "$key_map" | awk -v rank="$key" '$1 == rank { print $4; exit }')
           if [[ ! $source_row =~ ^[123]$ ]]; then
             notify-send 'Codex-kontobyte stoppat' 'Kunde inte koppla rankingen till ett konto. Vänta på nästa uppdatering.' 2>/dev/null || true
+            continue
+          fi
+          if [[ ! $launcher_account =~ ^[123]$ ]]; then
+            notify-send 'Codex-kontobyte stoppat' 'Kunde inte koppla kontot till rätt launcher. Kontrollera accounts.conf.' 2>/dev/null || true
             continue
           fi
           if [[ $source_row == "$active_source_row" ]]; then
@@ -120,7 +152,18 @@ while true; do
           pending_since=$SECONDS
           frame=$(highlight_pending_frame "$key")
           draw_frame "$frame"
-          launch_detached "$ACCOUNT_SWITCHER" "$source_row" --desktop
+          launch_detached "$ACCOUNT_SWITCHER" "$launcher_account" --desktop
+        fi
+        ;;
+      r|R)
+        if printf '%s\n' "$frame" | grep -Fq 'Press [R] to repair authentication'; then
+          if pgrep -f "${AUTH_REPAIRER}([[:space:]]|$)" >/dev/null 2>&1; then
+            notify-send 'Codex auth-reparation' 'En auth-reparation pågår redan.' 2>/dev/null || true
+          else
+            launch_detached "$(command -v gnome-terminal)" --hide-menubar --title='Codex auth-reparation' -- "$AUTH_REPAIRER" --hold
+          fi
+        else
+          notify-send 'Codex auth-reparation' 'Inget konto har ett reparerbart authfel just nu.' 2>/dev/null || true
         fi
         ;;
     esac

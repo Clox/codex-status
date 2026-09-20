@@ -13,6 +13,10 @@ fi
 # shellcheck source=/dev/null
 source "$config_file"
 
+export CODEX_HOME
+export PATH="$NODE_BIN_DIR:${PATH:-/usr/local/bin:/usr/bin:/bin}"
+ACCOUNT_STATE_CHECKER=${ACCOUNT_STATE_CHECKER:-"$HOME/.local/bin/codex-account-state"}
+
 usage() {
   printf 'Usage: codex-account <1|2|3> [--desktop] [desktop arguments...]\n' >&2
   exit 64
@@ -27,6 +31,15 @@ case "$account_number" in
   *) usage ;;
 esac
 shift
+
+expected_state=$("$ACCOUNT_STATE_CHECKER" resolve "$CODEX_HOME" "$account_selector") || {
+  message='Kunde inte entydigt koppla launchern till sparad account-state. Kontobytet avbröts.'
+  notify-send 'Codex-kontobyte stoppat' "$message" 2>/dev/null || true
+  printf '%s\n' "$message" >&2
+  exit 3
+}
+IFS=$'\t' read -r expected_account_id expected_account_key <<<"$expected_state"
+[[ -n $expected_account_id && -n $expected_account_key ]] || usage
 
 launch_desktop=false
 if [[ ${1:-} == '--desktop' ]]; then
@@ -59,14 +72,18 @@ if [[ $launch_desktop == true ]] && desktop_running; then
   fi
 fi
 
-export CODEX_HOME
-export PATH="$NODE_BIN_DIR:${PATH:-/usr/local/bin:/usr/bin:/bin}"
-
 if ! "$CODEX_AUTH_BIN" switch "$account_selector"; then
   message='codex-auth kunde inte byta konto. Kör codex-auth list i en terminal för detaljer.'
   notify-send 'Codex-kontobyte misslyckades' "$message" 2>/dev/null || true
   printf '%s\n' "$message" >&2
   exit 1
+fi
+
+if ! "$ACCOUNT_STATE_CHECKER" verify "$CODEX_HOME" "$expected_account_id" "$expected_account_key"; then
+  message='Kontobytets postcondition misslyckades: global auth och aktiv registry-post överensstämmer inte. Desktop startas inte.'
+  notify-send 'Codex-kontobyte stoppat' "$message" 2>/dev/null || true
+  printf '%s\n' "$message" >&2
+  exit 3
 fi
 
 if [[ $launch_desktop == true ]]; then

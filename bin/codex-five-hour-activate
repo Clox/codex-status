@@ -1,0 +1,146 @@
+#!/usr/bin/env node
+
+'use strict';
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const readline = require('readline/promises');
+const {
+  acquireAccountActivationLock,
+  releaseAccountActivationLock,
+} = require(path.join(__dirname, '..', 'lib', 'codex-activation-lock'));
+const {
+  configuredSelector,
+  configuredValue,
+  findAccount,
+  loadCredential,
+  readJson,
+} = require(path.join(__dirname, '..', 'lib', 'codex-activation-account'));
+const {
+  executeVerifiedFiveHourActivation,
+  fixedResetHours,
+  verifyFiveHourDormantPrecondition,
+} = require(path.join(__dirname, '..', 'lib', 'codex-five-hour-activation'));
+const {
+  authStateMatches,
+  fetchFreshUsageObservation,
+  fingerprintAuthState,
+  generateAndCheckSchema,
+  runIsolatedCodexTurn,
+} = require(path.join(__dirname, '..', 'lib', 'codex-weekly-activation'));
+
+function fail(message, code = 1) {
+  process.stderr.write(`${message}\n`);
+  process.exitCode = code;
+}
+
+function usage() {
+  fail('Usage: codex-five-hour-activate <1|2|3> [--execute]', 64);
+}
+
+function friendlyError(error, label) {
+  const code = error?.message || '';
+  if (code === 'USAGE_HTTP_401') return `${label}: server-auth svarar 401. Förnya kontots credential med en ny interaktiv inloggning.`;
+  if (code === 'ACCOUNT_NOT_FIVE_HOUR_DORMANT') return `${label} har inte VERIFIED fiveHourDormant=true. Ingen Codex-turn skickades.`;
+  if (code === 'APP_SERVER_CAPABILITY_MISMATCH') return 'Den installerade Codex App Server-versionen saknar den verifierade experimentella protokollformen. Avbryter säkert.';
+  if (code === 'FIVE_HOUR_ACTIVATION_NOT_VERIFIED') return 'Turnen slutfördes, men två färska serverobservationer bekräftade inte en fixerad ny 5H-deadline. Ingen retry gjordes.';
+  if (code === 'GLOBAL_AUTH_STATE_CHANGED') return 'Global auth-state ändrades oväntat. Activation markeras som misslyckad och Desktop startades inte om.';
+  if (code.startsWith('APP_SERVER_')) return `Den isolerade App Server-körningen avbröts säkert (${code}). Ingen retry gjordes.`;
+  if (code.startsWith('USAGE_')) return `Kunde inte verifiera färsk server-usage (${code}). Ingen Codex-turn skickades.`;
+  return `5H-activation avbröts säkert (${code || 'UNKNOWN_ERROR'}).`;
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+  if (args.length < 1 || !/^[123]$/.test(args[0]) || args.some((arg, index) => index > 0 && arg !== '--execute')) {
+    usage();
+    return;
+  }
+  const execute = args.includes('--execute');
+  const number = args[0];
+  const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+  const configFile = path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'codex-account-switcher', 'accounts.conf');
+  const usageCacheFile = configuredValue(configFile, 'USAGE_CACHE') ||
+    path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache'), 'codex-account-switcher', 'usage.json');
+  const activationLockDirectory = path.join(path.dirname(usageCacheFile), 'activation-locks');
+  const codexBin = process.env.CODEX_ACTIVATION_BIN || '/usr/lib/chatgpt/resources/codex';
+  const selector = configuredSelector(configFile, number);
+  const registry = readJson(path.join(codexHome, 'accounts', 'registry.json'));
+  const accounts = Array.isArray(registry.accounts) ? registry.accounts : Object.values(registry.accounts || {});
+  const account = findAccount(accounts, selector);
+  const accountId = account.chatgpt_account_id || account.accountId;
+  const accessToken = loadCredential(codexHome, accountId);
+  const label = account.email || account.alias || account.account_name || `konto ${number}`;
+  const usageCache = readJson(usageCacheFile);
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-five-hour-activation-'));
+  fs.chmodSync(tempRoot, 0o700);
+  const privateHome = path.join(tempRoot, 'home');
+  const schemaDirectory = path.join(tempRoot, 'schema');
+  fs.mkdirSync(privateHome, { mode: 0o700 });
+  const fetchObservation = () => fetchFreshUsageObservation({ accountId, accessToken });
+
+  try {
+    generateAndCheckSchema({ codexBin, privateHome, schemaDirectory });
+    const preflightCache = await verifyFiveHourDormantPrecondition({
+      cache: usageCache,
+      accountId,
+      accessToken,
+      fetchObservation,
+    });
+    process.stdout.write(`${label}: färsk server-data bekräftar VERIFIED fiveHourDormant=true.\n`);
+    process.stdout.write('App Server-capability för isolerad ephemeral/read-only activation är verifierad.\n');
+    if (!execute) {
+      process.stdout.write('Ingen riktig turn skickades. Kör samma kommando med --execute för den interaktiva bekräftelsespärren.\n');
+      return;
+    }
+    if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error('INTERACTIVE_CONFIRMATION_REQUIRED');
+    const phrase = `ACTIVATE 5H ${label}`;
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    const answer = await rl.question(`Detta förbrukar exakt en riktig minimal Codex-turn. Skriv exakt "${phrase}": `);
+    rl.close();
+    if (answer !== phrase) throw new Error('CONFIRMATION_REJECTED');
+
+    const activationLock = acquireAccountActivationLock(activationLockDirectory, accountId);
+    try {
+      fs.rmSync(schemaDirectory, { recursive: true, force: true });
+      generateAndCheckSchema({ codexBin, privateHome, schemaDirectory });
+      const beforeFingerprint = fingerprintAuthState(codexHome);
+      let activationError = null;
+      let activationResult = null;
+      try {
+        activationResult = await executeVerifiedFiveHourActivation({
+          cache: preflightCache,
+          accountId,
+          accessToken,
+          fetchObservation,
+          runTurn: () => runIsolatedCodexTurn({
+            codexBin,
+            privateHome,
+            accountId,
+            accessToken,
+            planType: account.plan,
+          }),
+        });
+      } catch (error) {
+        activationError = error;
+      }
+      const afterFingerprint = fingerprintAuthState(codexHome);
+      if (!authStateMatches(beforeFingerprint, afterFingerprint)) {
+        throw new Error('GLOBAL_AUTH_STATE_CHANGED');
+      }
+      process.stdout.write(`Global auth-state verifierad oförändrad (${Object.keys(afterFingerprint).length} filer).\n`);
+      if (activationError) throw activationError;
+      const resetHours = fixedResetHours(activationResult.after, accountId);
+      process.stdout.write(`5H-activation verifierad: deadline är fixerad och cirka ${resetHours.toFixed(2)} timmar bort.\n`);
+    } finally {
+      releaseAccountActivationLock(activationLock);
+    }
+  } catch (error) {
+    fail(friendlyError(error, label));
+  } finally {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
+}
+
+main();

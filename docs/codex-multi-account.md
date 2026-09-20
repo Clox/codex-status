@@ -101,9 +101,23 @@ The status window and ChatGPT have independent lifetimes. Account switches and C
 
 The `RESETS` column shows saved Codex resets as `XX×HHH:MM`: the available count and the countdown until the earliest expiration. A dash means no saved reset. Reset details are refreshed at most once every five minutes from Codex's read-only reset-credit endpoint and cached locally without tokens; all returned expiration times are retained in the private cache. If the service reports a count but omits one or more detail rows, the countdown is shown as unknown rather than guessing. Countdown hours are allowed to exceed 999 and the column expands only when necessary.
 
-The usage columns show remaining percentages, a rounded eighth-block indicator (` `, `▁` through `█`), and time until reset as `HH:MM`. `W%/H` shows weekly percentage remaining per hour until the weekly reset, which is the same urgency value used by the ranking. Usage data remains a cached local observation, not a live server poll. An inactive account commonly remains stale until that account is used and a suitable local rate-limit event is written. Saved-reset data is presentation-only and does not affect ranking or recommendation.
+The usage columns show remaining percentages, a rounded eighth-block indicator (` `, `▁` through `█`), and time until reset as `HH:MM`. `W%/H` shows weekly percentage remaining per hour until the weekly reset, which is the same urgency value used by the ranking. Usage is fetched independently for every saved account from Codex's read-only usage endpoint and cached locally without tokens. Server refresh runs at most once per minute while the UI can continue redrawing every ten seconds. A successful observation up to three minutes old is `VERIFIED`; one between three and fifteen minutes old is marked `~`/`STALE` when only a transient refresh error exists. Data older than fifteen minutes, a 401/403, missing credentials, protocol errors, three consecutive failures, or a dead refresh heartbeat is `UNVERIFIED`. Its old percentages may remain visible only as red historical context, `W%/H` becomes `AUTH` or `ERROR`, a problem section explains the failure, and the values are excluded from ranking and recommendation. Local `last_usage` is only an unverified fallback. Saved-reset data is presentation-only and does not affect ranking or recommendation.
+
+The token-free usage cache also keeps a bounded history of raw 5H and weekly window fields plus local and server observation times. A 5H window is shown as `100% █ READY` only after two fresh verified observations prove that its full five-hour deadline moves forward with the server clock. A single `100% (5:00)` or rounded zero usage is never enough, and a fixed deadline remains an active countdown. The display layer itself never triggers a turn, account switch, or auth change; the separately supervised 5H worker described below may act only on the underlying VERIFIED two-observation classification. Weekly activation keeps its existing rule while the raw history is collected for a future empirically verified model.
 
 After an automatic weekly reset, Codex can report `100%` with `0:00` until the account is used once. The status window treats this as `NEEDS_ACTIVATION`, shows `START` instead of a false W%/H value, and temporarily prioritizes one minimal use of that account. Once Codex reports a normal future weekly reset, ordinary ranking resumes automatically.
+
+An account with an explicit `AUTH ERROR` offers `Press [R] to repair authentication`. Repair runs the normal interactive ChatGPT browser login in a private temporary `CODEX_HOME`; it never copies tokens through command arguments, environment variables, logs, or user-visible output. The returned identity must match both the existing account ID and stable account key, and fresh server usage must succeed before codex-auth's supported import path updates the existing snapshot. The target must be inactive, so Desktop and global auth remain on the current verified account. Repair holds the same per-account lock as manual and automatic activation, preventing the target credential from changing during an activation attempt. A wrong-account login, cancellation, failed usage check, or postcondition mismatch changes no persistent state or rolls back the snapshot, registry, global auth, and usage cache. If the broken account is active, switch to another verified account before pressing `R`.
+
+For controlled testing, `codex-weekly-activate <1|2|3>` performs only a read-only preflight: it verifies fresh server usage and checks the installed App Server schema. Adding `--execute` still does not immediately send a turn; it requires an exact interactive confirmation phrase. Only then does it start a private temporary App Server, provide external ChatGPT tokens over JSON-RPC stdin, create an ephemeral read-only/no-approval thread, send exactly one minimal turn, and verify a new weekly deadline near 168 hours. It never switches the global account or restarts Desktop, it does not retry a real turn, and it verifies hashes of the global auth files before and after. This is a manual diagnostic path, not an automatic worker. A 401 requires a fresh interactive login; the tool does not work around stale credentials.
+
+`codex-five-hour-activate <1|2|3>` is the corresponding manual 5H diagnostic. Its initial preflight requires the cache's VERIFIED two-observation `fiveHourDormant=true` classification and then revalidates that classification with fresh server data; `READY`, `100%`, or one observation is insufficient. The confirmation prompt may remain open without making that initial state usable for a later turn. After the exact confirmation phrase, the command repeats the App Server capability check, discards the old 5H observation history for decision purposes, and requires two newly fetched observations to prove VERIFIED dormant state again before it can reuse the isolated App Server turn. It then makes exactly two post-turn usage observations and accepts success only if the dormant classification has disappeared, the new deadline is roughly five hours away, `reset_at` remains fixed, and the countdown decreases. An ambiguous result is reported without retrying the real turn. This command is not an automatic worker.
+
+Verified dormant 5H windows are also activated by the supervised `codex-five-hour-activation.timer` user unit. The timer runs independently of the status window and first forces the ordinary read-only usage refresh. Ranking, recommendation, active account, and user activity are not inputs. A target must have VERIFIED `fiveHourDormant=true`; after selection, two entirely new server observations must prove the same state before the shared isolated App Server mechanism can send exactly one turn. A per-account lock prevents overlap with the manual diagnostic or another worker.
+
+The isolated turn passes no dynamic tools or environments, uses a private empty working directory with a read-only sandbox and no approvals, and explicitly instructs the model not to use tools. The current experimental App Server schema has no verified switch that removes every built-in Codex tool from the model schema. The client therefore also treats any started tool, command, file-change, web-search, image-generation, or MCP item as a protocol violation and terminates the process. This layered guard is capability-checked against the installed App Server version, but it is not presented as a stable upstream guarantee that built-in tools are absent.
+
+The token-free `five-hour-activation.json` state is the worker's safety journal. It persists an attempt before the turn boundary and records `turn-committed` immediately before App Server is called. Success, timeout, crash, or ambiguous postconditions after that boundary can never trigger an automatic retry for the same dormant window. The block is cleared only after VERIFIED server data proves an active/non-dormant window, or when a later dormant observation is unambiguously after the successfully recorded fixed deadline. Pre-turn failures use a cooldown and consume no turn. Worker heartbeat, fatal state, and per-account activation errors are shown in the status window's problem section; no credentials, response bodies, or prompts are stored. Weekly windows are never activated by this worker.
 
 Ranking uses `weekly remaining / hours until weekly reset` as its primary signal. Accounts within 10% of the best weekly urgency form a group whose internal order is decided by current 5H quota plus a small bonus for a reset within the next hour. Recommendation is deliberately more conservative than ranking: it has separate 10% weekly hysteresis, and a 5H advantage can only trigger a switch between weekly-near-equals when the active account's reset-aware 5H score is at or below 10 and the alternative still has both a 10-point and 10% relative advantage. These constants live together in `tools/workstation/codex-auth/lib/codex-account-ranking.js`.
 
@@ -133,15 +147,33 @@ Conversation visibility comes from the shared local state, not from copying auth
 
 - `$HOME/.config/codex-account-switcher/accounts.conf` — mode `0600`, contains local account selectors and paths
 - `$HOME/.local/bin/codex-account`
+- `$HOME/.local/bin/codex-account-state`
+- `$HOME/.local/bin/codex-auth-repair`
 - `$HOME/.local/bin/codex-usage-watch`
 - `$HOME/.local/bin/codex-usage-annotate`
+- `$HOME/.local/bin/codex-usage-refresh`
+- `$HOME/.local/bin/codex-weekly-activate`
+- `$HOME/.local/bin/codex-five-hour-activate`
+- `$HOME/.local/bin/codex-five-hour-activation-worker`
 - `$HOME/.local/bin/codex-reset-credits-refresh`
 - `$HOME/.local/lib/codex-account-ranking.js`
+- `$HOME/.local/lib/codex-account-state.js`
+- `$HOME/.local/lib/codex-auth-repair.js`
 - `$HOME/.local/lib/codex-reset-credits.js`
+- `$HOME/.local/lib/codex-status-render.js`
+- `$HOME/.local/lib/codex-usage-cache.js`
+- `$HOME/.local/lib/codex-weekly-activation.js`
+- `$HOME/.local/lib/codex-five-hour-activation.js`
+- `$HOME/.local/lib/codex-five-hour-worker.js`
+- `$HOME/.local/lib/codex-activation-lock.js`
+- `$HOME/.local/lib/codex-activation-account.js`
 - `$HOME/.local/lib/codex-usage-format.js`
+- `$HOME/.cache/codex-account-switcher/usage.json` — mode `0600`, token-free per-account usage cache
+- `$HOME/.cache/codex-account-switcher/five-hour-activation.json` — mode `0600`, token-free worker heartbeat, idempotency and error state
 - `$HOME/.cache/codex-account-switcher/reset-credits.json` — mode `0600`, token-free reset count/expiration cache
 - `$HOME/.local/share/applications/codex-account{1,2,3}.desktop`
 - `$HOME/.local/share/applications/codex-usage-watch.desktop`
 - GNOME Terminal profile `Codex-status`
+- user units `codex-five-hour-activation.service` and `codex-five-hour-activation.timer`
 
 Backups created by the installer are local-only under `$HOME/.local/state/codex-auth-setup-backups/`.

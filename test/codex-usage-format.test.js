@@ -4,8 +4,11 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 const {
   USAGE_BLOCKS,
+  activationProblemLine,
+  activationWorkerProblem,
   tableCell,
   usageBlock,
+  usageProblemLine,
   weeklyUrgencyLabel,
 } = require('../lib/codex-usage-format');
 
@@ -41,6 +44,55 @@ test('shows normal W%/H after the weekly cycle has started', () => {
     weeklyResetHours: 168,
     weeklyUrgency: 100 / 168,
   }), '0.60');
+});
+
+test('marks stale usage and replaces unverified urgency with an error status', () => {
+  assert.equal(weeklyUrgencyLabel({
+    needsActivation: false,
+    weeklyResetHours: 10,
+    weeklyUrgency: 1.23,
+    usageQuality: 'stale',
+  }), '1.23~');
+  assert.equal(weeklyUrgencyLabel({
+    needsActivation: false,
+    weeklyResetHours: Number.POSITIVE_INFINITY,
+    weeklyUrgency: 1.23,
+    usageQuality: 'unverified',
+    errorKind: 'no-server-data',
+  }), 'ERROR');
+  assert.equal(weeklyUrgencyLabel({
+    usageQuality: 'unverified',
+    errorKind: 'auth-401',
+  }), 'AUTH');
+});
+
+test('problem text makes 401 and dead refresher action-required without leaking details', () => {
+  assert.match(usageProblemLine({
+    label: 'Account A',
+    usageQuality: 'unverified',
+    errorKind: 'auth-401',
+    httpStatus: 401,
+  }), /AUTH ERROR \/ ACTION REQUIRED.*HTTP 401.*re-login/);
+  assert.match(usageProblemLine({
+    label: 'Account B',
+    usageQuality: 'unverified',
+    errorKind: 'worker-stale',
+    usageAgeMs: 8 * 3_600_000,
+  }), /UNVERIFIED \/ ACTION REQUIRED.*8 h sedan.*Starta om statusfönstret/);
+});
+
+test('activation failures and dead worker are visible without changing usage quality', () => {
+  assert.match(activationProblemLine({ label: 'Account A', usageQuality: 'verified' }, {
+    phase: 'blocked',
+    errorKind: 'FIVE_HOUR_ACTIVATION_NOT_VERIFIED',
+  }), /5H ACTIVATION ERROR \/ ACTION REQUIRED.*ingen automatisk retry/);
+  assert.match(activationWorkerProblem({
+    enabled: true,
+    healthy: false,
+    ageMs: 4 * 60_000,
+    fatalErrorKind: null,
+  }), /heartbeat uppdateras inte.*4 min sedan/);
+  assert.equal(activationWorkerProblem({ enabled: true, healthy: true }), null);
 });
 
 test('renders a vertical boundary while preserving the cell content width', () => {
