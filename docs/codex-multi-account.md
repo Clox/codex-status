@@ -149,6 +149,7 @@ Conversation visibility comes from the shared local state, not from copying auth
 - `$HOME/.local/bin/codex-account`
 - `$HOME/.local/bin/codex-account-state`
 - `$HOME/.local/bin/codex-auth-repair`
+- `$HOME/.local/bin/codex-usage-launch`
 - `$HOME/.local/bin/codex-usage-watch`
 - `$HOME/.local/bin/codex-usage-annotate`
 - `$HOME/.local/bin/codex-usage-refresh`

@@ -75,6 +75,7 @@ backup_if_present "$config_file"
 backup_if_present "$local_bin/codex-account"
 backup_if_present "$local_bin/codex-account-state"
 backup_if_present "$local_bin/codex-auth-repair"
+backup_if_present "$local_bin/codex-usage-launch"
 backup_if_present "$local_bin/codex-usage-watch"
 backup_if_present "$local_bin/codex-usage-annotate"
 backup_if_present "$local_bin/codex-usage-refresh"
@@ -104,6 +105,7 @@ backup_if_present "$systemd_user_dir/codex-five-hour-activation.timer"
 install -m 0755 "$bin_source/codex-account" "$local_bin/codex-account"
 install -m 0755 "$bin_source/codex-account-state" "$local_bin/codex-account-state"
 install -m 0755 "$bin_source/codex-auth-repair" "$local_bin/codex-auth-repair"
+install -m 0755 "$bin_source/codex-usage-launch" "$local_bin/codex-usage-launch"
 install -m 0755 "$bin_source/codex-usage-watch" "$local_bin/codex-usage-watch"
 install -m 0755 "$bin_source/codex-usage-annotate" "$local_bin/codex-usage-annotate"
 install -m 0755 "$bin_source/codex-usage-refresh" "$local_bin/codex-usage-refresh"
@@ -217,7 +219,7 @@ status_desktop="$applications_dir/codex-usage-watch.desktop"
   printf 'Type=Application\n'
   printf 'Name=Codex-kontostatus\n'
   printf 'Comment=Visa Codex-konton och återstående kvoter\n'
-  printf 'Exec=%s --hide-menubar --profile=%s -- %s\n' "$(command -v gnome-terminal)" "$profile_name" "$local_bin/codex-usage-watch"
+  printf 'Exec=%s\n' "$local_bin/codex-usage-launch"
   printf 'Icon=utilities-terminal\n'
   printf 'Terminal=false\n'
   printf 'Categories=Development;Utility;\n'
