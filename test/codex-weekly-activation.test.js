@@ -100,8 +100,16 @@ test('capability check requires external auth and ephemeral guarded threads', t 
   fs.writeFileSync(path.join(root, 'v2', 'ThreadStartParams.json'), JSON.stringify({
     properties: { ephemeral: {}, approvalPolicy: {}, sandbox: {}, dynamicTools: {} },
   }));
-  fs.writeFileSync(path.join(root, 'v2', 'TurnStartParams.json'), JSON.stringify({ required: ['threadId', 'input'] }));
+  fs.writeFileSync(path.join(root, 'v2', 'TurnStartParams.json'), JSON.stringify({
+    required: ['threadId', 'input'],
+    properties: { model: {}, effort: {}, serviceTierForTurn: {} },
+  }));
   assert.equal(schemaSupportsManualActivation(root), true);
+  fs.writeFileSync(path.join(root, 'v2', 'TurnStartParams.json'), JSON.stringify({
+    required: ['threadId', 'input'],
+    properties: { model: {}, effort: {} },
+  }));
+  assert.equal(schemaSupportsManualActivation(root), false);
   fs.writeFileSync(path.join(root, 'v2', 'LoginAccountParams.json'), '{}');
   assert.equal(schemaSupportsManualActivation(root), false);
 });
@@ -186,7 +194,11 @@ test('isolated protocol passes credentials only over stdin and creates one guard
   assert.equal(thread.params.sandbox, 'read-only');
   assert.deepEqual(thread.params.dynamicTools, []);
   assert.deepEqual(thread.params.environments, []);
-  assert.equal(requests.filter(request => request.method === 'turn/start').length, 1);
+  const turns = requests.filter(request => request.method === 'turn/start');
+  assert.equal(turns.length, 1);
+  assert.equal(turns[0].params.model, 'gpt-5.6-luna');
+  assert.equal(turns[0].params.effort, 'low');
+  assert.equal(turns[0].params.serviceTierForTurn, 'default');
 });
 
 test('isolated protocol times out closed without retrying a turn', async () => {
