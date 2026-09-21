@@ -17,7 +17,7 @@ export RESET_CREDITS_CACHE
 USAGE_REFRESHER=${USAGE_REFRESHER:-"$HOME/.local/bin/codex-usage-refresh"}
 USAGE_CACHE=${USAGE_CACHE:-"${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/usage.json"}
 AUTH_REPAIRER=${AUTH_REPAIRER:-"$HOME/.local/bin/codex-auth-repair"}
-CODEX_LOGIN_BIN=${CODEX_LOGIN_BIN:-"$(command -v codex)"}
+CODEX_LOGIN_BIN=${CODEX_LOGIN_BIN:-/usr/lib/chatgpt/resources/codex}
 export CODEX_AUTH_BIN USAGE_REFRESHER USAGE_CACHE AUTH_REPAIRER CODEX_LOGIN_BIN
 FIVE_HOUR_ACTIVATION_STATE=${FIVE_HOUR_ACTIVATION_STATE:-"${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/five-hour-activation.json"}
 export FIVE_HOUR_ACTIVATION_STATE
@@ -25,8 +25,37 @@ USAGE_REFRESH_LOG=${USAGE_REFRESH_LOG:-"${XDG_CACHE_HOME:-$HOME/.cache}/codex-ac
 loaded_script_hash=$(sha256sum "$0" | awk '{ print $1 }')
 printf '\033]0;Codex-kontostatus\007'
 
+status_runtime_dir=${XDG_CACHE_HOME:-"$HOME/.cache"}/codex-account-switcher
+mkdir -p "$status_runtime_dir"
+chmod 700 "$status_runtime_dir"
+exec {status_lock_fd}>"$status_runtime_dir/status-window.lock"
+if ! flock -n "$status_lock_fd"; then
+  printf '%s status singleton already held\n' "$(date --iso-8601=seconds)" >>"$status_runtime_dir/status-launch.log"
+  exit 0
+fi
+status_started_at=$SECONDS
+
+attention_fd=''
+attention_pid=''
+if [[ ${XDG_SESSION_TYPE:-} == x11 ]] && command -v wmctrl >/dev/null && command -v xprop >/dev/null; then
+  coproc ATTENTION_CONTROLLER { "$HOME/.local/bin/codex-status-attention" >/dev/null 2>>"$status_runtime_dir/status-attention.log"; }
+  # Bash may unset coproc descriptors before these assignments if the helper
+  # exits immediately. Attention is optional; the status window must survive.
+  attention_fd=${ATTENTION_CONTROLLER[1]-}
+  attention_pid=${ATTENTION_CONTROLLER_PID-}
+fi
+
 saved_stty=''
 cleanup() {
+  local status=$1
+  printf '%s status exited code=%d elapsed=%ds\n' \
+    "$(date --iso-8601=seconds)" "$status" "$((SECONDS - status_started_at))" >>"$status_runtime_dir/status-launch.log"
+  if [[ -n $attention_fd ]]; then
+    exec {attention_fd}>&-
+  fi
+  if [[ -n $attention_pid ]]; then
+    wait "$attention_pid" 2>/dev/null || true
+  fi
   if [[ -n $saved_stty ]]; then
     stty "$saved_stty" </dev/tty 2>/dev/null || true
     tput smam 2>/dev/null || true
@@ -34,10 +63,10 @@ cleanup() {
     tput rmcup 2>/dev/null || true
   fi
 }
+trap 'cleanup "$?"' EXIT
 
 if [[ -t 0 && -t 1 ]]; then
   saved_stty=$(stty -g </dev/tty)
-  trap cleanup EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
   trap 'exit 129' HUP
@@ -115,6 +144,10 @@ while true; do
     key_map=$(
       printf '%s\n' "$raw_frame" |
         CODEX_STATUS_RANKING=1 CODEX_STATUS_NOW_MS="$status_now_ms" "$USAGE_ANNOTATOR" --key-map
+    ) &&
+    attention_json=$(
+      printf '%s\n' "$raw_frame" |
+        CODEX_STATUS_RANKING=1 CODEX_STATUS_NOW_MS="$status_now_ms" "$USAGE_ANNOTATOR" --attention-state
     ); then
     active_source_row=$(printf '%s\n' "$key_map" | awk '$3 == "active" { print $2; exit }')
     if [[ -n $pending_source_row && $pending_source_row == "$active_source_row" ]]; then
@@ -125,6 +158,11 @@ while true; do
       pending_since=0
     fi
     draw_frame "$frame"
+    if [[ -n $attention_fd ]]; then
+      printf '%s\n' "$attention_json" >&"$attention_fd" 2>/dev/null || attention_fd=''
+    fi
+  elif [[ -n $attention_fd ]]; then
+    printf '%s\n' '{"worthy":false,"observationKey":null}' >&"$attention_fd" 2>/dev/null || attention_fd=''
   fi
 
   key=''

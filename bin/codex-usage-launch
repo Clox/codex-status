@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 set -u
 
-terminal_bin=${GNOME_TERMINAL_BIN:-/usr/bin/gnome-terminal}
+terminal_bin=${GNOME_TERMINAL_BIN:-}
+terminal_server_bin=${GNOME_TERMINAL_SERVER_BIN:-/usr/libexec/gnome-terminal-server}
+terminal_client_bin=${GNOME_TERMINAL_CLIENT_BIN:-/usr/bin/gnome-terminal.real}
+busctl_bin=${CODEX_STATUS_BUSCTL_BIN:-/usr/bin/busctl}
 status_bin=${CODEX_USAGE_WATCH_BIN:-"$HOME/.local/bin/codex-usage-watch"}
 profile=${CODEX_STATUS_TERMINAL_PROFILE:-Codex-status}
 log_file=${CODEX_STATUS_LAUNCH_LOG:-"${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/status-launch.log"}
@@ -14,19 +17,62 @@ if [[ -f $log_file ]] && (( $(stat -c %s "$log_file" 2>/dev/null || printf 0) > 
   mv -f "${log_file}.tmp" "$log_file"
 fi
 
-if [[ ! -x $terminal_bin || ! -x $status_bin ]]; then
-  printf '%s launcher preflight failed: terminal=%q status=%q\n' \
-    "$(date --iso-8601=seconds)" "$terminal_bin" "$status_bin" >>"$log_file"
+if [[ ! -x $status_bin ]] || {
+  [[ -n $terminal_bin ]] && [[ ! -x $terminal_bin ]]
+} || {
+  [[ -z $terminal_bin ]] && { [[ ! -x $terminal_server_bin || ! -x $terminal_client_bin || ! -x $busctl_bin ]]; }
+}; then
+  printf '%s launcher preflight failed: status or terminal binary missing\n' \
+    "$(date --iso-8601=seconds)" >>"$log_file"
   notify-send 'Codex-kontostatus kunde inte starta' \
     "Kontrollera installationen. Diagnostik: $log_file" 2>/dev/null || true
   exit 78
 fi
 
+printf '%s launcher invoked pid=%s\n' "$(date --iso-8601=seconds)" "$BASHPID" >>"$log_file"
+
+server_pid=''
+cleanup() {
+  if [[ -n $server_pid ]]; then
+    kill "$server_pid" 2>/dev/null || true
+    wait "$server_pid" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+
 for attempt in 1 2; do
   started_at=$SECONDS
-  "$terminal_bin" --wait --hide-menubar --profile="$profile" -- "$status_bin" 2>>"$log_file"
-  status=$?
+  # Mint's Python wrapper can return success without starting the terminal.
+  # Keep WM_CLASS stable but give each explicit server its own D-Bus name.
+  app_id="com.canonical.Terminal.CodexStatus.instance${BASHPID}${attempt}"
+  if [[ -n $terminal_bin ]]; then
+    "$terminal_bin" --wait --hide-menubar --app-id="$app_id" --class=CodexStatus --role=codex-status --profile="$profile" -- "$status_bin" 2>>"$log_file"
+    status=$?
+  else
+    "$terminal_server_bin" --app-id "$app_id" --class CodexStatus >/dev/null 2>>"$log_file" &
+    server_pid=$!
+    ready=false
+    for ((check = 0; check < 50; check++)); do
+      if "$busctl_bin" --user status "$app_id" >/dev/null 2>&1; then
+        ready=true
+        break
+      fi
+      kill -0 "$server_pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    if [[ $ready == true ]]; then
+      "$terminal_client_bin" --app-id "$app_id" --wait --hide-menubar --role=codex-status --profile="$profile" -- "$status_bin" 2>>"$log_file"
+      status=$?
+    else
+      printf '%s terminal server did not become ready\n' "$(date --iso-8601=seconds)" >>"$log_file"
+      status=70
+    fi
+    cleanup
+    server_pid=''
+  fi
   elapsed=$((SECONDS - started_at))
+  printf '%s terminal returned exit=%d elapsed=%ds attempt=%d\n' \
+    "$(date --iso-8601=seconds)" "$status" "$elapsed" "$attempt" >>"$log_file"
 
   # Normal window closure and the deliberate old-code shutdown must not reopen.
   if ((status == 0 || status == 75 || status == 130 || status == 143)); then

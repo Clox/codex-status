@@ -12,6 +12,7 @@ const {
   recommendAccount,
   scoreAccount,
 } = require(path.join(__dirname, '..', 'lib', 'codex-account-ranking'));
+const { attentionDecision } = require(path.join(__dirname, '..', 'lib', 'codex-attention-policy'));
 const {
   formatResetValue,
 } = require(path.join(__dirname, '..', 'lib', 'codex-reset-credits'));
@@ -58,7 +59,8 @@ const activationStatePath = process.env.FIVE_HOUR_ACTIVATION_STATE || path.join(
 );
 const input = fs.readFileSync(0, 'utf8').replace(/\r/g, '');
 const mappingOnly = process.argv.includes('--key-map');
-const rankingEnabled = mappingOnly || process.env.CODEX_STATUS_RANKING === '1';
+const attentionOnly = process.argv.includes('--attention-state');
+const rankingEnabled = mappingOnly || attentionOnly || process.env.CODEX_STATUS_RANKING === '1';
 const pendingSourceCandidate = process.env.CODEX_PENDING_SOURCE_ROW || process.env.CODEX_PENDING_ROW || '';
 const pendingSourceRow = /^(1|2|3)$/.test(pendingSourceCandidate)
   ? pendingSourceCandidate
@@ -103,7 +105,7 @@ try {
     ? registry.accounts
     : Object.values(registry.accounts || {});
 } catch {
-  if (mappingOnly) process.exit(1);
+  if (mappingOnly || attentionOnly) process.exit(1);
   process.stdout.write(input);
   process.exit(0);
 }
@@ -134,7 +136,7 @@ const headerIndex = visibleLines.findIndex(line =>
 );
 
 if (headerIndex < 0) {
-  if (mappingOnly) process.exit(1);
+  if (mappingOnly || attentionOnly) process.exit(1);
   process.stdout.write(input);
   process.exit(0);
 }
@@ -182,6 +184,12 @@ const rankedRows = rankingEnabled
       rank: index + 1,
     }));
 
+const recommendation = rankingEnabled ? recommendAccount(rankedRows) : null;
+if (attentionOnly) {
+  process.stdout.write(JSON.stringify(attentionDecision(rankedRows, recommendation, { nowMs })));
+  process.exit(0);
+}
+
 if (mappingOnly) {
   process.stdout.write(rankedRows
     .map(row => `${row.rank}\t${row.sourceRow}\t${row.active ? 'active' : '-'}\t${row.accountNumber}`)
@@ -189,7 +197,6 @@ if (mappingOnly) {
   process.exit(0);
 }
 
-const recommendation = rankingEnabled ? recommendAccount(rankedRows) : null;
 const rankedByLineIndex = new Map();
 const rowLineIndexes = sourceRows.map(row => row.lineIndex).sort((left, right) => left - right);
 for (const [index, lineIndex] of rowLineIndexes.entries()) {

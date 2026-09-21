@@ -121,7 +121,9 @@ The isolated turn passes no dynamic tools or environments, uses a private empty 
 
 The token-free `five-hour-activation.json` state is the worker's safety journal. It persists an attempt before the turn boundary and records `turn-committed` immediately before App Server is called. Success, timeout, crash, or ambiguous postconditions after that boundary can never trigger an automatic retry for the same dormant window. The block is cleared only after VERIFIED server data proves an active/non-dormant window, or when a later dormant observation is unambiguously after the successfully recorded fixed deadline. Pre-turn failures use a cooldown and consume no turn. Worker heartbeat, fatal state, and per-account activation errors are shown in the status window's problem section; no credentials, response bodies, or prompts are stored. Weekly windows are never activated by this worker.
 
-Ranking uses `weekly remaining / hours until weekly reset` as its primary signal. Accounts within 10% of the best weekly urgency form a group whose internal order is decided by current 5H quota plus a small bonus for a reset within the next hour. Recommendation is deliberately more conservative than ranking: it has separate 10% weekly hysteresis, and a 5H advantage can only trigger a switch between weekly-near-equals when the active account's reset-aware 5H score is at or below 10 and the alternative still has both a 10-point and 10% relative advantage. These constants live together in `tools/workstation/codex-auth/lib/codex-account-ranking.js`.
+Ranking uses `weekly remaining / hours until weekly reset` as its primary signal. Accounts within 10% of the best weekly urgency form a group whose internal order is decided by current 5H quota plus a small bonus for a reset within the next hour. Recommendation follows the highest-ranked usable VERIFIED account even when the advantage is small; it is paused when the active account is STALE or UNVERIFIED. A separate attention policy determines when a switch is worth interrupting the user: ordinary weekly advantage keeps the prior approximately 10% threshold, while a 5H-only advantage requires the active account's reset-aware 5H score to be at or below 10 and the alternative to have both a 10-point and 10% relative advantage. Ordinary attention requires two distinct fresh VERIFIED server observations. VERIFIED `NEEDS_ACTIVATION` and exhausted active quota are immediate special cases. No new arbitrary critical-deadline threshold has been introduced.
+
+On this workstation the status launcher creates a dedicated GNOME Terminal server/window with `CodexStatus` WM_CLASS and `codex-status` role. It deliberately bypasses Linux Mint's `/usr/bin/gnome-terminal` Python wrapper, which can return success without opening the requested isolated-class window, and assigns each server a unique D-Bus app ID. A singleton lock prevents duplicate status windows. Its X11 controller watches `_NET_ACTIVE_WINDOW` events and sets `_NET_WM_STATE_DEMANDS_ATTENTION` on that exact window without raising or focusing it. Cinnamon briefly flashes the grouped taskbar item and then leaves an attention marker until the window is focused. Focus acknowledges the stable `active account → recommended account : situation class` fingerprint; unchanged recommendations do not re-alert on blur. Two distinct fresh observations of a resolved situation re-arm it. Stale cached usage after suspend cannot trigger attention. This is X11/Cinnamon-specific; on other display stacks the status UI still works but does not request taskbar attention.
 
 The digit shortcuts intentionally act immediately. Do not programmatically restart or focus the status terminal while active Codex work is in progress: an accidentally delivered digit can initiate a real account switch and close Desktop.
 
@@ -153,6 +155,7 @@ Conversation visibility comes from the shared local state, not from copying auth
 - `$HOME/.local/bin/codex-auth-repair`
 - `$HOME/.local/bin/codex-usage-launch`
 - `$HOME/.local/bin/codex-usage-watch`
+- `$HOME/.local/bin/codex-status-attention`
 - `$HOME/.local/bin/codex-usage-annotate`
 - `$HOME/.local/bin/codex-usage-refresh`
 - `$HOME/.local/bin/codex-weekly-activate`
@@ -160,6 +163,7 @@ Conversation visibility comes from the shared local state, not from copying auth
 - `$HOME/.local/bin/codex-five-hour-activation-worker`
 - `$HOME/.local/bin/codex-reset-credits-refresh`
 - `$HOME/.local/lib/codex-account-ranking.js`
+- `$HOME/.local/lib/codex-attention-policy.js`
 - `$HOME/.local/lib/codex-account-state.js`
 - `$HOME/.local/lib/codex-auth-repair.js`
 - `$HOME/.local/lib/codex-reset-credits.js`
@@ -175,6 +179,7 @@ Conversation visibility comes from the shared local state, not from copying auth
 - `$HOME/.cache/codex-account-switcher/usage.json` — mode `0600`, token-free per-account usage cache
 - `$HOME/.cache/codex-account-switcher/five-hour-activation.json` — mode `0600`, token-free worker heartbeat, idempotency and error state
 - `$HOME/.cache/codex-account-switcher/reset-credits.json` — mode `0600`, token-free reset count/expiration cache
+- `$HOME/.cache/codex-account-switcher/status-window.lock` — singleton lock for the status window
 - `$HOME/.config/codex-account-switcher/activation-holds.json` — optional mode-`0600` per-account observation holds keyed by stable account ID; contains no credentials
 - `$HOME/.local/share/applications/codex-account{1,2,3}.desktop`
 - `$HOME/.local/share/applications/codex-usage-watch.desktop`

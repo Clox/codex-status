@@ -18,9 +18,11 @@ fail() {
   exit 1
 }
 
-for command_name in node npm gnome-terminal gsettings dconf script setsid pgrep pkill systemctl; do
+for command_name in node npm gnome-terminal gsettings dconf script setsid pgrep pkill systemctl busctl flock wmctrl xprop; do
   command -v "$command_name" >/dev/null 2>&1 || fail "required command is missing: $command_name"
 done
+[[ -x /usr/libexec/gnome-terminal-server && -x /usr/bin/gnome-terminal.real ]] ||
+  fail 'the GNOME Terminal server/client binaries are required for the status window'
 
 node_major=$(node --version | sed -E 's/^v([0-9]+).*/\1/')
 [[ $node_major =~ ^[0-9]+$ ]] || fail 'could not determine the Node.js version'
@@ -36,9 +38,12 @@ node_bin_dir=$(dirname -- "$(command -v node)")
 codex_home=${CODEX_HOME:-"$HOME/.codex"}
 chatgpt_launcher=${CHATGPT_LAUNCHER:-/usr/bin/chatgpt}
 chatgpt_binary=${CHATGPT_BINARY:-/usr/lib/chatgpt/ChatGPT}
+codex_login_bin=$(command -v codex || true)
+codex_login_bin=${codex_login_bin:-/usr/lib/chatgpt/resources/codex}
 
 [[ -x $chatgpt_launcher ]] || fail "Desktop launcher is not executable: $chatgpt_launcher"
 [[ -x $chatgpt_binary ]] || fail "Desktop binary is not executable: $chatgpt_binary"
+[[ -x $codex_login_bin ]] || fail "Codex login binary is not executable: $codex_login_bin"
 
 printf '\nAccounts currently known to codex-auth:\n'
 "$codex_auth_bin" list --skip-api || fail 'codex-auth list failed; complete fresh interactive logins first'
@@ -77,6 +82,7 @@ backup_if_present "$local_bin/codex-account-state"
 backup_if_present "$local_bin/codex-auth-repair"
 backup_if_present "$local_bin/codex-usage-launch"
 backup_if_present "$local_bin/codex-usage-watch"
+backup_if_present "$local_bin/codex-status-attention"
 backup_if_present "$local_bin/codex-usage-annotate"
 backup_if_present "$local_bin/codex-usage-refresh"
 backup_if_present "$local_bin/codex-weekly-activate"
@@ -84,6 +90,7 @@ backup_if_present "$local_bin/codex-five-hour-activate"
 backup_if_present "$local_bin/codex-five-hour-activation-worker"
 backup_if_present "$local_bin/codex-reset-credits-refresh"
 backup_if_present "$local_lib/codex-account-ranking.js"
+backup_if_present "$local_lib/codex-attention-policy.js"
 backup_if_present "$local_lib/codex-account-state.js"
 backup_if_present "$local_lib/codex-auth-repair.js"
 backup_if_present "$local_lib/codex-reset-credits.js"
@@ -108,6 +115,7 @@ install -m 0755 "$bin_source/codex-account-state" "$local_bin/codex-account-stat
 install -m 0755 "$bin_source/codex-auth-repair" "$local_bin/codex-auth-repair"
 install -m 0755 "$bin_source/codex-usage-launch" "$local_bin/codex-usage-launch"
 install -m 0755 "$bin_source/codex-usage-watch" "$local_bin/codex-usage-watch"
+install -m 0755 "$bin_source/codex-status-attention" "$local_bin/codex-status-attention"
 install -m 0755 "$bin_source/codex-usage-annotate" "$local_bin/codex-usage-annotate"
 install -m 0755 "$bin_source/codex-usage-refresh" "$local_bin/codex-usage-refresh"
 install -m 0755 "$bin_source/codex-weekly-activate" "$local_bin/codex-weekly-activate"
@@ -115,6 +123,7 @@ install -m 0755 "$bin_source/codex-five-hour-activate" "$local_bin/codex-five-ho
 install -m 0755 "$bin_source/codex-five-hour-activation-worker" "$local_bin/codex-five-hour-activation-worker"
 install -m 0755 "$bin_source/codex-reset-credits-refresh" "$local_bin/codex-reset-credits-refresh"
 install -m 0644 "$lib_source/codex-account-ranking.js" "$local_lib/codex-account-ranking.js"
+install -m 0644 "$lib_source/codex-attention-policy.js" "$local_lib/codex-attention-policy.js"
 install -m 0644 "$lib_source/codex-account-state.js" "$local_lib/codex-account-state.js"
 install -m 0644 "$lib_source/codex-auth-repair.js" "$local_lib/codex-auth-repair.js"
 install -m 0644 "$lib_source/codex-reset-credits.js" "$local_lib/codex-reset-credits.js"
@@ -148,7 +157,7 @@ escape_config_value() {
   printf 'ACCOUNT_SWITCHER=%s\n' "$(escape_config_value "$local_bin/codex-account")"
   printf 'ACCOUNT_STATE_CHECKER=%s\n' "$(escape_config_value "$local_bin/codex-account-state")"
   printf 'AUTH_REPAIRER=%s\n' "$(escape_config_value "$local_bin/codex-auth-repair")"
-  printf 'CODEX_LOGIN_BIN=%s\n' "$(escape_config_value "$(command -v codex)")"
+  printf 'CODEX_LOGIN_BIN=%s\n' "$(escape_config_value "$codex_login_bin")"
   printf 'USAGE_ANNOTATOR=%s\n' "$(escape_config_value "$local_bin/codex-usage-annotate")"
   printf 'USAGE_REFRESHER=%s\n' "$(escape_config_value "$local_bin/codex-usage-refresh")"
   printf 'USAGE_CACHE=%s\n' "$(escape_config_value "${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/usage.json")"
@@ -222,6 +231,7 @@ status_desktop="$applications_dir/codex-usage-watch.desktop"
   printf 'Name=Codex-kontostatus\n'
   printf 'Comment=Visa Codex-konton och återstående kvoter\n'
   printf 'Exec=%s\n' "$local_bin/codex-usage-launch"
+  printf 'StartupWMClass=CodexStatus\n'
   printf 'Icon=utilities-terminal\n'
   printf 'Terminal=false\n'
   printf 'Categories=Development;Utility;\n'
@@ -234,6 +244,6 @@ printf 'Private configuration: %s\n' "$config_file"
 printf 'Run "codex-auth config auto disable" for the stable restart workflow.\n'
 printf 'Review API/local usage mode with "codex-auth status".\n'
 if [[ $status_was_running == true ]]; then
-  setsid -f "$(command -v gnome-terminal)" --hide-menubar --profile="$profile_name" -- "$local_bin/codex-usage-watch" </dev/null >/dev/null 2>&1
+  setsid -f "$local_bin/codex-usage-launch" </dev/null >/dev/null 2>&1
   printf 'Restarted the status window with the newly installed code.\n'
 fi

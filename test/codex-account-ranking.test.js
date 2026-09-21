@@ -164,28 +164,28 @@ test('an account with zero weekly quota ranks last and an exhausted active accou
   assert.equal(recommendAccount(ranked).account.sourceRow, '2');
 });
 
-test('stays on an active account that is only marginally behind', () => {
+test('recommendation follows rank one even when active is only marginally behind', () => {
   const ranked = rankAccounts([
     account(1, { active: true, weeklyRemaining: 60, weeklyResetAt: (NOW_MS + 2 * 3_600_000) / 1000, fiveHourRemaining: 55 }),
     account(2, { weeklyRemaining: 62, weeklyResetAt: (NOW_MS + 2 * 3_600_000) / 1000, fiveHourRemaining: 60 }),
   ], { nowMs: NOW_MS });
   assert.equal(ranked[0].sourceRow, '2');
   assert.deepEqual(recommendAccount(ranked), {
-    action: 'stay',
-    account: ranked.find(item => item.sourceRow === '1'),
-    reason: 'active-five-hour-usable',
+    action: 'switch',
+    account: ranked[0],
+    reason: 'ranked-best',
   });
 });
 
-test('stays within a weekly-near-equal group while active 5H remains usable', () => {
+test('recommendation follows 5H-ranked winner within weekly-near-equal group', () => {
   const ranked = rankAccounts([
     account(1, { active: true, weeklyRemaining: 60, weeklyResetAt: (NOW_MS + 2 * 3_600_000) / 1000, fiveHourRemaining: 20 }),
     account(2, { weeklyRemaining: 62, weeklyResetAt: (NOW_MS + 2 * 3_600_000) / 1000, fiveHourRemaining: 80 }),
   ], { nowMs: NOW_MS });
   const recommendation = recommendAccount(ranked);
-  assert.equal(recommendation.action, 'stay');
-  assert.equal(recommendation.account.sourceRow, '1');
-  assert.equal(recommendation.reason, 'active-five-hour-usable');
+  assert.equal(recommendation.action, 'switch');
+  assert.equal(recommendation.account.sourceRow, '2');
+  assert.equal(recommendation.reason, 'ranked-best');
 });
 
 test('switches within a weekly-near-equal group when active 5H is critically low', () => {
@@ -196,18 +196,18 @@ test('switches within a weekly-near-equal group when active 5H is critically low
   const recommendation = recommendAccount(ranked);
   assert.equal(recommendation.action, 'switch');
   assert.equal(recommendation.account.sourceRow, '2');
-  assert.equal(recommendation.reason, 'five-hour-availability');
+  assert.equal(recommendation.reason, 'ranked-best');
 });
 
-test('stays on critically low active 5H when its reset is imminent', () => {
+test('recommendation still follows rank one when active 5H reset is imminent', () => {
   const ranked = rankAccounts([
     account(1, { active: true, weeklyRemaining: 60, weeklyResetAt: (NOW_MS + 2 * 3_600_000) / 1000, fiveHourRemaining: 1, fiveHourResetAt: (NOW_MS + 5 * 60_000) / 1000 }),
     account(2, { weeklyRemaining: 62, weeklyResetAt: (NOW_MS + 2 * 3_600_000) / 1000, fiveHourRemaining: 80 }),
   ], { nowMs: NOW_MS });
   const recommendation = recommendAccount(ranked);
-  assert.equal(recommendation.action, 'stay');
-  assert.equal(recommendation.account.sourceRow, '1');
-  assert.equal(recommendation.reason, 'active-five-hour-usable');
+  assert.equal(recommendation.action, 'switch');
+  assert.equal(recommendation.account.sourceRow, '2');
+  assert.equal(recommendation.reason, 'ranked-best');
 });
 
 test('recommends switching when the active account is clearly worse weekly', () => {
@@ -218,7 +218,7 @@ test('recommends switching when the active account is clearly worse weekly', () 
   const recommendation = recommendAccount(ranked);
   assert.equal(recommendation.action, 'switch');
   assert.equal(recommendation.account.sourceRow, '2');
-  assert.equal(recommendation.reason, 'weekly-urgency');
+  assert.equal(recommendation.reason, 'ranked-best');
 });
 
 test('ranking changes after a 5H reset', () => {
@@ -241,7 +241,7 @@ test('equal accounts use the active account then stable source order', () => {
   ]), ['3', '1', '2']);
 });
 
-test('stays on the highest-weekly-urgency active account from the reported regression', () => {
+test('ranked recommendation can differ from highest-urgency active account without attention', () => {
   const resetInHours = hours => (NOW_MS + hours * 3_600_000) / 1000;
   const ranked = rankAccounts([
     account(1, {
@@ -271,8 +271,8 @@ test('stays on the highest-weekly-urgency active account from the reported regre
   assert.deepEqual(ranked.map(item => item.sourceRow), ['1', '2', '3']);
   assert.deepEqual(ranked.map(item => Number(item.weeklyUrgency.toFixed(2))), [1.11, 1.17, 0.66]);
   assert.deepEqual(recommendAccount(ranked), {
-    action: 'stay',
-    account: ranked.find(item => item.sourceRow === '2'),
-    reason: 'active-five-hour-usable',
+    action: 'switch',
+    account: ranked[0],
+    reason: 'ranked-best',
   });
 });

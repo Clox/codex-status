@@ -1,0 +1,80 @@
+#!/usr/bin/env node
+'use strict';
+
+const { execFileSync, spawn } = require('node:child_process');
+const readline = require('node:readline');
+const path = require('node:path');
+const { advanceAttentionState } = require(path.join(__dirname, '..', 'lib', 'codex-attention-policy'));
+
+const WINDOW_CLASS = 'CodexStatus';
+const WINDOW_ROLE = 'codex-status';
+let windowId = null;
+let focused = false;
+let latestDecision = null;
+let state = null;
+let appliedAttention = null;
+
+function command(commandName, args) {
+  return execFileSync(commandName, args, { encoding: 'utf8', timeout: 2000, stdio: ['ignore', 'pipe', 'ignore'] });
+}
+
+function findWindow() {
+  const ids = command('wmctrl', ['-lx']).split('\n')
+    .filter(line => new RegExp(`\\.${WINDOW_CLASS}\\s`, 'i').test(line))
+    .map(line => line.match(/^0x[0-9a-f]+/i)?.[0])
+    .filter(Boolean)
+    .filter(id => {
+      const properties = command('xprop', ['-id', id, 'WM_CLASS', 'WM_WINDOW_ROLE']);
+      return properties.includes(`"${WINDOW_CLASS}"`) && properties.includes(`"${WINDOW_ROLE}"`);
+    });
+  return ids.length === 1 ? ids[0] : null;
+}
+
+function activeWindow() {
+  return command('xprop', ['-root', '_NET_ACTIVE_WINDOW']).match(/window id # (0x[0-9a-f]+)/i)?.[1] || null;
+}
+
+function setAttention(enabled) {
+  if (!windowId || appliedAttention === enabled) return;
+  command('wmctrl', ['-i', '-r', windowId, '-b', `${enabled ? 'add' : 'remove'},demands_attention`]);
+  appliedAttention = enabled;
+}
+
+function updateFocus() {
+  if (!windowId) return;
+  focused = activeWindow()?.toLowerCase() === windowId.toLowerCase();
+  if (latestDecision) {
+    state = advanceAttentionState(state, latestDecision, focused);
+    setAttention(state.attention && !focused);
+  }
+}
+
+function failClosed() {
+  try { setAttention(false); } catch {}
+  process.exit(1);
+}
+
+try {
+  const watcher = spawn('xprop', ['-spy', '-root', '_NET_ACTIVE_WINDOW'], {
+    stdio: ['ignore', 'pipe', 'ignore'],
+  });
+  watcher.on('error', failClosed);
+  watcher.on('exit', failClosed);
+  readline.createInterface({ input: watcher.stdout }).on('line', () => {
+    try { updateFocus(); } catch { failClosed(); }
+  });
+  readline.createInterface({ input: process.stdin }).on('line', line => {
+    try {
+      if (!windowId) windowId = findWindow();
+      if (!windowId) return;
+      focused = activeWindow()?.toLowerCase() === windowId.toLowerCase();
+      latestDecision = JSON.parse(line);
+      state = advanceAttentionState(state, latestDecision, focused);
+      setAttention(state.attention && !focused);
+    } catch { failClosed(); }
+  });
+  process.stdin.on('end', () => {
+    try { setAttention(false); } catch {}
+    watcher.kill();
+  });
+} catch { failClosed(); }
