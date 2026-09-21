@@ -20,7 +20,7 @@ const {
 } = require(path.join(__dirname, '..', 'lib', 'codex-activation-account'));
 const {
   activatedResetHours,
-  authStateMatches,
+  assertAuthStateUnchanged,
   executeVerifiedActivation,
   fetchFreshUsage,
   fingerprintAuthState,
@@ -46,6 +46,10 @@ function friendlyError(error, label) {
   if (code === 'ACTIVATION_HOLDS_INVALID') return 'Activation-hold-konfigurationen är ogiltig. Avbryter säkert utan Codex-turn.';
   if (code === 'APP_SERVER_CAPABILITY_MISMATCH') return 'Den installerade Codex App Server-versionen saknar den verifierade experimentella protokollformen. Avbryter säkert.';
   if (code === 'ACTIVATION_NOT_VERIFIED') return 'Turnen slutfördes, men servern rapporterade inte en rimlig ny weekly-reset kring 168 timmar. Ingen retry gjordes.';
+  if (code === 'GLOBAL_AUTH_STATE_CHANGED') {
+    const fields = Array.isArray(error?.authStateChanges) ? ` Ändrat state: ${error.authStateChanges.join(', ')}.` : '';
+    return `Global auth-state ändrades oväntat. Activation markeras som misslyckad.${fields}`;
+  }
   if (code.startsWith('APP_SERVER_')) return `Den isolerade App Server-körningen avbröts säkert (${code}). Ingen retry gjordes.`;
   if (code.startsWith('USAGE_')) return `Kunde inte verifiera färsk server-usage (${code}). Ingen Codex-turn skickades.`;
   return `Activation avbröts säkert (${code || 'UNKNOWN_ERROR'}).`;
@@ -125,10 +129,8 @@ async function main() {
       activationError = error;
     }
     const afterFingerprint = fingerprintAuthState(codexHome);
-    if (!authStateMatches(beforeFingerprint, afterFingerprint)) {
-      throw new Error('GLOBAL_AUTH_STATE_CHANGED');
-    }
-    process.stdout.write(`Global auth-state verifierad oförändrad (${Object.keys(afterFingerprint).length} filer).\n`);
+    assertAuthStateUnchanged(beforeFingerprint, afterFingerprint);
+    process.stdout.write(`Global auth-state verifierad oförändrad (${Object.keys(afterFingerprint.authFileHashes).length} authfiler + normaliserat registry-state).\n`);
     if (activationError) throw activationError;
     const resetHours = activatedResetHours(activationResult.after);
     process.stdout.write(`Activation verifierad: weekly-reset är cirka ${resetHours.toFixed(1)} timmar bort.\n`);

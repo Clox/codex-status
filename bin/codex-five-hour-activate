@@ -29,7 +29,7 @@ const {
   verifyFiveHourDormantPrecondition,
 } = require(path.join(__dirname, '..', 'lib', 'codex-five-hour-activation'));
 const {
-  authStateMatches,
+  assertAuthStateUnchanged,
   fetchFreshUsageObservation,
   fingerprintAuthState,
   generateAndCheckSchema,
@@ -53,7 +53,10 @@ function friendlyError(error, label) {
   if (code === 'ACTIVATION_HOLDS_INVALID') return 'Activation-hold-konfigurationen är ogiltig. Avbryter säkert utan Codex-turn.';
   if (code === 'APP_SERVER_CAPABILITY_MISMATCH') return 'Den installerade Codex App Server-versionen saknar den verifierade experimentella protokollformen. Avbryter säkert.';
   if (code === 'FIVE_HOUR_ACTIVATION_NOT_VERIFIED') return 'Turnen slutfördes, men två färska serverobservationer bekräftade inte en fixerad ny 5H-deadline. Ingen retry gjordes.';
-  if (code === 'GLOBAL_AUTH_STATE_CHANGED') return 'Global auth-state ändrades oväntat. Activation markeras som misslyckad och Desktop startades inte om.';
+  if (code === 'GLOBAL_AUTH_STATE_CHANGED') {
+    const fields = Array.isArray(error?.authStateChanges) ? ` Ändrat state: ${error.authStateChanges.join(', ')}.` : '';
+    return `Global auth-state ändrades oväntat. Activation markeras som misslyckad och Desktop startades inte om.${fields}`;
+  }
   if (code.startsWith('APP_SERVER_')) return `Den isolerade App Server-körningen avbröts säkert (${code}). Ingen retry gjordes.`;
   if (code.startsWith('USAGE_')) return `Kunde inte verifiera färsk server-usage (${code}). Ingen Codex-turn skickades.`;
   return `5H-activation avbröts säkert (${code || 'UNKNOWN_ERROR'}).`;
@@ -149,10 +152,8 @@ async function main() {
         activationError = error;
       }
       const afterFingerprint = fingerprintAuthState(codexHome);
-      if (!authStateMatches(beforeFingerprint, afterFingerprint)) {
-        throw new Error('GLOBAL_AUTH_STATE_CHANGED');
-      }
-      process.stdout.write(`Global auth-state verifierad oförändrad (${Object.keys(afterFingerprint).length} filer).\n`);
+      assertAuthStateUnchanged(beforeFingerprint, afterFingerprint);
+      process.stdout.write(`Global auth-state verifierad oförändrad (${Object.keys(afterFingerprint.authFileHashes).length} authfiler + normaliserat registry-state).\n`);
       if (activationError) throw activationError;
       const resetHours = fixedResetHours(activationResult.after, accountId);
       process.stdout.write(`5H-activation verifierad: deadline är fixerad och cirka ${resetHours.toFixed(2)} timmar bort.\n`);

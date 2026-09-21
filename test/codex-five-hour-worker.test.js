@@ -10,6 +10,10 @@ const {
   activationWorkerHealth,
   runFiveHourActivationCycle,
 } = require('../lib/codex-five-hour-worker');
+const {
+  assertAuthStateUnchanged,
+  fingerprintAuthState,
+} = require('../lib/codex-weekly-activation');
 
 const NOW_MS = 1_800_000_000_000;
 const ACCOUNT_ID = 'account-a';
@@ -65,7 +69,47 @@ test('verified dormant account gets exactly one committed activation attempt', a
   });
   assert.equal(calls, 1);
   assert.equal(state.accounts[ACCOUNT_ID].phase, 'succeeded');
+  assert.equal(state.accounts[ACCOUNT_ID].lastSuccessAtMs, NOW_MS);
+  assert.equal(state.accounts[ACCOUNT_ID].activatedResetAt, NOW_MS / 1000 + 18_000);
   assert.equal(persisted.some(saved => saved.accounts[ACCOUNT_ID]?.phase === 'turn-committed'), true);
+});
+
+test('concurrent registry activity metadata does not prevent recording activation success', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'activation-registry-metadata-test-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(root, 'accounts'));
+  fs.writeFileSync(path.join(root, 'auth.json'), '{"global":"unchanged"}');
+  fs.writeFileSync(path.join(root, 'accounts', 'account-a.auth.json'), '{"snapshot":"unchanged"}');
+  const registryPath = path.join(root, 'accounts', 'registry.json');
+  const registry = {
+    active_account_key: 'key-a',
+    active_account_activated_at_ms: 123,
+    accounts: [{
+      account_key: 'key-a',
+      chatgpt_account_id: ACCOUNT_ID,
+      chatgpt_user_id: 'user-a',
+      last_usage: { primary: { used_percent: 0 } },
+      last_usage_at: 100,
+      last_local_rollout: { path: '/tmp/old', event_timestamp_ms: 100 },
+    }],
+  };
+  fs.writeFileSync(registryPath, JSON.stringify(registry));
+  const before = fingerprintAuthState(root);
+
+  const { state } = await cycle({
+    activateAccount: async (_account, hooks) => {
+      await hooks.beforeTurn();
+      registry.accounts[0].last_usage.primary.used_percent = 1;
+      registry.accounts[0].last_usage_at = 200;
+      registry.accounts[0].last_local_rollout = { path: '/tmp/new', event_timestamp_ms: 200 };
+      fs.writeFileSync(registryPath, JSON.stringify(registry));
+      assertAuthStateUnchanged(before, fingerprintAuthState(root));
+      return { activatedResetAt: NOW_MS / 1000 + 18_000 };
+    },
+  });
+  assert.equal(state.accounts[ACCOUNT_ID].phase, 'succeeded');
+  assert.equal(state.accounts[ACCOUNT_ID].lastSuccessAtMs, NOW_MS);
+  assert.equal(state.accounts[ACCOUNT_ID].activatedResetAt, NOW_MS / 1000 + 18_000);
 });
 
 test('stale or unverified dormant-looking data never triggers activation', async () => {
@@ -175,6 +219,35 @@ test('crash or ambiguity after turn commit blocks all automatic retries for that
   });
   assert.equal(first.state.accounts[ACCOUNT_ID].phase, 'blocked');
   assert.equal(first.state.accounts[ACCOUNT_ID].actionRequired, true);
+
+  await cycle({
+    previousState: first.state,
+    activateAccount: async () => { calls += 1; },
+  });
+  assert.equal(calls, 1);
+});
+
+test('auth identity change after turn commit records safe diagnostics and never retries', async () => {
+  let calls = 0;
+  const changed = new Error('GLOBAL_AUTH_STATE_CHANGED');
+  changed.authStateChanges = [
+    'registry.activeAccountKey',
+    'auth.globalAuthHash',
+    'unsafe.secret:value',
+  ];
+  const first = await cycle({
+    activateAccount: async (_account, hooks) => {
+      calls += 1;
+      await hooks.beforeTurn();
+      throw changed;
+    },
+  });
+  assert.equal(first.state.accounts[ACCOUNT_ID].phase, 'blocked');
+  assert.equal(first.state.accounts[ACCOUNT_ID].errorKind, 'GLOBAL_AUTH_STATE_CHANGED');
+  assert.deepEqual(first.state.accounts[ACCOUNT_ID].diagnosticFields, [
+    'auth.globalAuthHash',
+    'registry.activeAccountKey',
+  ]);
 
   await cycle({
     previousState: first.state,

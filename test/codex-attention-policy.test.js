@@ -126,7 +126,7 @@ test('stale observation and unverified active data fail closed', () => {
 test('NEEDS_ACTIVATION and exhausted active accounts request immediate attention', () => {
   const dormant = decide([
     account('a'),
-    account('b', { active: false, weeklyRemaining: 100, weeklyResetAt: NOW / 1000 }),
+    account('b', { active: false, weeklyRemaining: 100, weeklyDormant: true, weeklyResetAt: resetInHours(168) }),
   ]).decision;
   assert.equal(dormant.situationClass, 'needs-activation');
   assert.equal(advanceAttentionState(null, dormant, false).attention, true);

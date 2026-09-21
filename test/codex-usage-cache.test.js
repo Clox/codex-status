@@ -5,6 +5,7 @@ const test = require('node:test');
 const {
   assessCacheHealth,
   isFiveHourDormant,
+  isWeeklyDormant,
   parseUsageResponse,
   refreshUsageCache,
   resolveUsage,
@@ -105,7 +106,7 @@ test('preserves credential-free raw window fields for both 5H and weekly observa
   assert.equal(JSON.stringify(cache).includes('secret-a'), false);
 });
 
-test('pins two server-timed weekly reset observations beyond the rolling raw history', async () => {
+test('pins two server-timed dormant weekly observations beyond the rolling raw history', async () => {
   const beforeAt = NOW_MS - 60_000;
   const before = await refreshObserved({}, observedResponse({
     observedAtMs: beforeAt,
@@ -118,21 +119,21 @@ test('pins two server-timed weekly reset observations beyond the rolling raw his
     observedAtMs: NOW_MS,
     primaryResetAt: NOW_MS / 1000 + 18_000,
     secondaryUsed: 0,
-    secondaryResetAt: NOW_MS / 1000,
-    secondaryResetAfter: 0,
+    secondaryResetAt: NOW_MS / 1000 + 604_800,
+    secondaryResetAfter: 604_800,
   }));
   const second = await refreshObserved(first, observedResponse({
     observedAtMs: NOW_MS + 60_000,
     primaryResetAt: (NOW_MS + 60_000) / 1000 + 18_000,
     secondaryUsed: 0,
-    secondaryResetAt: (NOW_MS + 60_000) / 1000,
-    secondaryResetAfter: 0,
+    secondaryResetAt: (NOW_MS + 60_000) / 1000 + 604_800,
+    secondaryResetAfter: 604_800,
   }));
   const evidence = second.accounts['account-a'].weeklyResetEvidence;
   assert.equal(evidence.before.usedPercent, 100);
   assert.equal(evidence.after.length, 2);
   assert.deepEqual(evidence.after.map(value => value.serverObservedAtMs), [NOW_MS, NOW_MS + 60_000]);
-  assert.deepEqual(evidence.after.map(value => value.resetAfterSeconds), [0, 0]);
+  assert.deepEqual(evidence.after.map(value => value.resetAfterSeconds), [604_800, 604_800]);
   assert.equal(JSON.stringify(evidence).includes('secret-a'), false);
 
   const later = await refreshObserved(second, observedResponse({
@@ -141,6 +142,49 @@ test('pins two server-timed weekly reset observations beyond the rolling raw his
     secondaryUsed: 0,
   }));
   assert.deepEqual(later.accounts['account-a'].weeklyResetEvidence, evidence);
+});
+
+test('classifies weekly dormant from two fresh moving full-window observations', async () => {
+  const firstAt = NOW_MS - 60_000;
+  const first = await refreshObserved({}, observedResponse({
+    observedAtMs: firstAt,
+    primaryResetAt: firstAt / 1000 + 18_000,
+    secondaryUsed: 0,
+    secondaryResetAt: firstAt / 1000 + 604_800,
+    secondaryResetAfter: 604_800,
+  }));
+  assert.equal(isWeeklyDormant(first.accounts['account-a'], { nowMs: firstAt }), false);
+
+  const second = await refreshObserved(first, observedResponse({
+    observedAtMs: NOW_MS,
+    primaryResetAt: NOW_MS / 1000 + 18_000,
+    secondaryUsed: 0,
+    secondaryResetAt: NOW_MS / 1000 + 604_800,
+    secondaryResetAfter: 604_800,
+  }));
+  assert.equal(isWeeklyDormant(second.accounts['account-a'], { nowMs: NOW_MS }), true);
+  assert.equal(isWeeklyDormant(second.accounts['account-a'], { nowMs: NOW_MS + 180_001 }), false);
+});
+
+test('fixed weekly deadline stays active even while used_percent still rounds to zero', async () => {
+  const fixedResetAt = NOW_MS / 1000 + 604_800;
+  const firstAt = NOW_MS - 60_000;
+  const first = await refreshObserved({}, observedResponse({
+    observedAtMs: firstAt,
+    primaryResetAt: firstAt / 1000 + 18_000,
+    secondaryUsed: 0,
+    secondaryResetAt: fixedResetAt,
+    secondaryResetAfter: 604_800,
+  }));
+  const second = await refreshObserved(first, observedResponse({
+    observedAtMs: NOW_MS,
+    primaryResetAt: NOW_MS / 1000 + 18_000,
+    secondaryUsed: 0,
+    secondaryResetAt: fixedResetAt,
+    secondaryResetAfter: 604_740,
+  }));
+
+  assert.equal(isWeeklyDormant(second.accounts['account-a'], { nowMs: NOW_MS }), false);
 });
 
 test('classifies 5H dormant only after two fresh moving full-window observations', async () => {

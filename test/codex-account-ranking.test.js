@@ -40,7 +40,7 @@ test('weekly urgency is remaining weekly percentage per reset hour', () => {
 test('100% weekly with no running window needs activation and ranks first', () => {
   const ranked = rankAccounts([
     account(1, { active: true, weeklyRemaining: 60 }),
-    account(2, { usageFresh: true, weeklyRemaining: 100, weeklyResetAt: NOW_MS / 1000 }),
+    account(2, { weeklyRemaining: 100, weeklyDormant: true, weeklyResetAt: (NOW_MS + 168 * 3_600_000) / 1000 }),
   ], { nowMs: NOW_MS });
 
   assert.deepEqual(ranked.map(item => item.sourceRow), ['2', '1']);
@@ -57,7 +57,8 @@ test('stale 100% weekly data never creates NEEDS_ACTIVATION', () => {
   const scored = scoreAccount(account(1, {
     usageQuality: 'stale',
     weeklyRemaining: 100,
-    weeklyResetAt: NOW_MS / 1000,
+    weeklyDormant: true,
+    weeklyResetAt: (NOW_MS + 168 * 3_600_000) / 1000,
   }), { nowMs: NOW_MS });
 
   assert.equal(scored.needsActivation, false);
@@ -105,7 +106,7 @@ test('a stale active account pauses recommendation until refresh recovers', () =
 
 test('an active unstarted weekly cycle recommends one activation use without switching', () => {
   const ranked = rankAccounts([
-    account(1, { active: true, weeklyRemaining: 100, weeklyResetAt: NOW_MS / 1000 }),
+    account(1, { active: true, weeklyRemaining: 100, weeklyDormant: true, weeklyResetAt: (NOW_MS + 168 * 3_600_000) / 1000 }),
     account(2, { weeklyRemaining: 60 }),
   ], { nowMs: NOW_MS });
 

@@ -115,7 +115,7 @@ test('row coloring leaves vertical column separators in the terminal default col
   assert.equal(output, `${color}01 account \x1b[0m│${color} 1×025:04\x1b[0m│${color} 100% READY \x1b[0m│${color} Now  ACTIVE\x1b[0m`);
 });
 
-test('renders a confirmed synthetic moving 5H deadline as READY without countdown flapping', () => {
+test('renders confirmed synthetic moving 5H and weekly deadlines as READY and START', () => {
   const account = {
     account_key: 'user-c::account-c',
     chatgpt_account_id: 'account-c',
@@ -125,7 +125,7 @@ test('renders a confirmed synthetic moving 5H deadline as READY without countdow
   const firstAt = NOW_MS - 60_000;
   const serverEntry = {
     primary: { remainingPercent: 100, resetsAt: NOW_MS / 1000 + 18_000 },
-    secondary: { remainingPercent: 50, resetsAt: NOW_MS / 1000 + 100_000 },
+    secondary: { remainingPercent: 100, resetsAt: NOW_MS / 1000 + 604_800 },
     observations: {
       primary: [
         {
@@ -145,6 +145,24 @@ test('renders a confirmed synthetic moving 5H deadline as READY without countdow
           resetAt: NOW_MS / 1000 + 18_000,
         },
       ],
+      secondary: [
+        {
+          observedAtMs: firstAt,
+          serverObservedAtMs: firstAt,
+          usedPercent: 0,
+          limitWindowSeconds: 604_800,
+          resetAfterSeconds: 604_800,
+          resetAt: firstAt / 1000 + 604_800,
+        },
+        {
+          observedAtMs: NOW_MS,
+          serverObservedAtMs: NOW_MS,
+          usedPercent: 0,
+          limitWindowSeconds: 604_800,
+          resetAfterSeconds: 604_800,
+          resetAt: NOW_MS / 1000 + 604_800,
+        },
+      ],
     },
     refresh: {
       lastSuccessAt: NOW_MS,
@@ -158,8 +176,63 @@ test('renders a confirmed synthetic moving 5H deadline as READY without countdow
 
   for (const offset of [0, 10_000, 70_000]) {
     const row = normalize({ account, serverEntry, nowMs: NOW_MS + offset });
+    const ranked = rankAccounts([row], { nowMs: NOW_MS + offset });
     assert.equal(row.fiveHourDormant, true);
+    assert.equal(row.weeklyDormant, true);
+    assert.equal(ranked[0].needsActivation, true);
     assert.equal(row.fiveHour, '100% █ READY');
+    assert.equal(row.weekly, '100% █ READY');
+    assert.match(render(ranked[0]), /START/);
     assert.doesNotMatch(row.fiveHour, /4:59|5:00|5:01/);
+    assert.doesNotMatch(row.weekly, /167:59|168:00|168:01/);
   }
+});
+
+test('renders a fixed active 100 percent weekly deadline as a normal countdown', () => {
+  const account = {
+    account_key: 'user-c::account-c',
+    chatgpt_account_id: 'account-c',
+    email: 'account-c@example.com',
+    alias: '',
+  };
+  const firstAt = NOW_MS - 60_000;
+  const fixedResetAt = NOW_MS / 1000 + 604_800;
+  const serverEntry = {
+    primary: { remainingPercent: 50, resetsAt: NOW_MS / 1000 + 9_000 },
+    secondary: { remainingPercent: 100, resetsAt: fixedResetAt },
+    observations: {
+      secondary: [
+        {
+          observedAtMs: firstAt,
+          serverObservedAtMs: firstAt,
+          usedPercent: 0,
+          limitWindowSeconds: 604_800,
+          resetAfterSeconds: 604_800,
+          resetAt: fixedResetAt,
+        },
+        {
+          observedAtMs: NOW_MS,
+          serverObservedAtMs: NOW_MS,
+          usedPercent: 0,
+          limitWindowSeconds: 604_800,
+          resetAfterSeconds: 604_740,
+          resetAt: fixedResetAt,
+        },
+      ],
+    },
+    refresh: {
+      lastSuccessAt: NOW_MS,
+      lastAttemptAt: NOW_MS,
+      lastErrorAt: null,
+      errorKind: null,
+      httpStatus: 200,
+      consecutiveFailures: 0,
+    },
+  };
+  const row = normalize({ account, serverEntry });
+  const ranked = rankAccounts([row], { nowMs: NOW_MS });
+
+  assert.equal(row.weeklyDormant, false);
+  assert.equal(row.weekly, '100% █ (168:00)');
+  assert.equal(ranked[0].needsActivation, false);
 });

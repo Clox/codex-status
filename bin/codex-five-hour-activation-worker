@@ -30,7 +30,7 @@ const {
   safeErrorKind,
 } = require(path.join(__dirname, '..', 'lib', 'codex-five-hour-worker'));
 const {
-  authStateMatches,
+  assertAuthStateUnchanged,
   fetchFreshUsageObservation,
   fingerprintAuthState,
   generateAndCheckSchema,
@@ -150,9 +150,7 @@ async function activateAccount(account, accountId, accessToken, usageCache, hook
       activationError = error;
     }
     const afterFingerprint = fingerprintAuthState(codexHome);
-    if (!authStateMatches(beforeFingerprint, afterFingerprint)) {
-      throw new Error('GLOBAL_AUTH_STATE_CHANGED');
-    }
+    assertAuthStateUnchanged(beforeFingerprint, afterFingerprint);
     if (activationError) throw activationError;
     const observations = activationResult.after?.accounts?.[accountId]?.observations?.primary || [];
     const activatedResetAt = Number(observations.at(-1)?.resetAt);

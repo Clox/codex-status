@@ -96,6 +96,16 @@ test('activation failures and dead worker are visible without changing usage qua
   assert.equal(activationWorkerProblem({ enabled: true, healthy: true }), null);
 });
 
+test('activation auth-state diagnostics expose only normalized changed field names', () => {
+  const line = activationProblemLine({ label: 'Account A' }, {
+    phase: 'blocked',
+    errorKind: 'GLOBAL_AUTH_STATE_CHANGED',
+    diagnosticFields: ['auth.globalAuthHash', 'registry.activeAccountKey'],
+  });
+  assert.match(line, /auth\.globalAuthHash/);
+  assert.match(line, /registry\.activeAccountKey/);
+});
+
 test('observation hold is informational and not presented as an activation error', () => {
   const line = activationObservationHoldLine({ label: 'Account A' }, { reason: 'weekly-observation' });
   assert.match(line, /WEEKLY OBSERVATION HOLD.*activation-turns är blockerade.*rå weekly-historik fortsätter/);
