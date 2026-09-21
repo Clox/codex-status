@@ -105,6 +105,8 @@ The usage columns show remaining percentages, a rounded eighth-block indicator (
 
 The token-free usage cache also keeps a bounded history of raw 5H and weekly window fields plus local and server observation times. A 5H window is shown as `100% █ READY` only after two fresh verified observations prove that its full five-hour deadline moves forward with the server clock. A single `100% (5:00)` or rounded zero usage is never enough, and a fixed deadline remains an active countdown. The display layer itself never triggers a turn, account switch, or auth change; the separately supervised 5H worker described below may act only on the underlying VERIFIED two-observation classification. Weekly activation keeps its existing rule while the raw history is collected for a future empirically verified model.
 
+An optional private `activation-holds.json` can hold a stable `chatgpt_account_id` during a weekly-reset observation experiment. A hold blocks automatic 5H and both manual activation turns for that account, but leaves server usage refresh, raw history, ranking and other accounts untouched. The status window shows it under `ACCOUNT INFO`, not as an error. When a weekly observation changes from 0% remaining to 100% with zero raw usage, the cache also pins the preceding observation and the first two post-reset observations with server timestamps and raw weekly fields in `weeklyResetEvidence`; this evidence survives the rolling history limit. Keep the hold until that evidence has been inspected. To release it, set that account's `enabled` to `false` or remove only its account-ID entry from the private hold file; do not delete the usage cache.
+
 After an automatic weekly reset, Codex can report `100%` with `0:00` until the account is used once. The status window treats this as `NEEDS_ACTIVATION`, shows `START` instead of a false W%/H value, and temporarily prioritizes one minimal use of that account. Once Codex reports a normal future weekly reset, ordinary ranking resumes automatically.
 
 An account with an explicit `AUTH ERROR` offers `Press [R] to repair authentication`. Repair runs the normal interactive ChatGPT browser login in a private temporary `CODEX_HOME`; it never copies tokens through command arguments, environment variables, logs, or user-visible output. The returned identity must match both the existing account ID and stable account key, and fresh server usage must succeed before codex-auth's supported import path updates the existing snapshot. The target must be inactive, so Desktop and global auth remain on the current verified account. Repair holds the same per-account lock as manual and automatic activation, preventing the target credential from changing during an activation attempt. A wrong-account login, cancellation, failed usage check, or postcondition mismatch changes no persistent state or rolls back the snapshot, registry, global auth, and usage cache. If the broken account is active, switch to another verified account before pressing `R`.
@@ -168,10 +170,12 @@ Conversation visibility comes from the shared local state, not from copying auth
 - `$HOME/.local/lib/codex-five-hour-worker.js`
 - `$HOME/.local/lib/codex-activation-lock.js`
 - `$HOME/.local/lib/codex-activation-account.js`
+- `$HOME/.local/lib/codex-activation-hold.js`
 - `$HOME/.local/lib/codex-usage-format.js`
 - `$HOME/.cache/codex-account-switcher/usage.json` — mode `0600`, token-free per-account usage cache
 - `$HOME/.cache/codex-account-switcher/five-hour-activation.json` — mode `0600`, token-free worker heartbeat, idempotency and error state
 - `$HOME/.cache/codex-account-switcher/reset-credits.json` — mode `0600`, token-free reset count/expiration cache
+- `$HOME/.config/codex-account-switcher/activation-holds.json` — optional mode-`0600` per-account observation holds keyed by stable account ID; contains no credentials
 - `$HOME/.local/share/applications/codex-account{1,2,3}.desktop`
 - `$HOME/.local/share/applications/codex-usage-watch.desktop`
 - GNOME Terminal profile `Codex-status`

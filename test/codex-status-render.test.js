@@ -3,6 +3,7 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const {
+  colorAccountTableRow,
   normalizeAccountRow,
   recommendationLines,
   renderAccountTableRow,
@@ -102,6 +103,16 @@ test('missing recommendation object still renders an explicit paused reason', ()
     'RECOMMENDATION PAUSED:',
     'Insufficient normalized account data',
   ]);
+});
+
+test('row coloring leaves vertical column separators in the terminal default color', () => {
+  const color = '\x1b[0;32m';
+  const rendered = '01 account │ 1×025:04│ 100% READY │ Now  ACTIVE';
+  const output = colorAccountTableRow(rendered, color);
+
+  assert.equal(output.replace(/\x1b\[[0-9;]*m/g, ''), rendered);
+  assert.equal((output.match(/\x1b\[0m│\x1b\[0;32m/g) || []).length, 3);
+  assert.equal(output, `${color}01 account \x1b[0m│${color} 1×025:04\x1b[0m│${color} 100% READY \x1b[0m│${color} Now  ACTIVE\x1b[0m`);
 });
 
 test('renders a confirmed synthetic moving 5H deadline as READY without countdown flapping', () => {

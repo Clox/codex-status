@@ -3,6 +3,11 @@
 const fs = require('fs');
 const path = require('path');
 const {
+  activationHoldForAccount,
+  defaultActivationHoldsPath,
+  readActivationHolds,
+} = require(path.join(__dirname, '..', 'lib', 'codex-activation-hold'));
+const {
   rankAccounts,
   recommendAccount,
   scoreAccount,
@@ -18,6 +23,7 @@ const {
 } = require(path.join(__dirname, '..', 'lib', 'codex-auth-repair'));
 const {
   accountIdentifiers,
+  colorAccountTableRow,
   normalizeAccountRow,
   recommendationLines,
   renderAccountTableRow,
@@ -27,6 +33,7 @@ const {
 } = require(path.join(__dirname, '..', 'lib', 'codex-five-hour-worker'));
 const {
   tableCell,
+  activationObservationHoldLine,
   activationProblemLine,
   activationWorkerProblem,
   usageProblemLine,
@@ -88,6 +95,8 @@ let resetCreditsByAccountId = {};
 let serverUsageByAccountId = {};
 let usageCacheState = {};
 let activationState = {};
+let activationHolds = { version: 1, accounts: {} };
+let activationHoldsError = null;
 try {
   const registry = JSON.parse(fs.readFileSync(registryPath, 'utf8'));
   accounts = Array.isArray(registry.accounts)
@@ -111,6 +120,11 @@ const cacheHealth = assessCacheHealth(usageCacheState, nowMs);
 try {
   activationState = JSON.parse(fs.readFileSync(activationStatePath, 'utf8'));
 } catch {}
+try {
+  activationHolds = readActivationHolds(defaultActivationHoldsPath());
+} catch (error) {
+  activationHoldsError = error?.message || 'ACTIVATION_HOLDS_INVALID';
+}
 const fiveHourWorkerHealth = activationWorkerHealth(activationState, nowMs);
 
 const lines = input.split('\n');
@@ -251,7 +265,7 @@ const output = lines.map((line, lineIndex) => {
     weeklyUrgencyWidth,
     nowMs,
   });
-  return `${color}${rendered}\x1b[0m`;
+  return colorAccountTableRow(rendered, color);
 });
 
 const renderedRecommendationLines = recommendationLines(recommendation);
@@ -268,6 +282,9 @@ const usageQualityLine = usageQualityNotes.length > 0
   : null;
 const problems = [
   activationWorkerProblem(fiveHourWorkerHealth),
+  activationHoldsError
+    ? `ACTIVATION HOLD CONFIG ERROR / ACTION REQUIRED: ${activationHoldsError}; activation-workern avbryter säkert tills konfigurationen rättats.`
+    : null,
   ...rankedRows.flatMap(row => [
     usageProblemLine(row),
     activationProblemLine(row, activationState.accounts?.[row.accountId]),
@@ -279,7 +296,14 @@ const repairableProblemCount = rankedRows.filter(row =>
 const problemSection = problems.length > 0
   ? `\n\x1b[1;31mACCOUNT PROBLEMS:\x1b[0m\n${problems.map(line => `\x1b[31m${line}\x1b[0m`).join('\n')}${repairableProblemCount > 0 ? '\n\x1b[1;33mPress [R] to repair authentication\x1b[0m' : ''}`
   : '';
+const information = rankedRows.map(row => activationObservationHoldLine(
+  row,
+  activationHoldForAccount(activationHolds, row.accountId)
+)).filter(Boolean);
+const informationSection = information.length > 0
+  ? `\n\x1b[1;36mACCOUNT INFO:\x1b[0m\n${information.map(line => `\x1b[36m${line}\x1b[0m`).join('\n')}`
+  : '';
 const footerParts = [renderedRecommendationLines.join('\n')];
 if (usageQualityLine) footerParts.push(usageQualityLine);
-const footer = `${footerParts.join('\n')}${problemSection}`;
+const footer = `${footerParts.join('\n')}${informationSection}${problemSection}`;
 process.stdout.write(`${output.join('\n').trimEnd()}\n\n${footer}`);

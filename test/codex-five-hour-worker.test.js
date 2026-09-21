@@ -103,6 +103,47 @@ test('ranking, active account marker and weekly state do not gate a verified dor
   assert.equal(calls, 1);
 });
 
+test('per-account observation hold skips only the matching stable identity', async () => {
+  const otherAccountId = 'account-b';
+  const cache = usageCache();
+  cache.accounts[otherAccountId] = JSON.parse(JSON.stringify(cache.accounts[ACCOUNT_ID]));
+  const activated = [];
+  const state = await runFiveHourActivationCycle({
+    accounts: [account, { chatgpt_account_id: otherAccountId, email: 'account-b@example.com' }],
+    usageCache: cache,
+    activationHoldForAccount: candidate => candidate.chatgpt_account_id === ACCOUNT_ID
+      ? { reason: 'weekly-observation' }
+      : null,
+    activateAccount: async (target, hooks) => {
+      activated.push(target.chatgpt_account_id);
+      await hooks.beforeTurn();
+      return { activatedResetAt: NOW_MS / 1000 + 18_000 };
+    },
+    now: () => NOW_MS,
+    createAttemptId: () => 'attempt-hold-test',
+  });
+  assert.deepEqual(activated, [otherAccountId]);
+  assert.equal(state.accounts[ACCOUNT_ID].phase, 'held');
+  assert.equal(state.accounts[ACCOUNT_ID].holdReason, 'weekly-observation');
+  assert.equal(state.accounts[ACCOUNT_ID].actionRequired, false);
+  assert.equal(state.accounts[otherAccountId].phase, 'succeeded');
+});
+
+test('observation hold preserves no-retry journal states for a dormant account', async () => {
+  for (const phase of ['succeeded', 'blocked', 'turn-committed']) {
+    const prior = { phase, attemptId: 'previous-turn', actionRequired: phase === 'blocked' };
+    const state = await runFiveHourActivationCycle({
+      accounts: [account],
+      usageCache: usageCache(),
+      previousState: { accounts: { [ACCOUNT_ID]: prior } },
+      activationHoldForAccount: () => ({ reason: 'weekly-observation' }),
+      activateAccount: async () => { assert.fail('a held account must not activate'); },
+      now: () => NOW_MS,
+    });
+    assert.deepEqual(state.accounts[ACCOUNT_ID], prior);
+  }
+});
+
 test('successful dormant window is single-flight until verified active state is observed', async () => {
   let calls = 0;
   const previousState = {

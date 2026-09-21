@@ -7,6 +7,12 @@ const os = require('os');
 const path = require('path');
 const readline = require('readline/promises');
 const {
+  activationHoldForAccount,
+  assertQuotaActivationAllowed,
+  defaultActivationHoldsPath,
+  readActivationHolds,
+} = require(path.join(__dirname, '..', 'lib', 'codex-activation-hold'));
+const {
   acquireAccountActivationLock,
   releaseAccountActivationLock,
 } = require(path.join(__dirname, '..', 'lib', 'codex-activation-lock'));
@@ -43,6 +49,8 @@ function friendlyError(error, label) {
   const code = error?.message || '';
   if (code === 'USAGE_HTTP_401') return `${label}: server-auth svarar 401. Förnya kontots credential med en ny interaktiv inloggning.`;
   if (code === 'ACCOUNT_NOT_FIVE_HOUR_DORMANT') return `${label} har inte VERIFIED fiveHourDormant=true. Ingen Codex-turn skickades.`;
+  if (code === 'ACTIVATION_OBSERVATION_HOLD') return `${label}: WEEKLY OBSERVATION HOLD är aktiv. Alla manuella activation-turns är blockerade; usage-observation fortsätter.`;
+  if (code === 'ACTIVATION_HOLDS_INVALID') return 'Activation-hold-konfigurationen är ogiltig. Avbryter säkert utan Codex-turn.';
   if (code === 'APP_SERVER_CAPABILITY_MISMATCH') return 'Den installerade Codex App Server-versionen saknar den verifierade experimentella protokollformen. Avbryter säkert.';
   if (code === 'FIVE_HOUR_ACTIVATION_NOT_VERIFIED') return 'Turnen slutfördes, men två färska serverobservationer bekräftade inte en fixerad ny 5H-deadline. Ingen retry gjordes.';
   if (code === 'GLOBAL_AUTH_STATE_CHANGED') return 'Global auth-state ändrades oväntat. Activation markeras som misslyckad och Desktop startades inte om.';
@@ -70,8 +78,20 @@ async function main() {
   const accounts = Array.isArray(registry.accounts) ? registry.accounts : Object.values(registry.accounts || {});
   const account = findAccount(accounts, selector);
   const accountId = account.chatgpt_account_id || account.accountId;
-  const accessToken = loadCredential(codexHome, accountId);
   const label = account.email || account.alias || account.account_name || `konto ${number}`;
+  const activationHoldsFile = defaultActivationHoldsPath();
+  let activationHolds;
+  try {
+    activationHolds = readActivationHolds(activationHoldsFile);
+  } catch (error) {
+    fail(friendlyError(error, label));
+    return;
+  }
+  if (activationHoldForAccount(activationHolds, accountId)) {
+    fail(friendlyError(new Error('ACTIVATION_OBSERVATION_HOLD'), label));
+    return;
+  }
+  const accessToken = loadCredential(codexHome, accountId);
   const usageCache = readJson(usageCacheFile);
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-five-hour-activation-'));
   fs.chmodSync(tempRoot, 0o700);
@@ -114,13 +134,16 @@ async function main() {
           accountId,
           accessToken,
           fetchObservation,
-          runTurn: () => runIsolatedCodexTurn({
-            codexBin,
-            privateHome,
-            accountId,
-            accessToken,
-            planType: account.plan,
-          }),
+          runTurn: () => {
+            assertQuotaActivationAllowed(accountId, activationHoldsFile);
+            return runIsolatedCodexTurn({
+              codexBin,
+              privateHome,
+              accountId,
+              accessToken,
+              planType: account.plan,
+            });
+          },
         });
       } catch (error) {
         activationError = error;

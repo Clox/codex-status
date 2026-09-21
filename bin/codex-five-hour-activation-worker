@@ -7,6 +7,12 @@ const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
 const {
+  activationHoldForAccount,
+  assertQuotaActivationAllowed,
+  defaultActivationHoldsPath,
+  readActivationHolds,
+} = require(path.join(__dirname, '..', 'lib', 'codex-activation-hold'));
+const {
   acquireAccountActivationLock,
   releaseAccountActivationLock,
 } = require(path.join(__dirname, '..', 'lib', 'codex-activation-lock'));
@@ -50,6 +56,7 @@ const usageRefresher = process.env.USAGE_REFRESHER ||
   path.join(os.homedir(), '.local', 'bin', 'codex-usage-refresh');
 const codexBin = process.env.CODEX_ACTIVATION_BIN || '/usr/lib/chatgpt/resources/codex';
 const lockDirectory = path.join(cacheDirectory, 'activation-locks');
+const activationHoldsFile = defaultActivationHoldsPath();
 
 function accountsFromRegistry(registry) {
   return Array.isArray(registry.accounts)
@@ -128,6 +135,7 @@ async function activateAccount(account, accountId, accessToken, usageCache, hook
         accessToken,
         fetchObservation,
         runTurn: async () => {
+          assertQuotaActivationAllowed(accountId, activationHoldsFile);
           await hooks.beforeTurn();
           await runIsolatedCodexTurn({
             codexBin,
@@ -165,10 +173,15 @@ async function main() {
     const registry = readJson(path.join(codexHome, 'accounts', 'registry.json'));
     const accounts = accountsFromRegistry(registry);
     const usageCache = readJson(usageCacheFile);
+    const activationHolds = readActivationHolds(activationHoldsFile);
     const finalState = await runFiveHourActivationCycle({
       accounts,
       usageCache,
       previousState,
+      activationHoldForAccount: account => activationHoldForAccount(
+        activationHolds,
+        account.chatgpt_account_id || account.accountId
+      ),
       persistState: async state => writeState(state),
       activateAccount: async (account, hooks) => {
         const accountId = account.chatgpt_account_id || account.accountId;

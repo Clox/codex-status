@@ -105,6 +105,44 @@ test('preserves credential-free raw window fields for both 5H and weekly observa
   assert.equal(JSON.stringify(cache).includes('secret-a'), false);
 });
 
+test('pins two server-timed weekly reset observations beyond the rolling raw history', async () => {
+  const beforeAt = NOW_MS - 60_000;
+  const before = await refreshObserved({}, observedResponse({
+    observedAtMs: beforeAt,
+    primaryResetAt: beforeAt / 1000 + 18_000,
+    secondaryUsed: 100,
+    secondaryResetAt: beforeAt / 1000 + 60,
+    secondaryResetAfter: 60,
+  }));
+  const first = await refreshObserved(before, observedResponse({
+    observedAtMs: NOW_MS,
+    primaryResetAt: NOW_MS / 1000 + 18_000,
+    secondaryUsed: 0,
+    secondaryResetAt: NOW_MS / 1000,
+    secondaryResetAfter: 0,
+  }));
+  const second = await refreshObserved(first, observedResponse({
+    observedAtMs: NOW_MS + 60_000,
+    primaryResetAt: (NOW_MS + 60_000) / 1000 + 18_000,
+    secondaryUsed: 0,
+    secondaryResetAt: (NOW_MS + 60_000) / 1000,
+    secondaryResetAfter: 0,
+  }));
+  const evidence = second.accounts['account-a'].weeklyResetEvidence;
+  assert.equal(evidence.before.usedPercent, 100);
+  assert.equal(evidence.after.length, 2);
+  assert.deepEqual(evidence.after.map(value => value.serverObservedAtMs), [NOW_MS, NOW_MS + 60_000]);
+  assert.deepEqual(evidence.after.map(value => value.resetAfterSeconds), [0, 0]);
+  assert.equal(JSON.stringify(evidence).includes('secret-a'), false);
+
+  const later = await refreshObserved(second, observedResponse({
+    observedAtMs: NOW_MS + 120_000,
+    primaryResetAt: (NOW_MS + 120_000) / 1000 + 18_000,
+    secondaryUsed: 0,
+  }));
+  assert.deepEqual(later.accounts['account-a'].weeklyResetEvidence, evidence);
+});
+
 test('classifies 5H dormant only after two fresh moving full-window observations', async () => {
   const firstAt = NOW_MS - 60_000;
   const first = await refreshObserved({}, observedResponse({

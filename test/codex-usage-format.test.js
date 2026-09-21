@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 const {
   USAGE_BLOCKS,
+  activationObservationHoldLine,
   activationProblemLine,
   activationWorkerProblem,
   tableCell,
@@ -93,6 +94,16 @@ test('activation failures and dead worker are visible without changing usage qua
     fatalErrorKind: null,
   }), /heartbeat uppdateras inte.*4 min sedan/);
   assert.equal(activationWorkerProblem({ enabled: true, healthy: true }), null);
+});
+
+test('observation hold is informational and not presented as an activation error', () => {
+  const line = activationObservationHoldLine({ label: 'Account A' }, { reason: 'weekly-observation' });
+  assert.match(line, /WEEKLY OBSERVATION HOLD.*activation-turns är blockerade.*rå weekly-historik fortsätter/);
+  assert.doesNotMatch(line, /ERROR|ACTION REQUIRED/);
+  assert.equal(activationProblemLine({ label: 'Account A' }, {
+    phase: 'cooldown',
+    errorKind: 'ACTIVATION_OBSERVATION_HOLD',
+  }), null);
 });
 
 test('renders a vertical boundary while preserving the cell content width', () => {

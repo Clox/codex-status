@@ -7,6 +7,12 @@ const os = require('os');
 const path = require('path');
 const readline = require('readline/promises');
 const {
+  activationHoldForAccount,
+  assertQuotaActivationAllowed,
+  defaultActivationHoldsPath,
+  readActivationHolds,
+} = require(path.join(__dirname, '..', 'lib', 'codex-activation-hold'));
+const {
   configuredSelector,
   findAccount,
   loadCredential,
@@ -36,6 +42,8 @@ function friendlyError(error, label) {
   const code = error?.message || '';
   if (code === 'USAGE_HTTP_401') return `${label}: server-auth svarar 401. Förnya kontots credential med en ny interaktiv inloggning.`;
   if (code === 'ACCOUNT_NOT_NEEDS_ACTIVATION') return `${label} är inte längre NEEDS_ACTIVATION. Ingen Codex-turn skickades.`;
+  if (code === 'ACTIVATION_OBSERVATION_HOLD') return `${label}: WEEKLY OBSERVATION HOLD är aktiv. Alla manuella activation-turns är blockerade; usage-observation fortsätter.`;
+  if (code === 'ACTIVATION_HOLDS_INVALID') return 'Activation-hold-konfigurationen är ogiltig. Avbryter säkert utan Codex-turn.';
   if (code === 'APP_SERVER_CAPABILITY_MISMATCH') return 'Den installerade Codex App Server-versionen saknar den verifierade experimentella protokollformen. Avbryter säkert.';
   if (code === 'ACTIVATION_NOT_VERIFIED') return 'Turnen slutfördes, men servern rapporterade inte en rimlig ny weekly-reset kring 168 timmar. Ingen retry gjordes.';
   if (code.startsWith('APP_SERVER_')) return `Den isolerade App Server-körningen avbröts säkert (${code}). Ingen retry gjordes.`;
@@ -59,8 +67,20 @@ async function main() {
   const accounts = Array.isArray(registry.accounts) ? registry.accounts : Object.values(registry.accounts || {});
   const account = findAccount(accounts, selector);
   const accountId = account.chatgpt_account_id || account.accountId;
-  const accessToken = loadCredential(codexHome, accountId);
   const label = account.email || account.alias || account.account_name || `konto ${number}`;
+  const activationHoldsFile = defaultActivationHoldsPath();
+  let activationHolds;
+  try {
+    activationHolds = readActivationHolds(activationHoldsFile);
+  } catch (error) {
+    fail(friendlyError(error, label));
+    return;
+  }
+  if (activationHoldForAccount(activationHolds, accountId)) {
+    fail(friendlyError(new Error('ACTIVATION_OBSERVATION_HOLD'), label));
+    return;
+  }
+  const accessToken = loadCredential(codexHome, accountId);
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-weekly-activation-'));
   fs.chmodSync(tempRoot, 0o700);
   const privateHome = path.join(tempRoot, 'home');
@@ -90,13 +110,16 @@ async function main() {
     try {
       activationResult = await executeVerifiedActivation({
         fetchUsage: () => fetchFreshUsage({ accountId, accessToken }),
-        runTurn: () => runIsolatedCodexTurn({
-          codexBin,
-          privateHome,
-          accountId,
-          accessToken,
-          planType: account.plan,
-        }),
+        runTurn: () => {
+          assertQuotaActivationAllowed(accountId, activationHoldsFile);
+          return runIsolatedCodexTurn({
+            codexBin,
+            privateHome,
+            accountId,
+            accessToken,
+            planType: account.plan,
+          });
+        },
       });
     } catch (error) {
       activationError = error;
