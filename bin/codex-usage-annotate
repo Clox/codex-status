@@ -33,6 +33,9 @@ const {
   activationWorkerHealth,
 } = require(path.join(__dirname, '..', 'lib', 'codex-five-hour-worker'));
 const {
+  observerHealth,
+} = require(path.join(__dirname, '..', 'lib', 'codex-turn-observer'));
+const {
   tableCell,
   activationObservationHoldLine,
   activationProblemLine,
@@ -56,6 +59,11 @@ const activationStatePath = process.env.FIVE_HOUR_ACTIVATION_STATE || path.join(
   process.env.XDG_CACHE_HOME || path.join(process.env.HOME, '.cache'),
   'codex-account-switcher',
   'five-hour-activation.json'
+);
+const eventStatePath = process.env.CODEX_EVENT_STATE || path.join(
+  process.env.XDG_CACHE_HOME || path.join(process.env.HOME, '.cache'),
+  'codex-account-switcher',
+  'turn-events.json'
 );
 const input = fs.readFileSync(0, 'utf8').replace(/\r/g, '');
 const mappingOnly = process.argv.includes('--key-map');
@@ -97,6 +105,7 @@ let resetCreditsByAccountId = {};
 let serverUsageByAccountId = {};
 let usageCacheState = {};
 let activationState = {};
+let eventState = {};
 let activationHolds = { version: 1, accounts: {} };
 let activationHoldsError = null;
 try {
@@ -123,11 +132,16 @@ try {
   activationState = JSON.parse(fs.readFileSync(activationStatePath, 'utf8'));
 } catch {}
 try {
+  eventState = JSON.parse(fs.readFileSync(eventStatePath, 'utf8'));
+} catch {}
+try {
   activationHolds = readActivationHolds(defaultActivationHoldsPath());
 } catch (error) {
   activationHoldsError = error?.message || 'ACTIVATION_HOLDS_INVALID';
 }
 const fiveHourWorkerHealth = activationWorkerHealth(activationState, nowMs);
+const turnObserverHealth = observerHealth(eventState, nowMs);
+const exhaustionByAccountId = eventState.exhaustions || {};
 
 const lines = input.split('\n');
 const visibleLines = lines.map(plain);
@@ -169,6 +183,7 @@ for (const [lineIndex, visible] of visibleLines.entries()) {
     columns,
     accounts,
     serverUsageByAccountId,
+    exhaustionByAccountId,
     resetCreditsByAccountId,
     nowMs,
     cacheHealth,
@@ -256,7 +271,7 @@ const output = lines.map((line, lineIndex) => {
   if (!row) return line;
 
   const pending = pendingSourceRow === row.sourceRow;
-  const color = row.usageQuality === 'unverified'
+  const color = row.usageQuality === 'unverified' || row.verifiedExhausted
     ? '\x1b[1;31m'
     : row.active
       ? '\x1b[0;32m'
@@ -288,6 +303,9 @@ const usageQualityLine = usageQualityNotes.length > 0
   ? `\x1b[2m${usageQualityNotes.join('; ')}.\x1b[0m`
   : null;
 const problems = [
+  turnObserverHealth.healthy
+    ? null
+    : `TURN OBSERVER ERROR: turn-state is UNVERIFIED${turnObserverHealth.errorKind ? ` (${turnObserverHealth.errorKind})` : ''}; aktiva turns visas inte förrän observern återhämtat sig.`,
   activationWorkerProblem(fiveHourWorkerHealth),
   activationHoldsError
     ? `ACTIVATION HOLD CONFIG ERROR / ACTION REQUIRED: ${activationHoldsError}; activation-workern avbryter säkert tills konfigurationen rättats.`
@@ -310,7 +328,25 @@ const information = rankedRows.map(row => activationObservationHoldLine(
 const informationSection = information.length > 0
   ? `\n\x1b[1;36mACCOUNT INFO:\x1b[0m\n${information.map(line => `\x1b[36m${line}\x1b[0m`).join('\n')}`
   : '';
+const labelByAccountId = new Map(rankedRows.map(row => [row.accountId, row.label]));
+const activeTurns = turnObserverHealth.healthy
+  ? Object.values(eventState.activeTurns || {}).sort((left, right) => left.startedAtMs - right.startedAtMs)
+  : [];
+const activeTurnsSection = activeTurns.length > 0
+  ? `\n\x1b[1;36mACTIVE CODEX TURNS:\x1b[0m\n${activeTurns.map(turn => {
+      const accountLabel = labelByAccountId.get(turn.accountId) || 'unknown account';
+      const thread = turn.threadId ? `…${turn.threadId.slice(-8)}` : 'unknown thread';
+      const title = turn.title ? ` — ${turn.title.slice(0, 42)}` : '';
+      return `\x1b[36m${accountLabel} | ${thread}${title} | running\x1b[0m`;
+    }).join('\n')}`
+  : '';
+const exhaustionLines = rankedRows
+  .filter(row => row.verifiedExhausted)
+  .map(row => `VERIFIED EXHAUSTION: ${row.label} — terminal usageLimitExceeded; 5H/weekly pool is unknown.`);
+const exhaustionSection = exhaustionLines.length > 0
+  ? `\n\x1b[1;31mACCOUNT STATUS:\x1b[0m\n${exhaustionLines.map(line => `\x1b[31m${line}\x1b[0m`).join('\n')}`
+  : '';
 const footerParts = [renderedRecommendationLines.join('\n')];
 if (usageQualityLine) footerParts.push(usageQualityLine);
-const footer = `${footerParts.join('\n')}${informationSection}${problemSection}`;
+const footer = `${footerParts.join('\n')}${activeTurnsSection}${exhaustionSection}${informationSection}${problemSection}`;
 process.stdout.write(`${output.join('\n').trimEnd()}\n\n${footer}`);

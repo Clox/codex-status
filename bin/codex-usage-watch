@@ -21,6 +21,8 @@ CODEX_LOGIN_BIN=${CODEX_LOGIN_BIN:-/usr/lib/chatgpt/resources/codex}
 export CODEX_AUTH_BIN USAGE_REFRESHER USAGE_CACHE AUTH_REPAIRER CODEX_LOGIN_BIN
 FIVE_HOUR_ACTIVATION_STATE=${FIVE_HOUR_ACTIVATION_STATE:-"${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/five-hour-activation.json"}
 export FIVE_HOUR_ACTIVATION_STATE
+CODEX_EVENT_STATE=${CODEX_EVENT_STATE:-"${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/turn-events.json"}
+export CODEX_EVENT_STATE
 USAGE_REFRESH_LOG=${USAGE_REFRESH_LOG:-"${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/usage-refresh.log"}
 loaded_script_hash=$(sha256sum "$0" | awk '{ print $1 }')
 printf '\033]0;Codex-kontostatus\007'
@@ -28,7 +30,7 @@ printf '\033]0;Codex-kontostatus\007'
 status_runtime_dir=${XDG_CACHE_HOME:-"$HOME/.cache"}/codex-account-switcher
 mkdir -p "$status_runtime_dir"
 chmod 700 "$status_runtime_dir"
-exec {status_lock_fd}>"$status_runtime_dir/status-window.lock"
+exec {status_lock_fd}>"$status_runtime_dir/status-window-v2.lock"
 if ! flock -n "$status_lock_fd"; then
   printf '%s status singleton already held\n' "$(date --iso-8601=seconds)" >>"$status_runtime_dir/status-launch.log"
   exit 0
@@ -78,9 +80,10 @@ fi
 pending_source_row=''
 pending_since=0
 key_map=''
+last_background_refresh=-10
 
 launch_detached() {
-  setsid -f "$@" </dev/null >/dev/null 2>&1
+  setsid -f "$@" {status_lock_fd}>&- </dev/null >/dev/null 2>&1
 }
 
 launch_usage_refresh() {
@@ -90,7 +93,7 @@ launch_usage_refresh() {
     tail -n 100 "$USAGE_REFRESH_LOG" >"${USAGE_REFRESH_LOG}.tmp"
     mv -f "${USAGE_REFRESH_LOG}.tmp" "$USAGE_REFRESH_LOG"
   fi
-  setsid -f "$USAGE_REFRESHER" </dev/null >>"$USAGE_REFRESH_LOG" 2>&1
+  setsid -f "$USAGE_REFRESHER" {status_lock_fd}>&- </dev/null >>"$USAGE_REFRESH_LOG" 2>&1
 }
 
 draw_frame() {
@@ -131,8 +134,11 @@ while true; do
   [[ $columns =~ ^[0-9]+$ ]] || columns=100
   status_now_ms=$(($(date +%s) * 1000))
 
-  launch_usage_refresh
-  "$RESET_CREDITS_REFRESHER" >/dev/null 2>&1 || true
+  if ((SECONDS - last_background_refresh >= 10)); then
+    launch_usage_refresh
+    "$RESET_CREDITS_REFRESHER" >/dev/null 2>&1 || true
+    last_background_refresh=$SECONDS
+  fi
 
   if raw_frame=$(
     script -qefc "stty cols $columns; exec \"$CODEX_AUTH_BIN\" list --skip-api" /dev/null </dev/null
@@ -166,7 +172,7 @@ while true; do
   fi
 
   key=''
-  if IFS= read -rsn 1 -t 10 key </dev/tty; then
+  if IFS= read -rsn 1 -t 2 key </dev/tty; then
     case "$key" in
       1|2|3)
         if pgrep -f "^${ACCOUNT_SWITCHER} [123] --desktop( |$)" >/dev/null 2>&1; then

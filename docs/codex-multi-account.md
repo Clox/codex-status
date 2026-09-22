@@ -95,7 +95,7 @@ The scripts here terminate Codex Desktop politely and wait up to 15 seconds. The
 
 Open **Codex - Konto 1**, **Codex - Konto 2**, or **Codex - Konto 3** from the application menu. If Desktop is running, the launcher sends it `TERM`, waits for a clean exit, switches with `codex-auth`, and starts Desktop again. Closing an Electron window with its X may leave the process alive; Ctrl+Q normally exits the whole app, but the launcher handles the running process itself.
 
-Open **Codex-kontostatus** for the compact status window. It refreshes every ten seconds without clearing the visible terminal buffer. Accounts are automatically ranked by weekly urgency, with 5H availability breaking near-ties. The active account is green and explicitly marked `ACTIVE`; a recommendation below the table says whether to stay or switch. Pressing `1`, `2`, or `3` selects the account at that current rank. An inactive account is immediately marked yellow and launches the existing safe switcher; it becomes green once `codex-auth` reports it active. Selecting the already-active account opens ChatGPT or asks its existing single-instance process to show the app. Input other than those digits is ignored and the cursor, menu bar, and unnecessary scrollbar are hidden.
+Open **Codex-kontostatus** for the compact status window. It redraws every two seconds so observed turn lifecycle changes appear promptly, while usage/reset background refresh launch remains throttled to the existing ten-second cadence and server usage retains its one-minute cache policy. Accounts are automatically ranked by weekly urgency, with 5H availability breaking near-ties. The active account is green and explicitly marked `ACTIVE`; a recommendation below the table says whether to stay or switch. Pressing `1`, `2`, or `3` selects the account at that current rank. An inactive account is immediately marked yellow and launches the existing safe switcher; it becomes green once `codex-auth` reports it active. Selecting the already-active account opens ChatGPT or asks its existing single-instance process to show the app. Input other than those digits is ignored and the cursor, menu bar, and unnecessary scrollbar are hidden.
 
 The status window and ChatGPT have independent lifetimes. Account switches and ChatGPT launches started from the status window run in a detached session, so closing the terminal does not terminate Desktop. Opening the status window by itself does not open ChatGPT.
 
@@ -104,6 +104,10 @@ The `RESETS` column shows saved Codex resets as `XX×HHH:MM`: the available coun
 The usage columns show remaining percentages, a rounded eighth-block indicator (` `, `▁` through `█`), and time until reset as `HH:MM`. `W%/H` shows weekly percentage remaining per hour until the weekly reset, which is the same urgency value used by the ranking. Usage is fetched independently for every saved account from Codex's read-only usage endpoint and cached locally without tokens. Server refresh runs at most once per minute while the UI can continue redrawing every ten seconds. A successful observation up to three minutes old is `VERIFIED`; one between three and fifteen minutes old is marked `~`/`STALE` when only a transient refresh error exists. Data older than fifteen minutes, a 401/403, missing credentials, protocol errors, three consecutive failures, or a dead refresh heartbeat is `UNVERIFIED`. Its old percentages may remain visible only as red historical context, `W%/H` becomes `AUTH` or `ERROR`, a problem section explains the failure, and the values are excluded from ranking and recommendation. Local `last_usage` is only an unverified fallback. Saved-reset data is presentation-only and does not affect ranking or recommendation.
 
 The token-free usage cache also keeps a bounded history of raw 5H and weekly window fields plus local and server observation times. Dormant windows use an empirically verified synthetic rolling deadline: `used_percent=0`, the full `limit_window_seconds` and `reset_after_seconds` (`18000` for 5H or `604800` for weekly), and `reset_at` approximately equal to server observation time plus that full duration. Two fresh VERIFIED observations must show `reset_at` moving forward with the server clock before the state is classified dormant. This distinguishes it from a newly active but still rounded-to-zero window whose deadline remains fixed and countdown decreases. A 5H dormant window is shown as `100% █ READY`; a dormant weekly window becomes `NEEDS_ACTIVATION` and shows `START`. The display layer itself never triggers a turn, account switch, or auth change; the separately supervised 5H worker described below may act only on the underlying VERIFIED two-observation classification.
+
+The supervised `codex-turn-observer.service` follows append-only rollout lifecycle records without attaching to Desktop's private App Server stdio. A newly observed `task_started` is bound once to the stable registry account identity at observation time; that binding is retained even if the active account later changes. Old records present at first installation are checkpointed at EOF, so restart, suspend, or historical rollout files cannot create ghost-active turns. `task_complete` removes the matching turn for completed, interrupted, and failed outcomes. The status window redraws every two seconds and lists credential-free active account/thread/title/state data under `ACTIVE CODEX TURNS`.
+
+Formatted `0%` remaining is never treated as proof of exhaustion. Verified exhaustion requires the terminal App Server semantics: `usageLimitExceeded`, no further retry, and the matching failed completion for the same thread and turn. In the external rollout observer this is represented by Codex's persisted terminal `task_complete` record with `error.codex_error_info=usage_limit_exceeded`, which exists only after the turn has finished its retry lifecycle. Because that record does not identify whether 5H or weekly caused the refusal, status marks the account itself `EXHAUSTED`, keeps both trustworthy reset countdowns visible, and explicitly says that the pool is unknown. The marker clears only after a later account-bound successful turn or a newer VERIFIED server observation explicitly shows no reached limit and positive remaining capacity in both windows. No switch, resume, banked reset, or notification is triggered by this observer.
 
 An optional private `activation-holds.json` can hold a stable `chatgpt_account_id` during a weekly-reset observation experiment. A hold blocks automatic 5H and both manual activation turns for that account, but leaves server usage refresh, raw history, ranking and other accounts untouched. The status window shows it under `ACCOUNT INFO`, not as an error. When a weekly observation changes from 0% remaining to 100% with zero raw usage, the cache also pins the preceding observation and the first two post-reset observations with server timestamps and raw weekly fields in `weeklyResetEvidence`; this evidence survives the rolling history limit. Keep the hold until that evidence has been inspected. To release it, set that account's `enabled` to `false` or remove only its account-ID entry from the private hold file; do not delete the usage cache.
 
@@ -161,6 +165,7 @@ Conversation visibility comes from the shared local state, not from copying auth
 - `$HOME/.local/bin/codex-weekly-activate`
 - `$HOME/.local/bin/codex-five-hour-activate`
 - `$HOME/.local/bin/codex-five-hour-activation-worker`
+- `$HOME/.local/bin/codex-turn-observer`
 - `$HOME/.local/bin/codex-reset-credits-refresh`
 - `$HOME/.local/lib/codex-account-ranking.js`
 - `$HOME/.local/lib/codex-attention-policy.js`
@@ -175,15 +180,18 @@ Conversation visibility comes from the shared local state, not from copying auth
 - `$HOME/.local/lib/codex-activation-lock.js`
 - `$HOME/.local/lib/codex-activation-account.js`
 - `$HOME/.local/lib/codex-activation-hold.js`
+- `$HOME/.local/lib/codex-turn-observer.js`
 - `$HOME/.local/lib/codex-usage-format.js`
 - `$HOME/.cache/codex-account-switcher/usage.json` — mode `0600`, token-free per-account usage cache
 - `$HOME/.cache/codex-account-switcher/five-hour-activation.json` — mode `0600`, token-free worker heartbeat, idempotency and error state
 - `$HOME/.cache/codex-account-switcher/reset-credits.json` — mode `0600`, token-free reset count/expiration cache
-- `$HOME/.cache/codex-account-switcher/status-window.lock` — singleton lock for the status window
+- `$HOME/.cache/codex-account-switcher/status-window-v2.lock` — singleton lock for the status window; detached Desktop/switch/refresh children explicitly close its descriptor
+- `$HOME/.cache/codex-account-switcher/turn-events.json` — mode `0600`, credential-free active-turn, terminal-exhaustion, checkpoint, and observer-health state
 - `$HOME/.config/codex-account-switcher/activation-holds.json` — optional mode-`0600` per-account observation holds keyed by stable account ID; contains no credentials
 - `$HOME/.local/share/applications/codex-account{1,2,3}.desktop`
 - `$HOME/.local/share/applications/codex-usage-watch.desktop`
 - GNOME Terminal profile `Codex-status`
 - user units `codex-five-hour-activation.service` and `codex-five-hour-activation.timer`
+- user unit `codex-turn-observer.service`
 
 Backups created by the installer are local-only under `$HOME/.local/state/codex-auth-setup-backups/`.

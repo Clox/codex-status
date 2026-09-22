@@ -79,6 +79,23 @@ test('parses server usage into remaining 5H and weekly percentages', () => {
   assert.equal(parsed.secondary.windowSeconds, 604_800);
 });
 
+test('preserves explicit server permission and reached-state without inferring them from percentages', () => {
+  const payload = response(100, 100);
+  payload.ordinary_usage_allowed = false;
+  payload.rate_limit_reached_type = 'rate_limit_reached';
+  const parsed = parseUsageResponse(payload, NOW_MS);
+  assert.equal(parsed.primary.remainingPercent, 0);
+  assert.equal(parsed.ordinaryUsageAllowed, false);
+  assert.equal(parsed.ordinaryUsageAllowedObserved, true);
+  assert.equal(parsed.rateLimitReachedType, 'rate_limit_reached');
+  assert.equal(parsed.rateLimitReachedTypeObserved, true);
+
+  const percentagesOnly = parseUsageResponse(response(100, 100), NOW_MS);
+  assert.equal(percentagesOnly.ordinaryUsageAllowed, null);
+  assert.equal(percentagesOnly.ordinaryUsageAllowedObserved, false);
+  assert.equal(percentagesOnly.rateLimitReachedTypeObserved, false);
+});
+
 test('preserves credential-free raw window fields for both 5H and weekly observations', async () => {
   const observed = observedResponse({
     observedAtMs: NOW_MS,

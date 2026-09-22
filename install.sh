@@ -18,7 +18,7 @@ fail() {
   exit 1
 }
 
-for command_name in node npm gnome-terminal gsettings dconf script setsid pgrep pkill systemctl busctl flock wmctrl xprop; do
+for command_name in node npm gnome-terminal gsettings dconf script setsid pgrep pkill systemctl busctl flock wmctrl xprop sqlite3; do
   command -v "$command_name" >/dev/null 2>&1 || fail "required command is missing: $command_name"
 done
 [[ -x /usr/libexec/gnome-terminal-server && -x /usr/bin/gnome-terminal.real ]] ||
@@ -88,6 +88,7 @@ backup_if_present "$local_bin/codex-usage-refresh"
 backup_if_present "$local_bin/codex-weekly-activate"
 backup_if_present "$local_bin/codex-five-hour-activate"
 backup_if_present "$local_bin/codex-five-hour-activation-worker"
+backup_if_present "$local_bin/codex-turn-observer"
 backup_if_present "$local_bin/codex-reset-credits-refresh"
 backup_if_present "$local_lib/codex-account-ranking.js"
 backup_if_present "$local_lib/codex-attention-policy.js"
@@ -102,6 +103,7 @@ backup_if_present "$local_lib/codex-five-hour-worker.js"
 backup_if_present "$local_lib/codex-activation-lock.js"
 backup_if_present "$local_lib/codex-activation-account.js"
 backup_if_present "$local_lib/codex-activation-hold.js"
+backup_if_present "$local_lib/codex-turn-observer.js"
 backup_if_present "$local_lib/codex-usage-format.js"
 for account_number in 1 2 3; do
   backup_if_present "$applications_dir/codex-account${account_number}.desktop"
@@ -109,6 +111,7 @@ done
 backup_if_present "$applications_dir/codex-usage-watch.desktop"
 backup_if_present "$systemd_user_dir/codex-five-hour-activation.service"
 backup_if_present "$systemd_user_dir/codex-five-hour-activation.timer"
+backup_if_present "$systemd_user_dir/codex-turn-observer.service"
 
 install -m 0755 "$bin_source/codex-account" "$local_bin/codex-account"
 install -m 0755 "$bin_source/codex-account-state" "$local_bin/codex-account-state"
@@ -121,6 +124,7 @@ install -m 0755 "$bin_source/codex-usage-refresh" "$local_bin/codex-usage-refres
 install -m 0755 "$bin_source/codex-weekly-activate" "$local_bin/codex-weekly-activate"
 install -m 0755 "$bin_source/codex-five-hour-activate" "$local_bin/codex-five-hour-activate"
 install -m 0755 "$bin_source/codex-five-hour-activation-worker" "$local_bin/codex-five-hour-activation-worker"
+install -m 0755 "$bin_source/codex-turn-observer" "$local_bin/codex-turn-observer"
 install -m 0755 "$bin_source/codex-reset-credits-refresh" "$local_bin/codex-reset-credits-refresh"
 install -m 0644 "$lib_source/codex-account-ranking.js" "$local_lib/codex-account-ranking.js"
 install -m 0644 "$lib_source/codex-attention-policy.js" "$local_lib/codex-attention-policy.js"
@@ -135,9 +139,11 @@ install -m 0644 "$lib_source/codex-five-hour-worker.js" "$local_lib/codex-five-h
 install -m 0644 "$lib_source/codex-activation-lock.js" "$local_lib/codex-activation-lock.js"
 install -m 0644 "$lib_source/codex-activation-account.js" "$local_lib/codex-activation-account.js"
 install -m 0644 "$lib_source/codex-activation-hold.js" "$local_lib/codex-activation-hold.js"
+install -m 0644 "$lib_source/codex-turn-observer.js" "$local_lib/codex-turn-observer.js"
 install -m 0644 "$lib_source/codex-usage-format.js" "$local_lib/codex-usage-format.js"
 install -m 0644 "$systemd_source/codex-five-hour-activation.service" "$systemd_user_dir/codex-five-hour-activation.service"
 install -m 0644 "$systemd_source/codex-five-hour-activation.timer" "$systemd_user_dir/codex-five-hour-activation.timer"
+install -m 0644 "$systemd_source/codex-turn-observer.service" "$systemd_user_dir/codex-turn-observer.service"
 
 escape_config_value() {
   printf '%q' "$1"
@@ -163,6 +169,7 @@ escape_config_value() {
   printf 'USAGE_CACHE=%s\n' "$(escape_config_value "${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/usage.json")"
   printf 'USAGE_REFRESH_LOG=%s\n' "$(escape_config_value "${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/usage-refresh.log")"
   printf 'FIVE_HOUR_ACTIVATION_STATE=%s\n' "$(escape_config_value "${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/five-hour-activation.json")"
+  printf 'CODEX_EVENT_STATE=%s\n' "$(escape_config_value "${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/turn-events.json")"
   printf 'RESET_CREDITS_REFRESHER=%s\n' "$(escape_config_value "$local_bin/codex-reset-credits-refresh")"
   printf 'RESET_CREDITS_CACHE=%s\n' "$(escape_config_value "${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/reset-credits.json")"
 } >"$config_file"
@@ -170,6 +177,7 @@ chmod 600 "$config_file"
 
 systemctl --user daemon-reload
 systemctl --user enable --now codex-five-hour-activation.timer
+systemctl --user enable --now codex-turn-observer.service
 
 for account_number in 1 2 3; do
   desktop_file="$applications_dir/codex-account${account_number}.desktop"

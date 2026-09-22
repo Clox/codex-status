@@ -1,0 +1,292 @@
+#!/usr/bin/env node
+
+'use strict';
+
+const fs = require('node:fs');
+const path = require('node:path');
+const { execFileSync } = require('node:child_process');
+const {
+  applyRolloutRecord,
+  clearRecoveredExhaustions,
+  emptyEventState,
+  normalizeState,
+  pruneEventState,
+} = require(path.join(__dirname, '..', 'lib', 'codex-turn-observer'));
+
+const codexHome = process.env.CODEX_HOME || path.join(process.env.HOME, '.codex');
+const cacheDirectory = process.env.XDG_CACHE_HOME
+  ? path.join(process.env.XDG_CACHE_HOME, 'codex-account-switcher')
+  : path.join(process.env.HOME, '.cache', 'codex-account-switcher');
+const statePath = process.env.CODEX_EVENT_STATE || path.join(cacheDirectory, 'turn-events.json');
+const usageCachePath = process.env.USAGE_CACHE || path.join(cacheDirectory, 'usage.json');
+const registryPath = path.join(codexHome, 'accounts', 'registry.json');
+const sessionsPath = path.join(codexHome, 'sessions');
+const stateDatabasePath = path.join(codexHome, 'state_5.sqlite');
+const scanIntervalMs = Number(process.env.CODEX_TURN_OBSERVER_INTERVAL_MS || 750);
+const bindingMaxDelayMs = Number(process.env.CODEX_TURN_BINDING_MAX_DELAY_MS || 15_000);
+const once = process.argv.includes('--once');
+const lockPath = `${statePath}.lock`;
+
+function readJson(filename, fallback = null) {
+  try { return JSON.parse(fs.readFileSync(filename, 'utf8')); } catch { return fallback; }
+}
+
+function atomicWriteJson(filename, value) {
+  fs.mkdirSync(path.dirname(filename), { recursive: true, mode: 0o700 });
+  fs.chmodSync(path.dirname(filename), 0o700);
+  const temporary = `${filename}.tmp-${process.pid}`;
+  fs.writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+  fs.renameSync(temporary, filename);
+  fs.chmodSync(filename, 0o600);
+}
+
+function acquireLock() {
+  fs.mkdirSync(path.dirname(lockPath), { recursive: true, mode: 0o700 });
+  try {
+    const descriptor = fs.openSync(lockPath, 'wx', 0o600);
+    fs.writeFileSync(descriptor, `${process.pid}\n`);
+    return descriptor;
+  } catch (error) {
+    if (error?.code !== 'EEXIST') throw error;
+    let pid = null;
+    try { pid = Number(fs.readFileSync(lockPath, 'utf8').trim()); } catch {}
+    try {
+      if (Number.isFinite(pid)) process.kill(pid, 0);
+      return null;
+    } catch (signalError) {
+      if (signalError?.code !== 'ESRCH') return null;
+      fs.unlinkSync(lockPath);
+      const descriptor = fs.openSync(lockPath, 'wx', 0o600);
+      fs.writeFileSync(descriptor, `${process.pid}\n`);
+      return descriptor;
+    }
+  }
+}
+
+function releaseLock(descriptor) {
+  if (descriptor === null) return;
+  try { fs.closeSync(descriptor); } catch {}
+  try { fs.unlinkSync(lockPath); } catch {}
+}
+
+function activeIdentity() {
+  const registry = readJson(registryPath);
+  if (!registry?.active_account_key) return null;
+  const accounts = Array.isArray(registry.accounts)
+    ? registry.accounts
+    : Object.values(registry.accounts || {});
+  const active = accounts.find(account => account.account_key === registry.active_account_key);
+  if (!active?.chatgpt_account_id) return null;
+  return {
+    accountId: active.chatgpt_account_id,
+    accountKey: active.account_key,
+  };
+}
+
+function sameIdentity(left, right) {
+  return Boolean(left && right &&
+    left.accountId === right.accountId &&
+    left.accountKey === right.accountKey);
+}
+
+function rolloutFiles(directory) {
+  const files = [];
+  function visit(current) {
+    let entries;
+    try { entries = fs.readdirSync(current, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      const filename = path.join(current, entry.name);
+      if (entry.isDirectory()) visit(filename);
+      else if (entry.isFile() && entry.name.endsWith('.jsonl')) files.push(filename);
+    }
+  }
+  visit(directory);
+  return files;
+}
+
+function relativeFile(filename) {
+  return path.relative(codexHome, filename);
+}
+
+function sessionIdFromFirstRecord(filename) {
+  let descriptor;
+  try {
+    descriptor = fs.openSync(filename, 'r');
+    const chunks = [];
+    const chunkSize = 64 * 1024;
+    const maximumFirstRecordBytes = 4 * 1024 * 1024;
+    let position = 0;
+    let newlineAt = -1;
+    while (position < maximumFirstRecordBytes && newlineAt < 0) {
+      const buffer = Buffer.alloc(Math.min(chunkSize, maximumFirstRecordBytes - position));
+      const count = fs.readSync(descriptor, buffer, 0, buffer.length, position);
+      if (count === 0) break;
+      const chunk = buffer.subarray(0, count);
+      const localNewline = chunk.indexOf(0x0a);
+      if (localNewline >= 0) newlineAt = position + localNewline;
+      chunks.push(chunk);
+      position += count;
+    }
+    if (newlineAt < 0) return null;
+    const firstLine = Buffer.concat(chunks).subarray(0, newlineAt).toString('utf8');
+    const record = JSON.parse(firstLine);
+    if (record?.type !== 'session_meta') return null;
+    return record.payload?.session_id || record.payload?.id || null;
+  } catch {
+    return null;
+  } finally {
+    if (descriptor !== undefined) fs.closeSync(descriptor);
+  }
+}
+
+function readNewRecords(filename, checkpoint, initializeAtEnd) {
+  const stat = fs.statSync(filename);
+  if (!checkpoint) {
+    return {
+      records: [],
+      checkpoint: {
+        offset: initializeAtEnd ? stat.size : 0,
+        size: stat.size,
+        sessionId: sessionIdFromFirstRecord(filename),
+        mtimeMs: stat.mtimeMs,
+      },
+    };
+  }
+  const checkpointWithSession = checkpoint.sessionId
+    ? checkpoint
+    : { ...checkpoint, sessionId: sessionIdFromFirstRecord(filename) };
+  let offset = Number(checkpointWithSession.offset) || 0;
+  if (stat.size < offset) offset = 0;
+  if (stat.size === offset) {
+    return {
+      records: [],
+      checkpoint: { ...checkpointWithSession, size: stat.size, mtimeMs: stat.mtimeMs },
+    };
+  }
+  const length = stat.size - offset;
+  const descriptor = fs.openSync(filename, 'r');
+  const buffer = Buffer.alloc(length);
+  try { fs.readSync(descriptor, buffer, 0, length, offset); } finally { fs.closeSync(descriptor); }
+  const text = buffer.toString('utf8');
+  const lastNewline = text.lastIndexOf('\n');
+  if (lastNewline < 0) return { records: [], checkpoint };
+  const complete = text.slice(0, lastNewline + 1);
+  const records = [];
+  for (const line of complete.split('\n')) {
+    if (!line) continue;
+    try { records.push(JSON.parse(line)); } catch {}
+  }
+  return {
+    records,
+    checkpoint: {
+      ...checkpointWithSession,
+      offset: offset + Buffer.byteLength(complete),
+      size: stat.size,
+      mtimeMs: stat.mtimeMs,
+    },
+  };
+}
+
+function recordTime(record, fallback) {
+  const parsed = Date.parse(record?.timestamp);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function titleForThread(threadId) {
+  if (!/^[0-9a-f-]{20,}$/i.test(threadId || '') || !fs.existsSync(stateDatabasePath)) return null;
+  try {
+    const output = execFileSync('sqlite3', [
+      '-readonly',
+      stateDatabasePath,
+      `SELECT COALESCE(NULLIF(name, ''), NULLIF(title, '')) FROM threads WHERE id='${threadId}' LIMIT 1;`,
+    ], { encoding: 'utf8', timeout: 1000, stdio: ['ignore', 'pipe', 'ignore'] });
+    return output.replace(/[\r\n\t]+/g, ' ').trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+const lockDescriptor = acquireLock();
+if (lockDescriptor === null) process.exit(0);
+let state = normalizeState(readJson(statePath), Date.now());
+const firstRun = !fs.existsSync(statePath);
+const initialFiles = new Set(firstRun ? rolloutFiles(sessionsPath) : []);
+let scanning = false;
+let stopping = false;
+
+function scan() {
+  if (scanning || stopping) return;
+  scanning = true;
+  const nowMs = Date.now();
+  try {
+    const identityBefore = activeIdentity();
+    const batches = [];
+    for (const filename of rolloutFiles(sessionsPath)) {
+      const key = relativeFile(filename);
+      const result = readNewRecords(filename, state.files[key], initialFiles.has(filename));
+      state.files[key] = result.checkpoint;
+      if (result.records.length > 0) batches.push({ key, records: result.records });
+    }
+    const identityAfter = activeIdentity();
+    const stableIdentity = sameIdentity(identityBefore, identityAfter) ? identityAfter : null;
+
+    for (const batch of batches) {
+      const checkpoint = state.files[batch.key];
+      for (const record of batch.records) {
+        if (record.type === 'session_meta') {
+          checkpoint.sessionId = record.payload?.session_id || record.payload?.id || checkpoint.sessionId;
+          continue;
+        }
+        const eventAtMs = recordTime(record, nowMs);
+        const recent = Math.abs(nowMs - eventAtMs) <= bindingMaxDelayMs;
+        const payload = record.payload || {};
+        const existing = payload.turn_id ? state.activeTurns[payload.turn_id] : null;
+        state = applyRolloutRecord(state, record, {
+          threadId: checkpoint.sessionId,
+          accountId: existing?.accountId || (payload.type === 'task_started' && recent ? stableIdentity?.accountId : null),
+          accountKey: existing?.accountKey || (payload.type === 'task_started' && recent ? stableIdentity?.accountKey : null),
+          title: checkpoint.sessionId ? titleForThread(checkpoint.sessionId) : null,
+          observedAtMs: nowMs,
+          nowMs,
+        });
+      }
+    }
+    for (const turn of Object.values(state.activeTurns)) {
+      if (!turn.title) turn.title = titleForThread(turn.threadId);
+    }
+    state = clearRecoveredExhaustions(state, readJson(usageCachePath, {}));
+    state = pruneEventState(state, nowMs);
+    state.worker = {
+      heartbeatAtMs: nowMs,
+      lastScanAtMs: nowMs,
+      lastErrorAtMs: null,
+      errorKind: null,
+    };
+  } catch (error) {
+    state.worker = {
+      ...(state.worker || {}),
+      heartbeatAtMs: nowMs,
+      lastErrorAtMs: nowMs,
+      errorKind: error?.code || 'observer-scan-failed',
+    };
+  } finally {
+    atomicWriteJson(statePath, state);
+    scanning = false;
+  }
+}
+
+function stop() {
+  stopping = true;
+  releaseLock(lockDescriptor);
+  process.exit(0);
+}
+
+process.on('SIGTERM', stop);
+process.on('SIGINT', stop);
+scan();
+if (!once) setInterval(scan, scanIntervalMs);
+else {
+  const exitCode = state.worker.errorKind ? 1 : 0;
+  releaseLock(lockDescriptor);
+  process.exit(exitCode);
+}

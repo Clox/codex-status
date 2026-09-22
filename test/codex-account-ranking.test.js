@@ -95,6 +95,16 @@ test('an exhausted verified active account pauses when no verified usable altern
   assert.equal(recommendation.reason, 'insufficient-verified-data');
 });
 
+test('terminally verified exhausted account ranks behind and is never recommended', () => {
+  const ranked = rankAccounts([
+    account(1, { active: true, weeklyRemaining: 20, fiveHourRemaining: 20 }),
+    account(2, { verifiedExhausted: true, weeklyRemaining: 100, fiveHourRemaining: 100 }),
+    account(3, { weeklyRemaining: 10, fiveHourRemaining: 10 }),
+  ], { nowMs: NOW_MS });
+  assert.deepEqual(ranked.map(item => item.sourceRow), ['1', '3', '2']);
+  assert.equal(recommendAccount(ranked).account.sourceRow, '1');
+});
+
 test('a stale active account pauses recommendation until refresh recovers', () => {
   const ranked = rankAccounts([
     account(1, { active: true, usageQuality: 'stale' }),

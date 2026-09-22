@@ -22,6 +22,7 @@ function normalize({ serverEntry = null, account = null, nowMs = NOW_MS } = {}) 
     columns,
     accounts: account ? [account] : [],
     serverUsageByAccountId: serverEntry ? { 'account-c': serverEntry } : {},
+    exhaustionByAccountId: {},
     resetCreditsByAccountId: { 'account-c': { availableCount: 0, detailsComplete: true } },
     nowMs,
     cacheHealth: { healthy: true },
@@ -30,6 +31,24 @@ function normalize({ serverEntry = null, account = null, nowMs = NOW_MS } = {}) 
       const minutes = Math.ceil((epoch * 1000 - nowMs) / 60_000);
       return `${Math.floor(minutes / 60)}:${String(minutes % 60).padStart(2, '0')}`;
     },
+  });
+}
+
+function normalizeExhausted({ serverEntry, account }) {
+  const visible = '* 01 account-c@example.com Plus  -             -               Now';
+  return normalizeAccountRow({
+    visible,
+    lineIndex: 2,
+    rowMatch: visible.match(/^\s*\*?\s*0?(\d+)\s+/),
+    columns,
+    accounts: [account],
+    serverUsageByAccountId: { 'account-c': serverEntry },
+    exhaustionByAccountId: { 'account-c': { verified: true, pool: 'account' } },
+    resetCreditsByAccountId: {},
+    nowMs: NOW_MS,
+    cacheHealth: { healthy: true },
+    configuredAccountNumber: () => '3',
+    formatRemaining: () => '2:00',
   });
 }
 
@@ -113,6 +132,23 @@ test('row coloring leaves vertical column separators in the terminal default col
   assert.equal(output.replace(/\x1b\[[0-9;]*m/g, ''), rendered);
   assert.equal((output.match(/\x1b\[0m│\x1b\[0;32m/g) || []).length, 3);
   assert.equal(output, `${color}01 account \x1b[0m│${color} 1×025:04\x1b[0m│${color} 100% READY \x1b[0m│${color} Now  ACTIVE\x1b[0m`);
+});
+
+test('verified account-level exhaustion is rendered without inventing a 5H or weekly pool', () => {
+  const account = { chatgpt_account_id: 'account-c', email: 'account-c@example.com' };
+  const serverEntry = {
+    primary: { remainingPercent: 0, resetsAt: NOW_MS / 1000 + 7200 },
+    secondary: { remainingPercent: 20, resetsAt: NOW_MS / 1000 + 7200 },
+    refresh: { lastSuccessAt: NOW_MS, lastAttemptAt: NOW_MS, errorKind: null, consecutiveFailures: 0 },
+  };
+  const row = normalizeExhausted({ account, serverEntry });
+  const ranked = rankAccounts([row], { nowMs: NOW_MS });
+  const output = render(ranked[0]);
+  assert.equal(row.verifiedExhausted, true);
+  assert.match(output, /0%\s+\(2:00\)/);
+  assert.match(output, /20% ▂ \(2:00\)/);
+  assert.match(output, /ACTIVE  EXHAUSTED$/);
+  assert.equal(recommendAccount(ranked).reason, 'active-verified-exhaustion');
 });
 
 test('renders confirmed synthetic moving 5H and weekly deadlines as READY and START', () => {
