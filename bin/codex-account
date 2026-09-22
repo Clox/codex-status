@@ -16,6 +16,34 @@ source "$config_file"
 export CODEX_HOME
 export PATH="$NODE_BIN_DIR:${PATH:-/usr/local/bin:/usr/bin:/bin}"
 ACCOUNT_STATE_CHECKER=${ACCOUNT_STATE_CHECKER:-"$HOME/.local/bin/codex-account-state"}
+operation_lock_dir=${CODEX_OPERATION_LOCK_DIR:-"${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/exclusive-codex-operation.lock"}
+
+acquire_operation_lock() {
+  mkdir -p "$(dirname -- "$operation_lock_dir")"
+  chmod 700 "$(dirname -- "$operation_lock_dir")"
+  if ! mkdir -m 700 "$operation_lock_dir" 2>/dev/null; then
+    owner=''
+    [[ -r "$operation_lock_dir/owner" ]] && read -r owner <"$operation_lock_dir/owner"
+    if [[ $owner =~ ^[0-9]+$ ]] && kill -0 "$owner" 2>/dev/null; then
+      printf 'En annan exklusiv Codex-operation pågår. Kontobytet avbröts.\n' >&2
+      exit 75
+    fi
+    rm -f -- "$operation_lock_dir/owner"
+    rmdir -- "$operation_lock_dir" 2>/dev/null || {
+      printf 'Codex operationslåset kunde inte återställas säkert.\n' >&2
+      exit 75
+    }
+    mkdir -m 700 "$operation_lock_dir"
+  fi
+  printf '%s\n' "$BASHPID" >"$operation_lock_dir/owner"
+  trap 'rm -f -- "$operation_lock_dir/owner"; rmdir -- "$operation_lock_dir" 2>/dev/null || true' EXIT
+}
+
+release_operation_lock() {
+  rm -f -- "$operation_lock_dir/owner"
+  rmdir -- "$operation_lock_dir" 2>/dev/null || true
+  trap - EXIT
+}
 
 usage() {
   printf 'Usage: codex-account <1|2|3> [--desktop] [desktop arguments...]\n' >&2
@@ -23,6 +51,7 @@ usage() {
 }
 
 [[ $# -ge 1 ]] || usage
+acquire_operation_lock
 account_number=$1
 case "$account_number" in
   1) account_selector=${ACCOUNT_1:?ACCOUNT_1 is not configured} ;;
@@ -88,6 +117,7 @@ fi
 
 if [[ $launch_desktop == true ]]; then
   notify-send 'Codex-konto valt' 'Startar Codex Desktop med det valda kontot.' 2>/dev/null || true
+  release_operation_lock
   exec "$CHATGPT_LAUNCHER" "$@"
 fi
 

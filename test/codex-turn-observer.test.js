@@ -13,6 +13,7 @@ const {
   emptyEventState,
   observerHealth,
   pruneEventState,
+  turnKey,
 } = require('../lib/codex-turn-observer');
 
 const NOW = 1_800_000_000_000;
@@ -76,6 +77,7 @@ test('usageLimitExceeded requires willRetry false and matching failed completion
   assert.equal(terminal.exhaustions['account-a'].verified, true);
   assert.equal(terminal.exhaustions['account-a'].pool, 'account');
   assert.equal(terminal.exhaustions['account-a'].willRetry, false);
+  assert.equal(terminal.interruptedTurns[turnKey('thread-a', 'turn-a')].resumable, true);
 });
 
 test('mismatched terminal event cannot verify exhaustion', () => {
@@ -100,17 +102,124 @@ test('mismatched terminal event cannot verify exhaustion', () => {
 test('multiple active turns are independent and every terminal state removes only its turn', () => {
   let state = started(emptyEventState(NOW), 'thread-a', 'turn-a');
   state = started(state, 'thread-b', 'turn-b');
-  assert.deepEqual(Object.keys(state.activeTurns).sort(), ['turn-a', 'turn-b']);
+  assert.deepEqual(Object.keys(state.activeTurns).sort(), [turnKey('thread-a', 'turn-a'), turnKey('thread-b', 'turn-b')]);
   state = applyProtocolNotification(state, {
     method: 'turn/completed',
     params: { threadId: 'thread-a', turn: { id: 'turn-a', status: 'interrupted', error: null } },
   }, { nowMs: NOW + 100 });
-  assert.deepEqual(Object.keys(state.activeTurns), ['turn-b']);
+  assert.deepEqual(Object.keys(state.activeTurns), [turnKey('thread-b', 'turn-b')]);
   state = applyProtocolNotification(state, {
     method: 'turn/completed',
     params: { threadId: 'thread-b', turn: { id: 'turn-b', status: 'completed', error: null } },
   }, { nowMs: NOW + 200 });
   assert.deepEqual(state.activeTurns, {});
+});
+
+test('turn identity is the thread and turn pair, including repeated events and later turns', () => {
+  let state = started(emptyEventState(NOW), 'parent-thread', 'shared-turn');
+  state = started(state, 'child-thread', 'shared-turn');
+  state = started(state, 'child-thread', 'shared-turn');
+  assert.equal(Object.keys(state.activeTurns).length, 2);
+  state = applyProtocolNotification(state, {
+    method: 'turn/completed',
+    params: { threadId: 'child-thread', turn: { id: 'shared-turn', status: 'completed' } },
+  }, { nowMs: NOW + 100 });
+  assert.deepEqual(Object.keys(state.activeTurns), [turnKey('parent-thread', 'shared-turn')]);
+  state = applyProtocolNotification(state, {
+    method: 'turn/completed',
+    params: { threadId: 'child-thread', turn: { id: 'shared-turn', status: 'completed' } },
+  }, { nowMs: NOW + 100 });
+  assert.equal(state.terminalTurns.length, 1);
+  state = started(state, 'child-thread', 'shared-turn');
+  assert.deepEqual(Object.keys(state.activeTurns), [turnKey('parent-thread', 'shared-turn')]);
+  state = started(state, 'child-thread', 'next-turn');
+  assert.equal(Object.keys(state.activeTurns).length, 2);
+  state = applyProtocolNotification(state, {
+    method: 'turn/completed',
+    params: { threadId: 'parent-thread', turn: { id: 'shared-turn', status: 'completed' } },
+  }, { nowMs: NOW + 200 });
+  assert.deepEqual(Object.keys(state.activeTurns), [turnKey('child-thread', 'next-turn')]);
+});
+
+test('same turn ID in two threads cannot cross-bind exhaustion or create duplicate failed candidates', () => {
+  let state = started(emptyEventState(NOW), 'parent-thread', 'shared-turn');
+  state = started(state, 'child-thread', 'shared-turn');
+  state = applyProtocolNotification(state, {
+    method: 'error',
+    params: {
+      threadId: 'child-thread', turnId: 'shared-turn', willRetry: false,
+      error: { codexErrorInfo: 'usageLimitExceeded' },
+    },
+  }, { nowMs: NOW + 10 });
+  state = applyProtocolNotification(state, {
+    method: 'turn/completed',
+    params: { threadId: 'parent-thread', turn: {
+      id: 'shared-turn', status: 'failed', error: { codexErrorInfo: 'usageLimitExceeded' },
+    } },
+  }, { nowMs: NOW + 20 });
+  assert.deepEqual(state.exhaustions, {});
+  assert.equal(state.activeTurns[turnKey('child-thread', 'shared-turn')].state, 'running');
+  state = applyProtocolNotification(state, {
+    method: 'turn/completed',
+    params: { threadId: 'child-thread', turn: {
+      id: 'shared-turn', status: 'failed', error: { codexErrorInfo: 'usageLimitExceeded' },
+    } },
+  }, { nowMs: NOW + 30 });
+  assert.equal(state.exhaustions['account-a'].threadId, 'child-thread');
+  assert.deepEqual(state.terminalTurns.map(turn => turn.threadId), ['parent-thread', 'child-thread']);
+  state = applyProtocolNotification(state, {
+    method: 'turn/completed',
+    params: { threadId: 'child-thread', turn: {
+      id: 'shared-turn', status: 'failed', error: { codexErrorInfo: 'usageLimitExceeded' },
+    } },
+  }, { nowMs: NOW + 40 });
+  assert.equal(state.terminalTurns.length, 2);
+});
+
+test('legacy state cannot carry parent-session identities into a new failover candidate', () => {
+  const legacy = emptyEventState(NOW);
+  legacy.version = 1;
+  legacy.activeTurns['old-turn'] = { threadId: 'parent-thread', turnId: 'old-turn', accountId: 'account-a' };
+  legacy.terminalTurns.push({ threadId: 'parent-thread', turnId: 'old-failed', status: 'failed' });
+  legacy.exhaustions['account-a'] = { threadId: 'parent-thread', turnId: 'old-failed', verified: true };
+  const migrated = started(legacy, 'new-thread', 'new-turn');
+  assert.equal(migrated.activeTurns['old-turn'], undefined);
+  assert.equal(migrated.activeTurns[turnKey('new-thread', 'new-turn')].threadId, 'new-thread');
+  assert.equal(migrated.terminalTurns[0].threadIdentityVerified, false);
+  assert.equal(migrated.exhaustions['account-a'].threadIdentityVerified, false);
+});
+
+test('version 2 verified main-thread exhaustion migrates to a persistent interrupted candidate', () => {
+  const previous = emptyEventState(NOW);
+  previous.version = 2;
+  previous.exhaustions['account-a'] = {
+    accountId: 'account-a', threadId: 'thread-a', turnId: 'turn-a', verified: true,
+    observedAtMs: NOW, source: 'rollout-terminal', threadIdentityVerified: true,
+  };
+  previous.terminalTurns.push({
+    accountId: 'account-a', threadId: 'thread-a', turnId: 'turn-a', status: 'failed',
+    errorKind: 'usagelimitexceeded', completedAtMs: NOW, parentThreadId: null,
+    threadSource: 'user', threadIdentityVerified: true,
+  });
+  const migrated = started(previous, 'other-thread', 'other-turn');
+  assert.equal(migrated.version, 3);
+  assert.equal(migrated.interruptedTurns[turnKey('thread-a', 'turn-a')].resumable, true);
+});
+
+test('a later turn on the same thread resolves its interrupted candidate only', () => {
+  let state = started(emptyEventState(NOW), 'thread-a', 'failed-turn');
+  state = applyProtocolNotification(state, {
+    method: 'error',
+    params: { threadId: 'thread-a', turnId: 'failed-turn', willRetry: false, error: { codexErrorInfo: 'usageLimitExceeded' } },
+  }, { nowMs: NOW + 1 });
+  state = applyProtocolNotification(state, {
+    method: 'turn/completed',
+    params: { threadId: 'thread-a', turn: { id: 'failed-turn', status: 'failed', error: { codexErrorInfo: 'usageLimitExceeded' } } },
+  }, { nowMs: NOW + 2 });
+  assert.ok(state.interruptedTurns[turnKey('thread-a', 'failed-turn')]);
+  state = started(state, 'thread-a', 'continuation-turn');
+  assert.equal(state.interruptedTurns[turnKey('thread-a', 'failed-turn')], undefined);
+  assert.ok(state.activeTurns[turnKey('thread-a', 'continuation-turn')]);
 });
 
 test('persisted rollout task_complete is a terminal post-retry exhaustion record', () => {
@@ -189,6 +298,8 @@ test('observer checkpoints atomically and does not resurrect old active turns af
     HOME: root,
     CODEX_HOME: codexHome,
     XDG_CACHE_HOME: cache,
+    CODEX_EVENT_STATE: path.join(cache, 'codex-account-switcher', 'turn-events.json'),
+    USAGE_CACHE: path.join(cache, 'codex-account-switcher', 'usage.json'),
   };
   let result = spawnSync(process.execPath, [observer, '--once'], { env: environment, encoding: 'utf8' });
   assert.equal(result.status, 0, result.stderr);
@@ -204,7 +315,7 @@ test('observer checkpoints atomically and does not resurrect old active turns af
   result = spawnSync(process.execPath, [observer, '--once'], { env: environment, encoding: 'utf8' });
   assert.equal(result.status, 0, result.stderr);
   state = JSON.parse(fs.readFileSync(path.join(cache, 'codex-account-switcher', 'turn-events.json')));
-  assert.equal(state.activeTurns['turn-new'].accountId, 'account-a');
+  assert.equal(state.activeTurns[turnKey('thread-new', 'turn-new')].accountId, 'account-a');
 
   fs.appendFileSync(rollout, `${JSON.stringify({
     type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn-new' }, timestamp: new Date().toISOString(),
@@ -245,17 +356,19 @@ test('observer sees future appends in an existing rollout with a large session_m
     HOME: root,
     CODEX_HOME: codexHome,
     XDG_CACHE_HOME: cache,
+    CODEX_EVENT_STATE: path.join(cache, 'codex-account-switcher', 'turn-events.json'),
+    USAGE_CACHE: path.join(cache, 'codex-account-switcher', 'usage.json'),
   };
 
   let result = spawnSync(process.execPath, [observer, '--once'], { env: environment, encoding: 'utf8' });
   assert.equal(result.status, 0, result.stderr);
   let state = JSON.parse(fs.readFileSync(path.join(cache, 'codex-account-switcher', 'turn-events.json')));
   assert.deepEqual(state.activeTurns, {});
-  assert.equal(Object.values(state.files)[0].sessionId, threadId);
+  assert.equal(Object.values(state.files)[0].threadId, threadId);
 
   // Reproduce the checkpoint written by the old fixed-size first-line reader:
   // the EOF offset was correct, but the oversized session_meta could not be parsed.
-  Object.values(state.files)[0].sessionId = null;
+  Object.values(state.files)[0].threadId = null;
   fs.writeFileSync(
     path.join(cache, 'codex-account-switcher', 'turn-events.json'),
     `${JSON.stringify(state)}\n`,
@@ -270,8 +383,8 @@ test('observer sees future appends in an existing rollout with a large session_m
   result = spawnSync(process.execPath, [observer, '--once'], { env: environment, encoding: 'utf8' });
   assert.equal(result.status, 0, result.stderr);
   state = JSON.parse(fs.readFileSync(path.join(cache, 'codex-account-switcher', 'turn-events.json')));
-  assert.equal(state.activeTurns['live-turn'].threadId, threadId);
-  assert.equal(state.activeTurns['live-turn'].accountId, 'account-a');
+  assert.equal(state.activeTurns[turnKey(threadId, 'live-turn')].threadId, threadId);
+  assert.equal(state.activeTurns[turnKey(threadId, 'live-turn')].accountId, 'account-a');
 
   fs.appendFileSync(rollout, `${JSON.stringify({
     type: 'event_msg', payload: { type: 'task_complete', turn_id: 'live-turn' },
@@ -283,4 +396,69 @@ test('observer sees future appends in an existing rollout with a large session_m
   assert.deepEqual(state.activeTurns, {});
   assert.equal(state.terminalTurns.at(-1).threadId, threadId);
   assert.equal(state.terminalTurns.at(-1).turnId, 'live-turn');
+});
+
+test('observer keeps parent and guardian child rollout identities distinct', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-turn-observer-subagent-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const codexHome = path.join(root, '.codex');
+  const sessionDirectory = path.join(codexHome, 'sessions', '2026', '09', '22');
+  const registryDirectory = path.join(codexHome, 'accounts');
+  const cache = path.join(root, 'cache');
+  fs.mkdirSync(sessionDirectory, { recursive: true });
+  fs.mkdirSync(registryDirectory, { recursive: true });
+  fs.writeFileSync(path.join(registryDirectory, 'registry.json'), JSON.stringify({
+    active_account_key: 'key-a',
+    accounts: [{ account_key: 'key-a', chatgpt_account_id: 'account-a' }],
+  }));
+  const parentId = 'parent-thread';
+  const childId = 'guardian-thread';
+  const parent = path.join(sessionDirectory, 'rollout-parent.jsonl');
+  const child = path.join(sessionDirectory, 'rollout-child.jsonl');
+  fs.writeFileSync(parent, `${JSON.stringify({
+    type: 'session_meta', payload: { id: parentId, session_id: parentId, thread_source: 'user' },
+  })}\n`);
+  fs.writeFileSync(child, `${JSON.stringify({
+    type: 'session_meta', payload: {
+      id: childId, session_id: parentId, parent_thread_id: parentId,
+      thread_source: 'guardian_review', source: { subagent: { other: 'guardian' } },
+    },
+  })}\n`);
+  const observer = path.join(__dirname, '..', 'bin', 'codex-turn-observer');
+  const environment = {
+    ...process.env,
+    HOME: root,
+    CODEX_HOME: codexHome,
+    XDG_CACHE_HOME: cache,
+    CODEX_EVENT_STATE: path.join(cache, 'codex-account-switcher', 'turn-events.json'),
+    USAGE_CACHE: path.join(cache, 'codex-account-switcher', 'usage.json'),
+  };
+  const run = () => spawnSync(process.execPath, [observer, '--once'], { env: environment, encoding: 'utf8' });
+  assert.equal(run().status, 0);
+  const timestamp = new Date().toISOString();
+  const startedRecord = turnId => `${JSON.stringify({
+    type: 'event_msg', timestamp,
+    payload: { type: 'task_started', turn_id: turnId, started_at: Date.now() },
+  })}\n`;
+  fs.appendFileSync(parent, startedRecord('parent-turn'));
+  fs.appendFileSync(child, startedRecord('guardian-turn'));
+  assert.equal(run().status, 0);
+  const statePath = path.join(cache, 'codex-account-switcher', 'turn-events.json');
+  let state = JSON.parse(fs.readFileSync(statePath));
+  assert.equal(state.files[path.relative(codexHome, child)].threadId, childId);
+  assert.equal(state.files[path.relative(codexHome, child)].parentThreadId, parentId);
+  assert.deepEqual(new Set(Object.values(state.activeTurns).map(turn => turn.threadId)), new Set([parentId, childId]));
+  assert.equal(state.activeTurns[turnKey(childId, 'guardian-turn')].accountId, 'account-a');
+  assert.equal(state.activeTurns[turnKey(childId, 'guardian-turn')].threadSource, 'guardian_review');
+
+  fs.appendFileSync(child, `${JSON.stringify({
+    type: 'event_msg', timestamp: new Date().toISOString(),
+    payload: { type: 'task_complete', turn_id: 'guardian-turn' },
+  })}\n`);
+  assert.equal(run().status, 0);
+  state = JSON.parse(fs.readFileSync(statePath));
+  assert.deepEqual(Object.keys(state.activeTurns), [turnKey(parentId, 'parent-turn')]);
+  assert.equal(state.terminalTurns.at(-1).threadId, childId);
+  assert.equal(state.terminalTurns.at(-1).parentThreadId, parentId);
+  assert.equal(state.terminalTurns.at(-1).threadIdentityVerified, true);
 });

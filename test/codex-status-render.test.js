@@ -147,8 +147,9 @@ test('verified account-level exhaustion is rendered without inventing a 5H or we
   assert.equal(row.verifiedExhausted, true);
   assert.match(output, /0%\s+\(2:00\)/);
   assert.match(output, /20% ▂ \(2:00\)/);
-  assert.match(output, /ACTIVE  EXHAUSTED$/);
-  assert.equal(recommendAccount(ranked).reason, 'active-verified-exhaustion');
+  assert.match(output, /ACTIVE$/);
+  assert.doesNotMatch(output, /EXHAUSTED/);
+  assert.equal(recommendAccount(ranked).reason, 'insufficient-verified-data');
 });
 
 test('renders confirmed synthetic moving 5H and weekly deadlines as READY and START', () => {

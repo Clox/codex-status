@@ -33,8 +33,14 @@ const {
   activationWorkerHealth,
 } = require(path.join(__dirname, '..', 'lib', 'codex-five-hour-worker'));
 const {
+  normalizeState,
   observerHealth,
 } = require(path.join(__dirname, '..', 'lib', 'codex-turn-observer'));
+const {
+  emptyResumeState,
+  normalizeResumeState,
+  pendingInterruptedTurns,
+} = require(path.join(__dirname, '..', 'lib', 'codex-manual-resume'));
 const {
   tableCell,
   activationObservationHoldLine,
@@ -65,10 +71,16 @@ const eventStatePath = process.env.CODEX_EVENT_STATE || path.join(
   'codex-account-switcher',
   'turn-events.json'
 );
+const resumeStatePath = process.env.CODEX_RESUME_STATE || path.join(
+  process.env.XDG_CACHE_HOME || path.join(process.env.HOME, '.cache'),
+  'codex-account-switcher',
+  'manual-resume.json'
+);
 const input = fs.readFileSync(0, 'utf8').replace(/\r/g, '');
 const mappingOnly = process.argv.includes('--key-map');
+const resumeMappingOnly = process.argv.includes('--resume-map');
 const attentionOnly = process.argv.includes('--attention-state');
-const rankingEnabled = mappingOnly || attentionOnly || process.env.CODEX_STATUS_RANKING === '1';
+const rankingEnabled = mappingOnly || resumeMappingOnly || attentionOnly || process.env.CODEX_STATUS_RANKING === '1';
 const pendingSourceCandidate = process.env.CODEX_PENDING_SOURCE_ROW || process.env.CODEX_PENDING_ROW || '';
 const pendingSourceRow = /^(1|2|3)$/.test(pendingSourceCandidate)
   ? pendingSourceCandidate
@@ -106,6 +118,7 @@ let serverUsageByAccountId = {};
 let usageCacheState = {};
 let activationState = {};
 let eventState = {};
+let resumeState = emptyResumeState();
 let activationHolds = { version: 1, accounts: {} };
 let activationHoldsError = null;
 try {
@@ -114,7 +127,7 @@ try {
     ? registry.accounts
     : Object.values(registry.accounts || {});
 } catch {
-  if (mappingOnly || attentionOnly) process.exit(1);
+  if (mappingOnly || resumeMappingOnly || attentionOnly) process.exit(1);
   process.stdout.write(input);
   process.exit(0);
 }
@@ -132,7 +145,10 @@ try {
   activationState = JSON.parse(fs.readFileSync(activationStatePath, 'utf8'));
 } catch {}
 try {
-  eventState = JSON.parse(fs.readFileSync(eventStatePath, 'utf8'));
+  eventState = normalizeState(JSON.parse(fs.readFileSync(eventStatePath, 'utf8')), nowMs);
+} catch {}
+try {
+  resumeState = normalizeResumeState(JSON.parse(fs.readFileSync(resumeStatePath, 'utf8')));
 } catch {}
 try {
   activationHolds = readActivationHolds(defaultActivationHoldsPath());
@@ -150,7 +166,7 @@ const headerIndex = visibleLines.findIndex(line =>
 );
 
 if (headerIndex < 0) {
-  if (mappingOnly || attentionOnly) process.exit(1);
+  if (mappingOnly || resumeMappingOnly || attentionOnly) process.exit(1);
   process.stdout.write(input);
   process.exit(0);
 }
@@ -208,6 +224,20 @@ if (attentionOnly) {
 if (mappingOnly) {
   process.stdout.write(rankedRows
     .map(row => `${row.rank}\t${row.sourceRow}\t${row.active ? 'active' : '-'}\t${row.accountNumber}`)
+    .join('\n'));
+  process.exit(0);
+}
+
+const interruptedCandidates = turnObserverHealth.healthy
+  ? pendingInterruptedTurns(eventState, resumeState).slice(0, 6)
+  : [];
+const interruptedWithKeys = interruptedCandidates.map((candidate, index) => ({
+  ...candidate,
+  continueKey: String(index + 4),
+}));
+if (resumeMappingOnly) {
+  process.stdout.write(interruptedWithKeys
+    .map(candidate => `${candidate.continueKey}\t${candidate.threadId}\t${candidate.turnId}`)
     .join('\n'));
   process.exit(0);
 }
@@ -271,7 +301,7 @@ const output = lines.map((line, lineIndex) => {
   if (!row) return line;
 
   const pending = pendingSourceRow === row.sourceRow;
-  const color = row.usageQuality === 'unverified' || row.verifiedExhausted
+  const color = row.usageQuality === 'unverified'
     ? '\x1b[1;31m'
     : row.active
       ? '\x1b[0;32m'
@@ -318,9 +348,6 @@ const problems = [
 const repairableProblemCount = rankedRows.filter(row =>
   row.usageQuality === 'unverified' && REPAIRABLE_ERROR_KINDS.has(row.errorKind)
 ).length;
-const problemSection = problems.length > 0
-  ? `\n\x1b[1;31mACCOUNT PROBLEMS:\x1b[0m\n${problems.map(line => `\x1b[31m${line}\x1b[0m`).join('\n')}${repairableProblemCount > 0 ? '\n\x1b[1;33mPress [R] to repair authentication\x1b[0m' : ''}`
-  : '';
 const information = rankedRows.map(row => activationObservationHoldLine(
   row,
   activationHoldForAccount(activationHolds, row.accountId)
@@ -336,17 +363,38 @@ const activeTurnsSection = activeTurns.length > 0
   ? `\n\x1b[1;36mACTIVE CODEX TURNS:\x1b[0m\n${activeTurns.map(turn => {
       const accountLabel = labelByAccountId.get(turn.accountId) || 'unknown account';
       const thread = turn.threadId ? `…${turn.threadId.slice(-8)}` : 'unknown thread';
+      const role = turn.parentThreadId
+        ? ` (${turn.threadSource === 'guardian_review' ? 'guardian' : 'subagent'})`
+        : '';
       const title = turn.title ? ` — ${turn.title.slice(0, 42)}` : '';
-      return `\x1b[36m${accountLabel} | ${thread}${title} | running\x1b[0m`;
+      return `\x1b[36m${accountLabel} | ${thread}${role}${title} | running\x1b[0m`;
     }).join('\n')}`
+  : '';
+const interruptedTurnsSection = interruptedWithKeys.length > 0
+  ? `\n\x1b[1;33mINTERRUPTED CODEX TURNS:\x1b[0m\n${interruptedWithKeys.map(candidate => {
+      const accountLabel = labelByAccountId.get(candidate.accountId) || 'unknown account';
+      const thread = `…${candidate.threadId.slice(-8)}`;
+      const title = candidate.title ? ` — ${candidate.title.slice(0, 42)}` : '';
+      return `\x1b[33m[${candidate.continueKey}] ${accountLabel} | ${thread}${title} | quota-interrupted\x1b[0m`;
+    }).join('\n')}\n\x1b[1;33mPress [${interruptedWithKeys.map(candidate => candidate.continueKey).join('/')}] to continue after a manual account switch\x1b[0m`
   : '';
 const exhaustionLines = rankedRows
   .filter(row => row.verifiedExhausted)
-  .map(row => `VERIFIED EXHAUSTION: ${row.label} — terminal usageLimitExceeded; 5H/weekly pool is unknown.`);
+  .map(row => `VERIFIED EXHAUSTION: ${row.label} — quota pool unknown.`);
 const exhaustionSection = exhaustionLines.length > 0
   ? `\n\x1b[1;31mACCOUNT STATUS:\x1b[0m\n${exhaustionLines.map(line => `\x1b[31m${line}\x1b[0m`).join('\n')}`
   : '';
+const resumeAttemptProblems = Object.values(resumeState.attempts || {})
+  .filter(attempt => attempt.status === 'MANUAL_REQUIRED_AFTER_COMMIT')
+  .map(attempt => `MANUAL RESUME / ACTION REQUIRED: …${String(attempt.threadId || '').slice(-8)} was committed; no automatic retry (${attempt.errorKind || 'unknown error'}).`);
+if (resumeState.lastError?.actionRequired) {
+  problems.push(`MANUAL RESUME: no turn was sent; ${resumeState.lastError.errorKind || 'preflight failed'}.`);
+}
+problems.push(...resumeAttemptProblems);
+const problemSection = problems.length > 0
+  ? `\n\x1b[1;31mACCOUNT PROBLEMS:\x1b[0m\n${problems.map(line => `\x1b[31m${line}\x1b[0m`).join('\n')}${repairableProblemCount > 0 ? '\n\x1b[1;33mPress [R] to repair authentication\x1b[0m' : ''}`
+  : '';
 const footerParts = [renderedRecommendationLines.join('\n')];
 if (usageQualityLine) footerParts.push(usageQualityLine);
-const footer = `${footerParts.join('\n')}${activeTurnsSection}${exhaustionSection}${informationSection}${problemSection}`;
+const footer = `${footerParts.join('\n')}${activeTurnsSection}${interruptedTurnsSection}${exhaustionSection}${informationSection}${problemSection}`;
 process.stdout.write(`${output.join('\n').trimEnd()}\n\n${footer}`);

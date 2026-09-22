@@ -1,0 +1,502 @@
+#!/usr/bin/env node
+
+'use strict';
+
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const readline = require('node:readline');
+const { once } = require('node:events');
+const { spawn } = require('node:child_process');
+const {
+  CONTINUATION_PROMPT,
+  atomicWriteJson,
+  candidateKey,
+  codexErrorKind,
+  emptyResumeState,
+  markResumeCommitted,
+  markResumeFailure,
+  markResumeTerminal,
+  normalizeResumeState,
+  pendingInterruptedTurns,
+  validateThreadForResume,
+} = require(path.join(__dirname, '..', 'lib', 'codex-manual-resume'));
+const { normalizeState, observerHealth } = require(path.join(__dirname, '..', 'lib', 'codex-turn-observer'));
+const { verifyActiveAccountState } = require(path.join(__dirname, '..', 'lib', 'codex-account-state'));
+
+const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+const cacheDirectory = path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache'), 'codex-account-switcher');
+const eventStatePath = process.env.CODEX_EVENT_STATE || path.join(cacheDirectory, 'turn-events.json');
+const usageCachePath = process.env.USAGE_CACHE || path.join(cacheDirectory, 'usage.json');
+const resumeStatePath = process.env.CODEX_RESUME_STATE || path.join(cacheDirectory, 'manual-resume.json');
+const leasePath = `${resumeStatePath}.client-lease.json`;
+const lockPath = path.join(cacheDirectory, 'exclusive-codex-operation.lock');
+const registryPath = path.join(codexHome, 'accounts', 'registry.json');
+const globalAuthPath = path.join(codexHome, 'auth.json');
+const codexBin = process.env.CODEX_LOGIN_BIN || '/usr/lib/chatgpt/resources/codex';
+const desktopLauncher = process.env.CHATGPT_LAUNCHER || '/usr/bin/chatgpt';
+const desktopBinary = process.env.CHATGPT_BINARY_PATTERN || '/usr/lib/chatgpt/ChatGPT';
+const MAX_USAGE_AGE_MS = 3 * 60 * 1000;
+const TURN_TIMEOUT_MS = 12 * 60 * 60 * 1000;
+
+function readJson(filename, fallback = null) {
+  try { return JSON.parse(fs.readFileSync(filename, 'utf8')); } catch { return fallback; }
+}
+
+function sleep(milliseconds) {
+  return new Promise(resolve => setTimeout(resolve, milliseconds));
+}
+
+function processEntries() {
+  const entries = [];
+  for (const name of fs.readdirSync('/proc')) {
+    if (!/^\d+$/.test(name)) continue;
+    const pid = Number(name);
+    try {
+      const args = fs.readFileSync(`/proc/${pid}/cmdline`).toString().split('\0').filter(Boolean);
+      const status = fs.readFileSync(`/proc/${pid}/status`, 'utf8');
+      const ppid = Number(status.match(/^PPid:\s+(\d+)/m)?.[1]);
+      const state = status.match(/^State:\s+(\S)/m)?.[1] || '?';
+      entries.push({ pid, ppid, state, args });
+    } catch {}
+  }
+  return entries;
+}
+
+function isAppServer(entry) {
+  return entry.args.includes('app-server');
+}
+
+function isVsCodeCodexAppServer(entry) {
+  return isAppServer(entry) && /\/\.vscode\/extensions\/openai\.chatgpt-[^/]+\/bin\/[^/]+\/codex$/.test(entry.args[0] || '');
+}
+
+function isDesktopRoot(entry) {
+  return entry.args[0] === desktopBinary && !entry.args.some(argument => argument.startsWith('--type='));
+}
+
+function descendants(entries, roots) {
+  const result = new Set(roots);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const entry of entries) {
+      if (result.has(entry.ppid) && !result.has(entry.pid)) {
+        result.add(entry.pid);
+        changed = true;
+      }
+    }
+  }
+  return [...result];
+}
+
+function processExists(pid) {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+function signalExisting(pids, signal) {
+  for (const pid of pids) {
+    try { process.kill(pid, signal); } catch (error) {
+      if (error?.code !== 'ESRCH') throw error;
+    }
+  }
+}
+
+async function waitUntil(predicate, timeoutMs, errorKind) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await sleep(100);
+  }
+  throw new Error(errorKind);
+}
+
+function discoverClientProcesses() {
+  const entries = processEntries();
+  const vscodeServers = entries.filter(isVsCodeCodexAppServer);
+  const vscodeHosts = [...new Set(vscodeServers.map(server => server.ppid))];
+  for (const hostPid of vscodeHosts) {
+    const host = entries.find(entry => entry.pid === hostPid);
+    if (!host || !host.args.includes('--utility-sub-type=node.mojom.NodeService')) {
+      throw new Error('VSCODE_EXTENSION_HOST_UNVERIFIED');
+    }
+  }
+  return {
+    vscodeHosts,
+    vscodePids: descendants(entries, vscodeHosts),
+    desktopRoots: entries.filter(isDesktopRoot).map(entry => entry.pid),
+  };
+}
+
+function launchDesktop() {
+  const child = spawn(desktopLauncher, [], { detached: true, stdio: 'ignore' });
+  child.unref();
+}
+
+async function restoreClients(lease, { removeLease = true } = {}) {
+  signalExisting([...(lease.vscodePids || [])].reverse(), 'SIGCONT');
+  if (lease.desktopWasRunning && !processEntries().some(isDesktopRoot)) launchDesktop();
+  if (removeLease) {
+    try { fs.unlinkSync(leasePath); } catch {}
+  }
+}
+
+async function watchdogMode() {
+  while (fs.existsSync(leasePath)) {
+    const lease = readJson(leasePath);
+    if (!lease?.controllerPid || !processExists(lease.controllerPid)) {
+      if (lease) await restoreClients(lease);
+      return;
+    }
+    await sleep(500);
+  }
+}
+
+function startWatchdog(lease) {
+  atomicWriteJson(leasePath, lease);
+  const child = spawn(process.execPath, [__filename, '--restore-watchdog'], {
+    detached: true,
+    stdio: 'ignore',
+    env: process.env,
+  });
+  child.unref();
+}
+
+async function acquireExclusiveClients() {
+  const discovered = discoverClientProcesses();
+  const lease = {
+    version: 1,
+    controllerPid: process.pid,
+    createdAtMs: Date.now(),
+    vscodePids: discovered.vscodePids,
+    desktopWasRunning: discovered.desktopRoots.length > 0,
+  };
+  startWatchdog(lease);
+  try {
+    // Stop extension hosts first so they cannot enqueue more work, then all
+    // descendants. SIGCONT later restores the exact same in-memory client.
+    signalExisting(discovered.vscodeHosts, 'SIGSTOP');
+    const stoppedTree = descendants(processEntries(), discovered.vscodeHosts);
+    signalExisting(stoppedTree, 'SIGSTOP');
+    lease.vscodePids = [...new Set([...lease.vscodePids, ...stoppedTree])];
+    atomicWriteJson(leasePath, lease);
+    await waitUntil(() => lease.vscodePids.every(pid => {
+      const entry = processEntries().find(candidate => candidate.pid === pid);
+      return !entry || entry.state === 'T' || entry.state === 't';
+    }), 5_000, 'VSCODE_CLIENT_NOT_QUIESCENT');
+
+    signalExisting(discovered.desktopRoots, 'SIGTERM');
+    await waitUntil(() => !processEntries().some(isDesktopRoot), 15_000, 'DESKTOP_DID_NOT_STOP');
+
+    const competitors = processEntries().filter(entry => isAppServer(entry) && entry.pid !== process.pid);
+    const unsafe = competitors.filter(entry => !isVsCodeCodexAppServer(entry) || !['T', 't'].includes(entry.state));
+    if (unsafe.length > 0) throw new Error('APP_SERVER_EXCLUSIVITY_FAILED');
+    return lease;
+  } catch (error) {
+    await restoreClients(lease);
+    throw error;
+  }
+}
+
+function activeAccountState() {
+  const registry = readJson(registryPath);
+  const globalAuth = readJson(globalAuthPath);
+  if (!registry || !globalAuth) throw new Error('ACTIVE_AUTH_STATE_MISSING');
+  const accounts = Array.isArray(registry.accounts) ? registry.accounts : Object.values(registry.accounts || {});
+  const active = accounts.find(account => account.account_key === registry.active_account_key);
+  if (!active) throw new Error('ACTIVE_ACCOUNT_MISSING');
+  const expected = { accountId: active.chatgpt_account_id || active.accountId, accountKey: active.account_key };
+  if (!expected.accountId || !expected.accountKey) throw new Error('ACTIVE_ACCOUNT_IDENTITY_INCOMPLETE');
+  const verified = verifyActiveAccountState({
+    registry,
+    globalAuth,
+    expectedAccountId: expected.accountId,
+    expectedAccountKey: expected.accountKey,
+  });
+  if (!verified.ok) throw new Error('ACTIVE_AUTH_POSTCONDITION_FAILED');
+  return { accountId: expected.accountId, accountKey: expected.accountKey };
+}
+
+function assertFreshUsableTarget(accountId) {
+  const cache = readJson(usageCachePath, {});
+  const entry = cache?.accounts?.[accountId];
+  const successAt = Number(entry?.refresh?.lastSuccessAt);
+  if (!entry || !Number.isFinite(successAt) || Date.now() - successAt > MAX_USAGE_AGE_MS) {
+    throw new Error('TARGET_USAGE_NOT_VERIFIED');
+  }
+  if (entry.refresh?.errorKind || Number(entry.refresh?.consecutiveFailures) > 0) {
+    throw new Error('TARGET_USAGE_NOT_VERIFIED');
+  }
+  if (!(Number(entry.primary?.remainingPercent) > 0 && Number(entry.secondary?.remainingPercent) > 0)) {
+    throw new Error('TARGET_ACCOUNT_NOT_USABLE');
+  }
+}
+
+function assertObserverIdle(eventState, candidate) {
+  if (!observerHealth(eventState, Date.now()).healthy) throw new Error('TURN_OBSERVER_UNVERIFIED');
+  if (Object.keys(eventState.activeTurns || {}).length > 0) throw new Error('CODEX_TURNS_STILL_ACTIVE');
+  const persisted = eventState.interruptedTurns?.[candidateKey(candidate.threadId, candidate.turnId)];
+  if (!persisted?.resumable || persisted.threadIdentityVerified !== true) throw new Error('CANDIDATE_NO_LONGER_RESUMABLE');
+  return persisted;
+}
+
+class RpcConnection {
+  constructor(child) {
+    this.child = child;
+    this.nextId = 1;
+    this.pending = new Map();
+    this.notifications = [];
+    this.waiters = new Set();
+    this.buffer = '';
+    this.failure = null;
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', chunk => this.onData(chunk));
+    child.stderr.on('data', () => {});
+    child.on('error', () => this.fail(new Error('APP_SERVER_START_FAILED')));
+    child.on('exit', () => this.fail(new Error('APP_SERVER_EXITED')));
+  }
+
+  onData(chunk) {
+    this.buffer += chunk;
+    if (this.buffer.length > 4 * 1024 * 1024) return this.fail(new Error('APP_SERVER_PROTOCOL_OVERFLOW'));
+    let newline;
+    while ((newline = this.buffer.indexOf('\n')) >= 0) {
+      const line = this.buffer.slice(0, newline);
+      this.buffer = this.buffer.slice(newline + 1);
+      if (!line.trim()) continue;
+      let message;
+      try { message = JSON.parse(line); } catch { return this.fail(new Error('APP_SERVER_PROTOCOL_MISMATCH')); }
+      this.onMessage(message);
+    }
+  }
+
+  onMessage(message) {
+    if (message.id !== undefined && !message.method) {
+      const pending = this.pending.get(message.id);
+      if (!pending) return;
+      this.pending.delete(message.id);
+      message.error ? pending.reject(new Error('APP_SERVER_REQUEST_FAILED')) : pending.resolve(message.result);
+      return;
+    }
+    if (message.id !== undefined && message.method) {
+      this.handleServerRequest(message).catch(() => {
+        this.respond(message.id, null, { code: -32603, message: 'Manual resume client could not safely answer request' });
+      });
+      return;
+    }
+    this.notifications.push(message);
+    if (this.notifications.length > 512) this.notifications.shift();
+    for (const waiter of [...this.waiters]) {
+      if (waiter.predicate(message)) {
+        this.waiters.delete(waiter);
+        waiter.resolve(message);
+      }
+    }
+  }
+
+  async handleServerRequest(message) {
+    const method = message.method;
+    if (method === 'item/commandExecution/requestApproval' || method === 'item/fileChange/requestApproval') {
+      const accepted = await ask(`${method.includes('command') ? 'Kommando' : 'Filändring'} kräver godkännande. Godkänn? [y/N] `);
+      this.respond(message.id, { decision: /^y(es)?$/i.test(accepted.trim()) ? 'accept' : 'decline' });
+      return;
+    }
+    if (method === 'item/permissions/requestApproval') {
+      this.respond(message.id, { permissions: {} });
+      return;
+    }
+    if (method === 'item/tool/requestUserInput') {
+      this.respond(message.id, { answers: {} });
+      return;
+    }
+    if (method === 'mcpServer/elicitation/request') {
+      this.respond(message.id, { action: 'decline', content: null });
+      return;
+    }
+    this.respond(message.id, null, { code: -32601, message: 'Unsupported server request during manual resume' });
+  }
+
+  respond(id, result, error = null) {
+    this.child.stdin.write(`${JSON.stringify(error ? { id, error } : { id, result })}\n`);
+  }
+
+  request(method, params) {
+    if (this.failure) return Promise.reject(this.failure);
+    const id = this.nextId++;
+    const promise = new Promise((resolve, reject) => this.pending.set(id, { resolve, reject }));
+    this.child.stdin.write(`${JSON.stringify({ id, method, params })}\n`);
+    return promise;
+  }
+
+  notify(method, params = {}) {
+    this.child.stdin.write(`${JSON.stringify({ method, params })}\n`);
+  }
+
+  waitFor(predicate) {
+    const index = this.notifications.findIndex(predicate);
+    if (index >= 0) return Promise.resolve(this.notifications.splice(index, 1)[0]);
+    return new Promise((resolve, reject) => this.waiters.add({ predicate, resolve, reject }));
+  }
+
+  fail(error) {
+    if (this.failure) return;
+    this.failure = error;
+    for (const pending of this.pending.values()) pending.reject(error);
+    for (const waiter of this.waiters) waiter.reject(error);
+    this.pending.clear();
+    this.waiters.clear();
+  }
+}
+
+function ask(prompt) {
+  const terminal = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise(resolve => terminal.question(prompt, answer => { terminal.close(); resolve(answer); }));
+}
+
+function withTimeout(promise, milliseconds) {
+  let timer;
+  return Promise.race([
+    promise.finally(() => clearTimeout(timer)),
+    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('APP_SERVER_TIMEOUT')), milliseconds); }),
+  ]);
+}
+
+async function terminateChild(child) {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const exited = once(child, 'exit').catch(() => {});
+  child.stdin.end();
+  child.kill('SIGTERM');
+  await Promise.race([exited, sleep(1500)]);
+  if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+}
+
+async function runResume(candidate, targetAccountId, onCommit) {
+  const child = spawn(codexBin, ['-c', 'features.code_mode_host=true', 'app-server', '--analytics-default-enabled'], {
+    cwd: candidate.cwd || os.homedir(),
+    env: { ...process.env, CODEX_HOME: codexHome },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  const rpc = new RpcConnection(child);
+  try {
+    return await withTimeout((async () => {
+      await rpc.request('initialize', {
+        clientInfo: { name: 'codex_manual_resume', title: 'Codex Manual Resume', version: '1.0.0' },
+        capabilities: { experimentalApi: true, requestAttestation: false },
+      });
+      rpc.notify('initialized');
+      const read = await rpc.request('thread/read', { threadId: candidate.threadId, includeTurns: true });
+      const eventState = readJson(eventStatePath, {});
+      const resumeState = normalizeResumeState(readJson(resumeStatePath, emptyResumeState()));
+      validateThreadForResume({ candidate, thread: read?.thread, eventState, resumeState });
+      const resumed = await rpc.request('thread/resume', { threadId: candidate.threadId });
+      if (resumed?.thread?.id !== candidate.threadId || resumed.thread.status?.type !== 'idle') {
+        throw new Error('THREAD_RESUME_POSTCONDITION_FAILED');
+      }
+      await onCommit();
+      const started = await rpc.request('turn/start', {
+        threadId: candidate.threadId,
+        input: [{ type: 'text', text: CONTINUATION_PROMPT }],
+        turnTrigger: 'manual-quota-resume',
+      });
+      const turnId = started?.turn?.id;
+      if (!turnId) throw new Error('TURN_START_OUTCOME_UNKNOWN');
+      const terminal = await rpc.waitFor(message =>
+        message.method === 'turn/completed' &&
+        message.params?.threadId === candidate.threadId &&
+        message.params?.turn?.id === turnId
+      );
+      return {
+        turnId,
+        status: terminal.params.turn.status,
+        errorKind: codexErrorKind(terminal.params.turn.error),
+        targetAccountId,
+      };
+    })(), TURN_TIMEOUT_MS);
+  } finally {
+    await terminateChild(child);
+  }
+}
+
+function acquireLock() {
+  fs.mkdirSync(path.dirname(lockPath), { recursive: true, mode: 0o700 });
+  try {
+    fs.mkdirSync(lockPath, { mode: 0o700 });
+    fs.writeFileSync(path.join(lockPath, 'owner'), `${process.pid}\n`, { mode: 0o600 });
+    return lockPath;
+  } catch (error) {
+    if (error?.code !== 'EEXIST') throw error;
+    const owner = Number(fs.readFileSync(path.join(lockPath, 'owner'), 'utf8').trim());
+    if (processExists(owner)) throw new Error('RESUME_ALREADY_RUNNING');
+    try { fs.unlinkSync(path.join(lockPath, 'owner')); } catch {}
+    fs.rmdirSync(lockPath);
+    return acquireLock();
+  }
+}
+
+function releaseLock() {
+  try { fs.unlinkSync(path.join(lockPath, 'owner')); } catch {}
+  try { fs.rmdirSync(lockPath); } catch {}
+}
+
+async function main() {
+  if (process.argv.includes('--restore-watchdog')) return watchdogMode();
+  const eventState = normalizeState(readJson(eventStatePath, {}), Date.now());
+  const resumeState = normalizeResumeState(readJson(resumeStatePath, emptyResumeState()));
+  const candidates = pendingInterruptedTurns(eventState, resumeState);
+  if (process.argv.includes('--list')) {
+    for (const candidate of candidates) {
+      process.stdout.write(`${candidate.threadId}\t${candidate.turnId}\t${candidate.accountId || '-'}\n`);
+    }
+    return;
+  }
+  const threadId = process.argv[2];
+  const turnId = process.argv[3];
+  const candidate = candidates.find(item => item.threadId === threadId && item.turnId === turnId);
+  if (!candidate) throw new Error('CANDIDATE_NOT_FOUND');
+  const lock = acquireLock();
+  let lease = null;
+  let committed = false;
+  try {
+    const freshEventState = normalizeState(readJson(eventStatePath, {}), Date.now());
+    const persisted = assertObserverIdle(freshEventState, candidate);
+    const target = activeAccountState();
+    if (target.accountId === persisted.accountId) throw new Error('SWITCH_TO_DIFFERENT_ACCOUNT_REQUIRED');
+    assertFreshUsableTarget(target.accountId);
+    process.stdout.write(`Fortsätter tråd …${threadId.slice(-8)} med det aktiva kontot. Desktop och VS Code Codex pausas tillfälligt.\n`);
+    lease = await acquireExclusiveClients();
+    const revalidatedEventState = normalizeState(readJson(eventStatePath, {}), Date.now());
+    assertObserverIdle(revalidatedEventState, persisted);
+    const revalidatedTarget = activeAccountState();
+    if (revalidatedTarget.accountId !== target.accountId) throw new Error('ACTIVE_ACCOUNT_CHANGED');
+    assertFreshUsableTarget(target.accountId);
+
+    const result = await runResume(persisted, target.accountId, async () => {
+      let journal = normalizeResumeState(readJson(resumeStatePath, emptyResumeState()));
+      journal = markResumeCommitted(journal, persisted, { targetAccountId: target.accountId });
+      atomicWriteJson(resumeStatePath, journal);
+      committed = true;
+    });
+    const finalTarget = activeAccountState();
+    if (finalTarget.accountId !== target.accountId || finalTarget.accountKey !== target.accountKey) {
+      throw new Error('ACTIVE_ACCOUNT_CHANGED_AFTER_COMMIT');
+    }
+    let journal = normalizeResumeState(readJson(resumeStatePath, emptyResumeState()));
+    journal = markResumeTerminal(journal, persisted, result);
+    atomicWriteJson(resumeStatePath, journal);
+    process.stdout.write(`Fortsättningsturnen avslutades med status ${result.status}. Klienterna återställs.\n`);
+  } catch (error) {
+    let journal = normalizeResumeState(readJson(resumeStatePath, emptyResumeState()));
+    journal = markResumeFailure(journal, candidate, error?.message || 'MANUAL_RESUME_FAILED', { committed });
+    atomicWriteJson(resumeStatePath, journal);
+    process.stderr.write(`MANUAL_REQUIRED: ${error?.message || 'MANUAL_RESUME_FAILED'}\n`);
+    process.exitCode = 1;
+  } finally {
+    if (lease) await restoreClients(lease);
+    releaseLock(lock);
+  }
+}
+
+main().catch(error => {
+  process.stderr.write(`MANUAL_REQUIRED: ${error?.message || 'MANUAL_RESUME_FAILED'}\n`);
+  process.exitCode = 1;
+});

@@ -11,6 +11,7 @@ const {
   emptyEventState,
   normalizeState,
   pruneEventState,
+  turnKey,
 } = require(path.join(__dirname, '..', 'lib', 'codex-turn-observer'));
 
 const codexHome = process.env.CODEX_HOME || path.join(process.env.HOME, '.codex');
@@ -108,7 +109,7 @@ function relativeFile(filename) {
   return path.relative(codexHome, filename);
 }
 
-function sessionIdFromFirstRecord(filename) {
+function threadIdentityFromFirstRecord(filename) {
   let descriptor;
   try {
     descriptor = fs.openSync(filename, 'r');
@@ -131,7 +132,13 @@ function sessionIdFromFirstRecord(filename) {
     const firstLine = Buffer.concat(chunks).subarray(0, newlineAt).toString('utf8');
     const record = JSON.parse(firstLine);
     if (record?.type !== 'session_meta') return null;
-    return record.payload?.session_id || record.payload?.id || null;
+    const payload = record.payload || {};
+    if (!payload.id) return null;
+    return {
+      threadId: payload.id,
+      parentThreadId: payload.parent_thread_id || null,
+      threadSource: payload.thread_source || null,
+    };
   } catch {
     return null;
   } finally {
@@ -142,19 +149,20 @@ function sessionIdFromFirstRecord(filename) {
 function readNewRecords(filename, checkpoint, initializeAtEnd) {
   const stat = fs.statSync(filename);
   if (!checkpoint) {
+    const identity = threadIdentityFromFirstRecord(filename);
     return {
       records: [],
       checkpoint: {
         offset: initializeAtEnd ? stat.size : 0,
         size: stat.size,
-        sessionId: sessionIdFromFirstRecord(filename),
+        ...identity,
         mtimeMs: stat.mtimeMs,
       },
     };
   }
-  const checkpointWithSession = checkpoint.sessionId
+  const checkpointWithSession = checkpoint.threadId
     ? checkpoint
-    : { ...checkpoint, sessionId: sessionIdFromFirstRecord(filename) };
+    : { ...checkpoint, ...threadIdentityFromFirstRecord(filename) };
   let offset = Number(checkpointWithSession.offset) || 0;
   if (stat.size < offset) offset = 0;
   if (stat.size === offset) {
@@ -234,18 +242,24 @@ function scan() {
       const checkpoint = state.files[batch.key];
       for (const record of batch.records) {
         if (record.type === 'session_meta') {
-          checkpoint.sessionId = record.payload?.session_id || record.payload?.id || checkpoint.sessionId;
+          checkpoint.threadId = record.payload?.id || checkpoint.threadId;
+          checkpoint.parentThreadId = record.payload?.parent_thread_id || null;
+          checkpoint.threadSource = record.payload?.thread_source || null;
           continue;
         }
         const eventAtMs = recordTime(record, nowMs);
         const recent = Math.abs(nowMs - eventAtMs) <= bindingMaxDelayMs;
         const payload = record.payload || {};
-        const existing = payload.turn_id ? state.activeTurns[payload.turn_id] : null;
+        const existing = payload.turn_id && checkpoint.threadId
+          ? state.activeTurns[turnKey(checkpoint.threadId, payload.turn_id)]
+          : null;
         state = applyRolloutRecord(state, record, {
-          threadId: checkpoint.sessionId,
+          threadId: checkpoint.threadId,
           accountId: existing?.accountId || (payload.type === 'task_started' && recent ? stableIdentity?.accountId : null),
           accountKey: existing?.accountKey || (payload.type === 'task_started' && recent ? stableIdentity?.accountKey : null),
-          title: checkpoint.sessionId ? titleForThread(checkpoint.sessionId) : null,
+          title: checkpoint.threadId ? titleForThread(checkpoint.threadId) : null,
+          parentThreadId: checkpoint.parentThreadId,
+          threadSource: checkpoint.threadSource,
           observedAtMs: nowMs,
           nowMs,
         });
@@ -253,6 +267,9 @@ function scan() {
     }
     for (const turn of Object.values(state.activeTurns)) {
       if (!turn.title) turn.title = titleForThread(turn.threadId);
+    }
+    for (const candidate of Object.values(state.interruptedTurns || {})) {
+      if (!candidate.title) candidate.title = titleForThread(candidate.threadId);
     }
     state = clearRecoveredExhaustions(state, readJson(usageCachePath, {}));
     state = pruneEventState(state, nowMs);

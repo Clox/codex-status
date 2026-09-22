@@ -105,6 +105,17 @@ test('terminally verified exhausted account ranks behind and is never recommende
   assert.equal(recommendAccount(ranked).account.sourceRow, '1');
 });
 
+test('verified exhaustion on ACTIVE excludes it but does not pause a safe alternative', () => {
+  const ranked = rankAccounts([
+    account(1, { active: true, verifiedExhausted: true, weeklyRemaining: 60, fiveHourRemaining: 60 }),
+    account(2, { weeklyRemaining: 30, fiveHourRemaining: 40 }),
+  ], { nowMs: NOW_MS });
+  const recommendation = recommendAccount(ranked);
+  assert.equal(recommendation.action, 'switch');
+  assert.equal(recommendation.account.sourceRow, '2');
+  assert.equal(recommendation.reason, 'ranked-best');
+});
+
 test('a stale active account pauses recommendation until refresh recovers', () => {
   const ranked = rankAccounts([
     account(1, { active: true, usageQuality: 'stale' }),

@@ -29,6 +29,7 @@ const codexLoginBin = process.env.CODEX_LOGIN_BIN || '/usr/lib/chatgpt/resources
 const registryPath = path.join(codexHome, 'accounts', 'registry.json');
 const globalAuthPath = path.join(codexHome, 'auth.json');
 const lockPath = `${usageCachePath}.auth-repair.lock`;
+const operationLockPath = path.join(path.dirname(usageCachePath), 'exclusive-codex-operation.lock');
 const activationLockDirectory = path.join(path.dirname(usageCachePath), 'activation-locks');
 
 function fail(message, code = 1) {
@@ -128,6 +129,33 @@ function acquireLock() {
   }
 }
 
+function acquireOperationLock() {
+  fs.mkdirSync(path.dirname(operationLockPath), { recursive: true, mode: 0o700 });
+  try {
+    fs.mkdirSync(operationLockPath, { mode: 0o700 });
+    fs.writeFileSync(path.join(operationLockPath, 'owner'), `${process.pid}\n`, { mode: 0o600 });
+    return operationLockPath;
+  } catch (error) {
+    if (error.code !== 'EEXIST') throw error;
+    let owner = null;
+    try { owner = Number(fs.readFileSync(path.join(operationLockPath, 'owner'), 'utf8').trim()); } catch {}
+    try {
+      if (Number.isInteger(owner) && owner > 0) process.kill(owner, 0);
+      fail('Another exclusive Codex operation is already running.', 75);
+    } catch (processError) {
+      if (processError.code !== 'ESRCH') throw processError;
+      try { fs.unlinkSync(path.join(operationLockPath, 'owner')); } catch {}
+      fs.rmdirSync(operationLockPath);
+      return acquireOperationLock();
+    }
+  }
+}
+
+function releaseOperationLock() {
+  try { fs.unlinkSync(path.join(operationLockPath, 'owner')); } catch {}
+  try { fs.rmdirSync(operationLockPath); } catch {}
+}
+
 async function chooseTarget(accounts) {
   if (accounts.length === 1) return accounts[0];
   process.stdout.write('Accounts requiring authentication repair:\n');
@@ -144,7 +172,8 @@ async function chooseTarget(accounts) {
 }
 
 async function main() {
-  const lockFd = acquireLock();
+  const operationLock = acquireOperationLock();
+  let lockFd = null;
   let stagingRoot = null;
   let rollbackRoot = null;
   let mutationStarted = false;
@@ -158,6 +187,7 @@ async function main() {
   let accountActivationLock = null;
 
   try {
+    lockFd = acquireLock();
     const beforeRegistry = readJson(registryPath);
     const beforeGlobalAuth = readJson(globalAuthPath);
     const usageCache = readJson(usageCachePath);
@@ -297,8 +327,11 @@ async function main() {
     if (stagingRoot) fs.rmSync(stagingRoot, { recursive: true, force: true });
     if (rollbackRoot) fs.rmSync(rollbackRoot, { recursive: true, force: true });
     releaseAccountActivationLock(accountActivationLock);
-    try { fs.closeSync(lockFd); } catch {}
-    try { fs.unlinkSync(lockPath); } catch {}
+    if (lockFd !== null) {
+      try { fs.closeSync(lockFd); } catch {}
+      try { fs.unlinkSync(lockPath); } catch {}
+    }
+    if (operationLock) releaseOperationLock();
   }
 }
 
