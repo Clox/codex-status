@@ -91,6 +91,7 @@ test('repair followed by fresh refresh uses server usage despite missing registr
   const output = render(ranked[0]);
 
   assert.equal(row.usageQuality, 'verified');
+  assert.match(output, /\x1b\[1;32mOK {3}\x1b\[0m(?:\x1b\[1m)?│/);
   assert.match(output, /account-c@example\.c/);
   assert.match(output.replace(/\x1b\[[0-9;]*m/g, ''), /100%█████\(5:00\)/);
   assert.match(output.replace(/\x1b\[[0-9;]*m/g, ''), /11%▌ {4}\(12:00\)/);
@@ -137,6 +138,7 @@ test('active marker stays primary while only account text is bold and separators
   assert.match(output, /\x1b\[38;2;[^m]+m[^\x1b]+\x1b\[0m\x1b\[1m/);
   assert.match(output, /\x1b\[0m$/);
   assert.match(plain, /^\*01/);
+  assert.match(plain, /│OK {3}│/);
   assert.doesNotMatch(plain, /ACTIVE|ACTE/);
   assert.match(plain, /78%███▉/);
   assert.match(plain, /42%██▏/);
@@ -164,6 +166,34 @@ test('pending switch uses a compact spinner frame without moving the active mark
   assert.match(plain, /WAIT\\/);
   assert.match(output, /\x1b\[1;33mWAIT\\/);
   assert.match(output, /\x1b\[38;2;/);
+  assert.doesNotMatch(output, /\x1b\[1;32mOK/);
+});
+
+test('OK status is never used for stale, unverified, explicitly unusable, or exhausted accounts', () => {
+  const account = { chatgpt_account_id: 'account-c', email: 'account-c@example.com' };
+  const base = {
+    primary: { remainingPercent: 78, resetsAt: NOW_MS / 1000 + 7200 },
+    secondary: { remainingPercent: 42, resetsAt: NOW_MS / 1000 + 7200 },
+  };
+  const stale = normalize({ account, serverEntry: {
+    ...base,
+    refresh: { lastSuccessAt: NOW_MS - 4 * 60_000, lastAttemptAt: NOW_MS, errorKind: 'network', consecutiveFailures: 1 },
+  } });
+  const unusable = normalize({ account, serverEntry: {
+    ...base,
+    ordinaryUsageAllowed: false,
+    ordinaryUsageAllowedObserved: true,
+    refresh: { lastSuccessAt: NOW_MS, lastAttemptAt: NOW_MS, errorKind: null, consecutiveFailures: 0 },
+  } });
+  const exhausted = normalizeExhausted({ account, serverEntry: {
+    ...base,
+    refresh: { lastSuccessAt: NOW_MS, lastAttemptAt: NOW_MS, errorKind: null, consecutiveFailures: 0 },
+  } });
+
+  assert.doesNotMatch(render(rankAccounts([stale], { nowMs: NOW_MS })[0]), /\x1b\[1;32mOK/);
+  assert.doesNotMatch(render(rankAccounts([unusable], { nowMs: NOW_MS })[0]), /\x1b\[1;32mOK/);
+  assert.doesNotMatch(render(rankAccounts([normalize()], { nowMs: NOW_MS })[0]), /\x1b\[1;32mOK/);
+  assert.doesNotMatch(render(rankAccounts([exhausted], { nowMs: NOW_MS })[0]), /\x1b\[1;32mOK/);
 });
 
 test('verified account-level exhaustion is rendered without inventing a 5H or weekly pool', () => {
