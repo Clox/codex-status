@@ -1,0 +1,12 @@
+[Unit]
+Description=Check for verified Codex quota-interrupted turns
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=30s
+AccuracySec=2s
+Persistent=false
+Unit=codex-auto-continue.service
+
+[Install]
+WantedBy=timers.target

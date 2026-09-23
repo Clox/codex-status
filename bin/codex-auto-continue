@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+config_home=${XDG_CONFIG_HOME:-"$HOME/.config"}
+config_file="$config_home/codex-account-switcher/accounts.conf"
+if [[ ! -r $config_file ]]; then
+  printf 'Missing configuration: %s\n' "$config_file" >&2
+  exit 78
+fi
+# shellcheck source=/dev/null
+source "$config_file"
+
+export CODEX_HOME ACCOUNT_1 ACCOUNT_2 ACCOUNT_3 CODEX_AUTH_BIN
+export CHATGPT_LAUNCHER CHATGPT_BINARY_PATTERN USAGE_REFRESHER USAGE_CACHE
+export CODEX_EVENT_STATE CODEX_RESUME_STATE CODEX_STATUS_PREFERENCES
+export CODEX_AUTO_CONTINUE_STATE
+export PATH="$NODE_BIN_DIR:${PATH:-/usr/local/bin:/usr/bin:/bin}"
+
+CODEX_MANUAL_RESUME=${CODEX_MANUAL_RESUME:-"$HOME/.local/bin/codex-manual-resume"}
+exec "$CODEX_MANUAL_RESUME" --auto

@@ -33,6 +33,60 @@ test('zero percent alone never arms verified total exhaustion', () => {
   assert.deepEqual(snapshot.usableAccounts.map(entry => entry.accountId), ['b']);
 });
 
+test('fresh positive quota is usable when the optional ordinary-usage flag is absent', () => {
+  const snapshot = quotaAvailabilitySnapshot([
+    account('a', {
+      ordinaryUsageAllowed: null,
+      ordinaryUsageAllowedObserved: false,
+      fiveHourRemaining: 89,
+      weeklyRemaining: 83,
+    }),
+    account('b', { verifiedExhausted: true }),
+  ]);
+  assert.equal(snapshot.verified, true);
+  assert.equal(snapshot.totalExhaustion, false);
+  assert.deepEqual(snapshot.usableAccounts, [{ accountId: 'a', label: 'Account a' }]);
+  const armed = {
+    ...emptyQuotaTransitionState(),
+    armed: true,
+    phase: 'total-exhaustion',
+  };
+  const recovered = advanceQuotaTransition(armed, snapshot, NOW);
+  assert.deepEqual(recovered.event.accounts, [{ accountId: 'a', label: 'Account a' }]);
+  assert.equal(advanceQuotaTransition(recovered.state, snapshot, NOW + 1).event, null);
+});
+
+test('an explicit ordinary-usage denial still prevents recovery despite positive percentages', () => {
+  const snapshot = quotaAvailabilitySnapshot([
+    account('a', {
+      ordinaryUsageAllowed: false,
+      ordinaryUsageAllowedObserved: true,
+      fiveHourRemaining: 89,
+      weeklyRemaining: 83,
+    }),
+  ]);
+  assert.equal(snapshot.verified, true);
+  assert.equal(snapshot.totalExhaustion, true);
+  assert.deepEqual(snapshot.usableAccounts, []);
+});
+
+test('simultaneously recovered accounts produce one event listing every usable account', () => {
+  const snapshot = quotaAvailabilitySnapshot([
+    account('a', { ordinaryUsageAllowed: null, ordinaryUsageAllowedObserved: false }),
+    account('b', { ordinaryUsageAllowed: true, ordinaryUsageAllowedObserved: true }),
+  ]);
+  const result = advanceQuotaTransition({
+    ...emptyQuotaTransitionState(),
+    armed: true,
+    phase: 'total-exhaustion',
+  }, snapshot, NOW);
+  assert.equal(result.event.type, 'quota-available');
+  assert.deepEqual(result.event.accounts, [
+    { accountId: 'a', label: 'Account a' },
+    { accountId: 'b', label: 'Account b' },
+  ]);
+});
+
 test('fresh authoritative quota denial arms and one verified recovery notifies once', () => {
   const exhausted = quotaAvailabilitySnapshot([
     account('a', { verifiedExhausted: true }),

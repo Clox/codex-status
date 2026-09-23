@@ -91,7 +91,7 @@ test('repair followed by fresh refresh uses server usage despite missing registr
   const output = render(ranked[0]);
 
   assert.equal(row.usageQuality, 'verified');
-  assert.match(output, /\x1b\[1;32mOK {3}\x1b\[0m(?:\x1b\[1m)?│/);
+  assert.match(output, /\x1b\[1;32m OK {2}\x1b\[0m(?:\x1b\[1m)?│/);
   assert.match(output, /account-c@example\.c/);
   assert.match(output.replace(/\x1b\[[0-9;]*m/g, ''), /100%█████\(5:00\)/);
   assert.match(output.replace(/\x1b\[[0-9;]*m/g, ''), /11%▌ {4}\(12:00\)/);
@@ -138,7 +138,7 @@ test('active marker stays primary while only account text is bold and separators
   assert.match(output, /\x1b\[38;2;[^m]+m[^\x1b]+\x1b\[0m\x1b\[1m/);
   assert.match(output, /\x1b\[0m$/);
   assert.match(plain, /^\*01/);
-  assert.match(plain, /│OK {3}│/);
+  assert.match(plain, /│ OK {2}│/);
   assert.doesNotMatch(plain, /ACTIVE|ACTE/);
   assert.match(plain, /78%███▉/);
   assert.match(plain, /42%██▏/);

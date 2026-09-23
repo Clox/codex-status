@@ -7,11 +7,12 @@ const os = require('node:os');
 const path = require('node:path');
 const readline = require('node:readline');
 const { once } = require('node:events');
-const { spawn } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 const {
   CONTINUATION_PROMPT,
   appServerExclusivityReport,
   atomicWriteJson,
+  automaticClientBlocker,
   candidateKey,
   codexErrorKind,
   emptyResumeState,
@@ -29,12 +30,23 @@ const {
 } = require(path.join(__dirname, '..', 'lib', 'codex-manual-resume'));
 const { normalizeState, observerHealth } = require(path.join(__dirname, '..', 'lib', 'codex-turn-observer'));
 const { verifyActiveAccountState } = require(path.join(__dirname, '..', 'lib', 'codex-account-state'));
+const {
+  automationDecision,
+  emptyAutoContinueState,
+  sameDecisionPlan,
+} = require(path.join(__dirname, '..', 'lib', 'codex-auto-continue'));
+const {
+  defaultStatusPreferencesPath,
+  readStatusPreferences,
+} = require(path.join(__dirname, '..', 'lib', 'codex-status-preferences'));
 
 const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
 const cacheDirectory = path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache'), 'codex-account-switcher');
 const eventStatePath = process.env.CODEX_EVENT_STATE || path.join(cacheDirectory, 'turn-events.json');
 const usageCachePath = process.env.USAGE_CACHE || path.join(cacheDirectory, 'usage.json');
 const resumeStatePath = process.env.CODEX_RESUME_STATE || path.join(cacheDirectory, 'manual-resume.json');
+const autoContinueStatePath = process.env.CODEX_AUTO_CONTINUE_STATE || path.join(cacheDirectory, 'auto-continue.json');
+const statusPreferencesPath = process.env.CODEX_STATUS_PREFERENCES || defaultStatusPreferencesPath();
 const leasePath = `${resumeStatePath}.client-lease.json`;
 const lockPath = path.join(cacheDirectory, 'exclusive-codex-operation.lock');
 const registryPath = path.join(codexHome, 'accounts', 'registry.json');
@@ -42,6 +54,8 @@ const globalAuthPath = path.join(codexHome, 'auth.json');
 const codexBin = process.env.CODEX_LOGIN_BIN || '/usr/lib/chatgpt/resources/codex';
 const desktopLauncher = process.env.CHATGPT_LAUNCHER || '/usr/bin/chatgpt';
 const desktopBinary = process.env.CHATGPT_BINARY_PATTERN || '/usr/lib/chatgpt/ChatGPT';
+const codexAuthBin = process.env.CODEX_AUTH_BIN || 'codex-auth';
+const usageRefresher = process.env.USAGE_REFRESHER || path.join(os.homedir(), '.local', 'bin', 'codex-usage-refresh');
 const MAX_USAGE_AGE_MS = 3 * 60 * 1000;
 const TURN_TIMEOUT_MS = 12 * 60 * 60 * 1000;
 const MAX_PROTOCOL_FRAME_BYTES = 4 * 1024 * 1024;
@@ -187,8 +201,14 @@ function startWatchdog(lease) {
   child.unref();
 }
 
-async function acquireExclusiveClients() {
+async function acquireExclusiveClients({ autoMode = false } = {}) {
   const discovered = discoverClientProcesses();
+  const autoBlocker = autoMode ? automaticClientBlocker(processEntries()) : null;
+  if (autoBlocker) {
+    const error = new Error(autoBlocker.errorKind);
+    error.diagnostics = autoBlocker;
+    throw error;
+  }
   const lease = {
     version: 1,
     controllerPid: process.pid,
@@ -267,7 +287,7 @@ function assertObserverIdle(eventState, candidate) {
 }
 
 class RpcConnection {
-  constructor(child) {
+  constructor(child, { interactiveApprovals = true } = {}) {
     this.child = child;
     this.nextId = 1;
     this.pending = new Map();
@@ -277,6 +297,7 @@ class RpcConnection {
     this.failure = null;
     this.phase = 'startup';
     this.receivedMessages = [];
+    this.interactiveApprovals = interactiveApprovals;
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', chunk => this.onData(chunk));
     child.stderr.on('data', () => {});
@@ -343,6 +364,10 @@ class RpcConnection {
   async handleServerRequest(message) {
     const method = message.method;
     if (method === 'item/commandExecution/requestApproval' || method === 'item/fileChange/requestApproval') {
+      if (!this.interactiveApprovals) {
+        this.respond(message.id, { decision: 'decline' });
+        return;
+      }
       const accepted = await ask(`${method.includes('command') ? 'Kommando' : 'Filändring'} kräver godkännande. Godkänn? [y/N] `);
       this.respond(message.id, { decision: /^y(es)?$/i.test(accepted.trim()) ? 'accept' : 'decline' });
       return;
@@ -416,13 +441,13 @@ async function terminateChild(child) {
   if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
 }
 
-async function runResume(candidate, targetAccountId, onCommit) {
+async function runResume(candidate, targetAccountId, onCommit, { automatic = false } = {}) {
   const child = spawn(codexBin, ['-c', 'features.code_mode_host=true', 'app-server', '--analytics-default-enabled'], {
     cwd: candidate.cwd || os.homedir(),
     env: { ...process.env, CODEX_HOME: codexHome },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
-  const rpc = new RpcConnection(child);
+  const rpc = new RpcConnection(child, { interactiveApprovals: !automatic });
   try {
     return await withTimeout((async () => {
       const requests = resumeProtocolRequests(candidate.threadId);
@@ -454,12 +479,12 @@ async function runResume(candidate, targetAccountId, onCommit) {
         resumeState: normalizeResumeState(readJson(resumeStatePath, emptyResumeState())),
       });
       rpc.setPhase('pre-turn-commit');
-      await onCommit();
+      await onCommit(child.pid);
       rpc.setPhase('turn-start');
       const started = await rpc.request('turn/start', {
         threadId: candidate.threadId,
         input: [{ type: 'text', text: CONTINUATION_PROMPT }],
-        turnTrigger: 'manual-quota-resume',
+        turnTrigger: automatic ? 'automatic-quota-resume' : 'manual-quota-resume',
       });
       const turnId = started?.turn?.id;
       if (!turnId) throw new Error('TURN_START_OUTCOME_UNKNOWN');
@@ -502,8 +527,228 @@ function releaseLock() {
   try { fs.rmdirSync(lockPath); } catch {}
 }
 
+function autoSelectors() {
+  const selectors = [process.env.ACCOUNT_1, process.env.ACCOUNT_2, process.env.ACCOUNT_3];
+  if (selectors.some(selector => !selector)) throw new Error('AUTO_ACCOUNT_SELECTORS_MISSING');
+  return selectors;
+}
+
+function autoDecisionSnapshot(nowMs = Date.now()) {
+  const preferences = readStatusPreferences(statusPreferencesPath);
+  const registry = readJson(registryPath);
+  const globalAuth = readJson(globalAuthPath);
+  const usageCache = readJson(usageCachePath);
+  const eventState = normalizeState(readJson(eventStatePath, {}), nowMs);
+  const resumeState = normalizeResumeState(readJson(resumeStatePath, emptyResumeState()));
+  if (!registry || !globalAuth || !usageCache) throw new Error('AUTO_STATE_MISSING');
+  return automationDecision({
+    preferences,
+    registry,
+    globalAuth,
+    usageCache,
+    eventState,
+    resumeState,
+    selectors: autoSelectors(),
+    nowMs,
+  });
+}
+
+function writeAutoContinueState(patch) {
+  const previous = readJson(autoContinueStatePath, emptyAutoContinueState());
+  atomicWriteJson(autoContinueStatePath, {
+    ...emptyAutoContinueState(),
+    ...previous,
+    ...patch,
+    version: 1,
+    heartbeatAtMs: Date.now(),
+  });
+}
+
+function refreshUsageNow() {
+  const result = spawnSync(usageRefresher, [], {
+    env: { ...process.env, USAGE_REFRESH_INTERVAL_MS: '0' },
+    stdio: 'ignore',
+    timeout: 30_000,
+  });
+  if (result.error || result.status !== 0) throw new Error('AUTO_USAGE_REFRESH_FAILED');
+}
+
+function switchToTarget(target) {
+  const before = activeAccountState();
+  if (before.accountId === target.accountId && before.accountKey === target.accountKey) return false;
+  const result = spawnSync(codexAuthBin, ['switch', target.selector], {
+    stdio: 'ignore',
+    timeout: 60_000,
+  });
+  if (result.error || result.status !== 0) throw new Error('AUTO_ACCOUNT_SWITCH_FAILED');
+  const after = activeAccountState();
+  if (after.accountId !== target.accountId || after.accountKey !== target.accountKey) {
+    throw new Error('AUTO_ACCOUNT_SWITCH_POSTCONDITION_FAILED');
+  }
+  return true;
+}
+
+function assertAutomaticOwnership(controlledAppServerPid = null) {
+  const entries = processEntries();
+  const autoBlocker = automaticClientBlocker(entries);
+  if (autoBlocker) throw new Error(autoBlocker.errorKind);
+  const discovered = discoverClientProcesses();
+  if (discovered.desktopRoots.length > 0) throw new Error('AUTO_DESKTOP_REAPPEARED');
+  const report = appServerExclusivityReport(entries, {
+    ignoredPids: [process.pid, controlledAppServerPid].filter(Boolean),
+  });
+  if (!report.exclusive) {
+    const error = new Error('APP_SERVER_EXCLUSIVITY_FAILED');
+    error.diagnostics = { blockers: report.blockers };
+    throw error;
+  }
+}
+
+async function waitForObserverIdleAfterTurn(timeoutMs = 15_000) {
+  await waitUntil(() => {
+    const state = normalizeState(readJson(eventStatePath, {}), Date.now());
+    return observerHealth(state, Date.now()).healthy && Object.keys(state.activeTurns || {}).length === 0;
+  }, timeoutMs, 'TURN_OBSERVER_DID_NOT_SETTLE');
+}
+
+async function automaticMain() {
+  const initial = autoDecisionSnapshot();
+  if (initial.action !== 'resume') {
+    writeAutoContinueState({
+      status: initial.action,
+      lastAttemptAtMs: Date.now(),
+      errorKind: initial.action === 'blocked' ? initial.reason : null,
+      actionRequired: initial.actionRequired === true,
+      candidateThreadId: null,
+      candidateTurnId: null,
+      targetAccountId: null,
+    });
+    return;
+  }
+
+  let lock = null;
+  let lease = null;
+  let currentCandidate = null;
+  let committed = false;
+  try {
+    lock = acquireLock();
+    const lockedPlan = autoDecisionSnapshot();
+    if (!sameDecisionPlan(initial, lockedPlan)) throw new Error('AUTO_PLAN_CHANGED_BEFORE_OWNERSHIP');
+    writeAutoContinueState({
+      status: 'running',
+      lastAttemptAtMs: Date.now(),
+      errorKind: null,
+      actionRequired: false,
+      candidateThreadId: lockedPlan.candidates[0]?.threadId || null,
+      candidateTurnId: lockedPlan.candidates[0]?.turnId || null,
+      targetAccountId: lockedPlan.target.accountId,
+    });
+
+    lease = await acquireExclusiveClients({ autoMode: true });
+    assertAutomaticOwnership();
+    const ownedPlan = autoDecisionSnapshot();
+    if (!sameDecisionPlan(lockedPlan, ownedPlan)) throw new Error('AUTO_PLAN_CHANGED_BEFORE_SWITCH');
+    switchToTarget(ownedPlan.target);
+    refreshUsageNow();
+    const switchedPlan = autoDecisionSnapshot();
+    if (!sameDecisionPlan(ownedPlan, switchedPlan)) throw new Error('AUTO_PLAN_CHANGED_AFTER_SWITCH');
+
+    const plannedCandidates = [...switchedPlan.candidates];
+    for (let index = 0; index < plannedCandidates.length; index += 1) {
+      currentCandidate = plannedCandidates[index];
+      committed = false;
+      await waitForObserverIdleAfterTurn();
+      refreshUsageNow();
+      const remainingPlan = autoDecisionSnapshot();
+      const expectedPlan = { ...switchedPlan, candidates: plannedCandidates.slice(index) };
+      if (!sameDecisionPlan(expectedPlan, remainingPlan)) throw new Error('AUTO_PLAN_CHANGED_BEFORE_RESUME');
+      const target = activeAccountState();
+      if (target.accountId !== remainingPlan.target.accountId || target.accountKey !== remainingPlan.target.accountKey) {
+        throw new Error('ACTIVE_ACCOUNT_CHANGED');
+      }
+      assertFreshUsableTarget(target.accountId);
+      const freshEventState = normalizeState(readJson(eventStatePath, {}), Date.now());
+      const persisted = assertObserverIdle(freshEventState, currentCandidate);
+
+      const result = await runResume(persisted, target.accountId, async controlledAppServerPid => {
+        assertAutomaticOwnership(controlledAppServerPid);
+        refreshUsageNow();
+        const commitPlan = autoDecisionSnapshot();
+        if (!sameDecisionPlan(expectedPlan, commitPlan)) throw new Error('AUTO_PLAN_CHANGED_BEFORE_COMMIT');
+        const commitTarget = activeAccountState();
+        if (commitTarget.accountId !== target.accountId || commitTarget.accountKey !== target.accountKey) {
+          throw new Error('ACTIVE_ACCOUNT_CHANGED_BEFORE_COMMIT');
+        }
+        let journal = normalizeResumeState(readJson(resumeStatePath, emptyResumeState()));
+        journal = markResumeCommitted(journal, persisted, { targetAccountId: target.accountId });
+        atomicWriteJson(resumeStatePath, journal);
+        committed = true;
+      }, { automatic: true });
+
+      const finalTarget = activeAccountState();
+      if (finalTarget.accountId !== target.accountId || finalTarget.accountKey !== target.accountKey) {
+        throw new Error('ACTIVE_ACCOUNT_CHANGED_AFTER_COMMIT');
+      }
+      let journal = normalizeResumeState(readJson(resumeStatePath, emptyResumeState()));
+      journal = markResumeTerminal(journal, persisted, result);
+      atomicWriteJson(resumeStatePath, journal);
+      await waitForObserverIdleAfterTurn();
+      if (result.status !== 'completed') throw new Error('AUTO_RESUME_TERMINAL_FAILED');
+    }
+
+    writeAutoContinueState({
+      status: 'completed',
+      lastSuccessAtMs: Date.now(),
+      errorKind: null,
+      actionRequired: false,
+      candidateThreadId: null,
+      candidateTurnId: null,
+      targetAccountId: switchedPlan.target.accountId,
+    });
+  } catch (error) {
+    if (committed && currentCandidate) {
+      let journal = normalizeResumeState(readJson(resumeStatePath, emptyResumeState()));
+      journal = markResumeFailure(journal, currentCandidate, error?.message || 'AUTO_RESUME_FAILED', {
+        committed: true,
+        diagnostics: error?.diagnostics || null,
+      });
+      atomicWriteJson(resumeStatePath, journal);
+    }
+    const transient = error?.message === 'RESUME_ALREADY_RUNNING';
+    writeAutoContinueState({
+      status: transient ? 'waiting' : 'blocked',
+      lastAttemptAtMs: Date.now(),
+      errorKind: transient ? null : error?.message || 'AUTO_RESUME_FAILED',
+      actionRequired: !transient,
+      candidateThreadId: currentCandidate?.threadId || initial.candidates[0]?.threadId || null,
+      candidateTurnId: currentCandidate?.turnId || initial.candidates[0]?.turnId || null,
+      targetAccountId: initial.target?.accountId || null,
+    });
+    if (!transient) process.exitCode = 1;
+  } finally {
+    if (lease) {
+      try {
+        await restoreClients(lease);
+      } catch (error) {
+        writeAutoContinueState({
+          status: 'blocked',
+          lastAttemptAtMs: Date.now(),
+          errorKind: error?.message || 'AUTO_CLIENT_RESTORE_FAILED',
+          actionRequired: true,
+          candidateThreadId: currentCandidate?.threadId || null,
+          candidateTurnId: currentCandidate?.turnId || null,
+          targetAccountId: initial.target?.accountId || null,
+        });
+        process.exitCode = 1;
+      }
+    }
+    if (lock) releaseLock(lock);
+  }
+}
+
 async function main() {
   if (process.argv.includes('--restore-watchdog')) return watchdogMode();
+  if (process.argv.includes('--auto')) return automaticMain();
   const eventState = normalizeState(readJson(eventStatePath, {}), Date.now());
   const resumeState = normalizeResumeState(readJson(resumeStatePath, emptyResumeState()));
   const candidates = pendingInterruptedTurns(eventState, resumeState);

@@ -48,6 +48,11 @@ const {
   readStatusPreferences,
 } = require(path.join(__dirname, '..', 'lib', 'codex-status-preferences'));
 const {
+  autoContinueProblemLine,
+  emptyAutoContinueState,
+  normalizeAutoContinueState,
+} = require(path.join(__dirname, '..', 'lib', 'codex-auto-continue'));
+const {
   tableCell,
   activationObservationHoldLine,
   activationProblemLine,
@@ -83,6 +88,11 @@ const resumeStatePath = process.env.CODEX_RESUME_STATE || path.join(
   'manual-resume.json'
 );
 const statusPreferencesPath = process.env.CODEX_STATUS_PREFERENCES || defaultStatusPreferencesPath();
+const autoContinueStatePath = process.env.CODEX_AUTO_CONTINUE_STATE || path.join(
+  process.env.XDG_CACHE_HOME || path.join(process.env.HOME, '.cache'),
+  'codex-account-switcher',
+  'auto-continue.json'
+);
 const input = fs.readFileSync(0, 'utf8').replace(/\r/g, '');
 const mappingOnly = process.argv.includes('--key-map');
 const resumeMappingOnly = process.argv.includes('--resume-map');
@@ -135,6 +145,7 @@ let activationHolds = { version: 1, accounts: {} };
 let activationHoldsError = null;
 let statusPreferences = { version: 1, autoContinue: false };
 let statusPreferencesError = null;
+let autoContinueState = emptyAutoContinueState();
 try {
   const registry = JSON.parse(fs.readFileSync(registryPath, 'utf8'));
   accounts = Array.isArray(registry.accounts)
@@ -174,6 +185,9 @@ try {
 } catch (error) {
   statusPreferencesError = error?.message || 'STATUS_PREFERENCES_INVALID';
 }
+try {
+  autoContinueState = normalizeAutoContinueState(JSON.parse(fs.readFileSync(autoContinueStatePath, 'utf8')));
+} catch {}
 const fiveHourWorkerHealth = activationWorkerHealth(activationState, nowMs);
 const turnObserverHealth = observerHealth(eventState, nowMs);
 const exhaustionByAccountId = eventState.exhaustions || {};
@@ -355,6 +369,7 @@ const problems = [
   statusPreferencesError
     ? `AUTO-CONTINUE CONFIG ERROR / ACTION REQUIRED: ${statusPreferencesError}; AUTO-CONTINUE är fail-closed OFF.`
     : null,
+  autoContinueProblemLine(autoContinueState, statusPreferences.autoContinue === true),
   ...rankedRows.flatMap(row => [
     usageProblemLine(row),
     activationProblemLine(row, activationState.accounts?.[row.accountId]),
@@ -397,7 +412,13 @@ problems.push(...currentResumeProblemLines(resumeState));
 const problemSection = problems.length > 0
   ? `\n\x1b[1;31mACCOUNT PROBLEMS:\x1b[0m\n${problems.map(line => `\x1b[0m  • ${line}\x1b[0m`).join('\n')}${repairableProblemCount > 0 ? '\n\x1b[1;33m  Press [R] to repair authentication\x1b[0m' : ''}`
   : '';
-const footerParts = [`\x1b[1;36m${autoContinueLine(statusPreferences)}\x1b[0m`];
-if (usageQualityLine) footerParts.push(usageQualityLine);
-const footer = `${footerParts.join('\n')}${activeTurnsSection}${interruptedTurnsSection}${informationSection}${problemSection}`;
+const footerParts = [
+  activeTurnsSection,
+  interruptedTurnsSection,
+  informationSection,
+  problemSection,
+  usageQualityLine,
+].filter(Boolean).map(section => section.replace(/^\n/, ''));
+footerParts.push(`\x1b[1;35m${autoContinueLine(statusPreferences)}\x1b[0m`);
+const footer = footerParts.join('\n\n');
 process.stdout.write(`${output.join('\n').trimEnd()}\n\n${renderedRecommendationLines.join('\n')}\n\n${footer}`);

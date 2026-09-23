@@ -1,0 +1,11 @@
+[Unit]
+Description=Fail-closed Codex quota auto-continue controller
+After=codex-turn-observer.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/codex-auto-continue
+Nice=10
+
+[Install]
+WantedBy=default.target

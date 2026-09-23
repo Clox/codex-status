@@ -27,9 +27,11 @@ CODEX_RESUME_STATE=${CODEX_RESUME_STATE:-"${XDG_CACHE_HOME:-$HOME/.cache}/codex-
 CODEX_MANUAL_RESUME=${CODEX_MANUAL_RESUME:-"$HOME/.local/bin/codex-manual-resume"}
 CODEX_STATUS_PREFERENCES=${CODEX_STATUS_PREFERENCES:-"${XDG_CONFIG_HOME:-$HOME/.config}/codex-account-switcher/status-preferences.json"}
 CODEX_STATUS_PREFERENCES_BIN=${CODEX_STATUS_PREFERENCES_BIN:-"$HOME/.local/bin/codex-status-preferences"}
+CODEX_AUTO_CONTINUE_STATE=${CODEX_AUTO_CONTINUE_STATE:-"${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/auto-continue.json"}
 CODEX_QUOTA_TRANSITION_STATE=${CODEX_QUOTA_TRANSITION_STATE:-"${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/quota-transition.json"}
 CODEX_QUOTA_TRANSITION_BIN=${CODEX_QUOTA_TRANSITION_BIN:-"$HOME/.local/bin/codex-quota-transition"}
 export CODEX_RESUME_STATE CODEX_MANUAL_RESUME CODEX_STATUS_PREFERENCES CODEX_STATUS_PREFERENCES_BIN
+export CODEX_AUTO_CONTINUE_STATE
 export CODEX_QUOTA_TRANSITION_STATE CODEX_QUOTA_TRANSITION_BIN
 USAGE_REFRESH_LOG=${USAGE_REFRESH_LOG:-"${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/usage-refresh.log"}
 loaded_script_hash=$(sha256sum "$0" | awk '{ print $1 }')

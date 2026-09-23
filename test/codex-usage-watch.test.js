@@ -34,11 +34,28 @@ test('startup renders cached or loading state before asynchronous local collecti
   assert.match(source, /CODEX_STATUS_READY_FILE/);
 });
 
-test('recommendation is rendered before auto-continue and problems are indented items', () => {
+test('recommendation precedes dynamic sections and magenta auto-continue remains last before help', () => {
   const outputStatement = annotateSource.indexOf('process.stdout.write(`${output.join');
   assert.notEqual(outputStatement, -1);
   const outputExpression = annotateSource.slice(outputStatement, outputStatement + 220);
   assert.ok(outputExpression.indexOf('renderedRecommendationLines') < outputExpression.indexOf('${footer}'));
+  const footerStatement = annotateSource.indexOf('const footerParts = [');
+  const footerExpression = annotateSource.slice(footerStatement, footerStatement + 420);
+  assert.ok(footerExpression.indexOf('activeTurnsSection') < footerExpression.indexOf('autoContinueLine'));
+  assert.ok(footerExpression.indexOf('interruptedTurnsSection') < footerExpression.indexOf('autoContinueLine'));
+  assert.ok(footerExpression.indexOf('problemSection') < footerExpression.indexOf('autoContinueLine'));
+  assert.match(footerExpression, /\\x1b\[1;35m.*autoContinueLine/);
   assert.ok(annotateSource.includes('  • ${line}'));
   assert.doesNotMatch(annotateSource, /resumeState\.lastError\?\.actionRequired/);
+});
+
+test('a quota recovery event sends one labelled desktop notification and persistent attention', () => {
+  const recoveryBranch = source.slice(
+    source.indexOf('if [[ -n $recovery_fingerprint ]]'),
+    source.indexOf('base_frame=$frame'),
+  );
+  assert.match(recoveryBranch, /map\(account => account\.label\)\.join\(", "\)/);
+  assert.equal((recoveryBranch.match(/notify-send 'Codex-kvot åter tillgänglig'/g) || []).length, 1);
+  assert.match(recoveryBranch, /"persistentUntilFocus":true/);
+  assert.match(recoveryBranch, /"situationClass":"quota-recovered"/);
 });

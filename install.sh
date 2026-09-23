@@ -79,6 +79,7 @@ backup_if_present() {
 backup_if_present "$config_file"
 backup_if_present "$local_bin/codex-account"
 backup_if_present "$local_bin/codex-account-state"
+backup_if_present "$local_bin/codex-auto-continue"
 backup_if_present "$local_bin/codex-continuation-drafts"
 backup_if_present "$local_bin/codex-auth-repair"
 backup_if_present "$local_bin/codex-usage-launch"
@@ -98,6 +99,7 @@ backup_if_present "$local_bin/codex-reset-credits-refresh"
 backup_if_present "$local_lib/codex-account-ranking.js"
 backup_if_present "$local_lib/codex-attention-policy.js"
 backup_if_present "$local_lib/codex-account-state.js"
+backup_if_present "$local_lib/codex-auto-continue.js"
 backup_if_present "$local_lib/codex-continuation-drafts.js"
 backup_if_present "$local_lib/codex-auth-repair.js"
 backup_if_present "$local_lib/codex-reset-credits.js"
@@ -121,10 +123,13 @@ done
 backup_if_present "$applications_dir/codex-usage-watch.desktop"
 backup_if_present "$systemd_user_dir/codex-five-hour-activation.service"
 backup_if_present "$systemd_user_dir/codex-five-hour-activation.timer"
+backup_if_present "$systemd_user_dir/codex-auto-continue.service"
+backup_if_present "$systemd_user_dir/codex-auto-continue.timer"
 backup_if_present "$systemd_user_dir/codex-turn-observer.service"
 
 install -m 0755 "$bin_source/codex-account" "$local_bin/codex-account"
 install -m 0755 "$bin_source/codex-account-state" "$local_bin/codex-account-state"
+install -m 0755 "$bin_source/codex-auto-continue" "$local_bin/codex-auto-continue"
 install -m 0755 "$bin_source/codex-continuation-drafts" "$local_bin/codex-continuation-drafts"
 install -m 0755 "$bin_source/codex-auth-repair" "$local_bin/codex-auth-repair"
 install -m 0755 "$bin_source/codex-usage-launch" "$local_bin/codex-usage-launch"
@@ -144,6 +149,7 @@ install -m 0755 "$bin_source/codex-reset-credits-refresh" "$local_bin/codex-rese
 install -m 0644 "$lib_source/codex-account-ranking.js" "$local_lib/codex-account-ranking.js"
 install -m 0644 "$lib_source/codex-attention-policy.js" "$local_lib/codex-attention-policy.js"
 install -m 0644 "$lib_source/codex-account-state.js" "$local_lib/codex-account-state.js"
+install -m 0644 "$lib_source/codex-auto-continue.js" "$local_lib/codex-auto-continue.js"
 install -m 0644 "$lib_source/codex-continuation-drafts.js" "$local_lib/codex-continuation-drafts.js"
 install -m 0644 "$lib_source/codex-auth-repair.js" "$local_lib/codex-auth-repair.js"
 install -m 0644 "$lib_source/codex-reset-credits.js" "$local_lib/codex-reset-credits.js"
@@ -163,6 +169,8 @@ install -m 0644 "$lib_source/codex-vscode-normalize.js" "$local_lib/codex-vscode
 install -m 0644 "$lib_source/codex-usage-format.js" "$local_lib/codex-usage-format.js"
 install -m 0644 "$systemd_source/codex-five-hour-activation.service" "$systemd_user_dir/codex-five-hour-activation.service"
 install -m 0644 "$systemd_source/codex-five-hour-activation.timer" "$systemd_user_dir/codex-five-hour-activation.timer"
+install -m 0644 "$systemd_source/codex-auto-continue.service" "$systemd_user_dir/codex-auto-continue.service"
+install -m 0644 "$systemd_source/codex-auto-continue.timer" "$systemd_user_dir/codex-auto-continue.timer"
 install -m 0644 "$systemd_source/codex-turn-observer.service" "$systemd_user_dir/codex-turn-observer.service"
 
 escape_config_value() {
@@ -193,6 +201,7 @@ escape_config_value() {
   printf 'CODEX_EVENT_STATE=%s\n' "$(escape_config_value "${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/turn-events.json")"
   printf 'CODEX_RESUME_STATE=%s\n' "$(escape_config_value "${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/manual-resume.json")"
   printf 'CODEX_MANUAL_RESUME=%s\n' "$(escape_config_value "$local_bin/codex-manual-resume")"
+  printf 'CODEX_AUTO_CONTINUE_STATE=%s\n' "$(escape_config_value "${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/auto-continue.json")"
   printf 'CODEX_STATUS_PREFERENCES=%s\n' "$(escape_config_value "$config_dir/status-preferences.json")"
   printf 'CODEX_STATUS_PREFERENCES_BIN=%s\n' "$(escape_config_value "$local_bin/codex-status-preferences")"
   printf 'CODEX_QUOTA_TRANSITION_STATE=%s\n' "$(escape_config_value "${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/quota-transition.json")"
@@ -204,6 +213,7 @@ chmod 600 "$config_file"
 
 systemctl --user daemon-reload
 systemctl --user enable --now codex-five-hour-activation.timer
+systemctl --user enable --now codex-auto-continue.timer
 systemctl --user enable --now codex-turn-observer.service
 
 for account_number in 1 2 3; do
