@@ -119,7 +119,9 @@ A verified terminal exhaustion on a main user thread is also retained in the cre
 
 The status window retains quota-interrupted thread identity as diagnostics but no longer exposes the headless `4`–`9` continuation action as a normal manual workflow. `codex-manual-resume` remains installed for invariant testing and future explicit automation. It requires a healthy observer, no active Codex turns, a fresh VERIFIED and usable target account, the exact persisted `(threadId, turnId)`, and no prior resume commit. It then gracefully closes Desktop and kernel-pauses every VS Code extension host that owns an OpenAI Codex App Server together with its descendants. A detached watchdog restores these clients if the controller exits unexpectedly. The paused processes keep VS Code's in-memory extension state and cannot race the single controlled App Server.
 
-The installed Desktop accepts `codex://threads/<threadId>?prompt=...` and has been observed to populate an unsent composer draft, but it exposes no supported semantic acknowledgement that proves the same exact thread is active after navigation. AT-SPI verification was not stable across Chromium renderer replacement, and clipboard/global-key approaches are intentionally rejected. The status switcher therefore does not yet automate the OFF-mode draft flow; it sends no continuation turn and does not pretend navigation was verified.
+The installed Desktop accepts `codex://threads/<threadId>?prompt=...` and populates an unsent composer draft. A no-send live test on this installed version verified per-thread persistence across the sequence A-with-draft, B-with-draft, reopen A, reopen B: both distinct drafts remained intact and no turn was created. The direct `/usr/lib/chatgpt/ChatGPT <deeplink>` invocation reaches the already running Codex profile; the generic desktop URI launchers did not reliably reach that instance. This remains locally verified behavior rather than a documented public OpenAI contract.
+
+For a manual `1`–`3` switch launched from the status window, the switcher now takes a credential-free preflight snapshot before leaving the active account. It prepares continuation drafts only when the source account has fresh VERIFIED usage, persistent verified terminal exhaustion, a healthy turn observer, and one or more current quota-interrupted main-thread candidates. Guardian/subagent candidates and already committed controller resumes are excluded. After the ordinary codex-auth switch and its existing auth postcondition, the switcher refreshes server usage, starts Desktop, and revalidates the target auth, fresh VERIFIED target usability, source exhaustion, observer health, and the exact unchanged candidate set. It then opens every candidate oldest-to-newest with the fixed continuation text as an unsent `prompt=` draft, leaving the most recently interrupted thread visible. No `turn/start`, Send action, keyboard event, AT-SPI action, or banked reset is involved. The user has explicitly accepted that this continuation prefill may replace an existing draft in those verified quota-interrupted threads. Ordinary account switches never inject drafts; any stale, ambiguous, or changed state skips all draft injection while leaving the verified account switch intact.
 
 The status window always shows `AUTO-CONTINUE: OFF [A] toggle` or `AUTO-CONTINUE: ON [A] toggle`. Pressing `A` changes a private mode-0600 preference under `$XDG_CONFIG_HOME/codex-account-switcher/` and the choice survives status-window restarts. This is deliberately only a persisted policy input until verified automatic exhaustion failover is implemented: `OFF` is the fail-closed default, no current observer or switch path consumes the setting, and banked resets remain excluded from all automatic behavior. Future `OFF` semantics are switch/reopen/navigate without sending; future `ON` semantics may call only the already verified exclusive controller-resume path and must retain its exact-once and fail-closed invariants.
 
@@ -182,6 +184,7 @@ Conversation visibility comes from the shared local state, not from copying auth
 - `$HOME/.config/codex-account-switcher/accounts.conf` — mode `0600`, contains local account selectors and paths
 - `$HOME/.local/bin/codex-account`
 - `$HOME/.local/bin/codex-account-state`
+- `$HOME/.local/bin/codex-continuation-drafts`
 - `$HOME/.local/bin/codex-auth-repair`
 - `$HOME/.local/bin/codex-usage-launch`
 - `$HOME/.local/bin/codex-usage-watch`
@@ -199,6 +202,7 @@ Conversation visibility comes from the shared local state, not from copying auth
 - `$HOME/.local/lib/codex-account-ranking.js`
 - `$HOME/.local/lib/codex-attention-policy.js`
 - `$HOME/.local/lib/codex-account-state.js`
+- `$HOME/.local/lib/codex-continuation-drafts.js`
 - `$HOME/.local/lib/codex-auth-repair.js`
 - `$HOME/.local/lib/codex-reset-credits.js`
 - `$HOME/.local/lib/codex-status-render.js`

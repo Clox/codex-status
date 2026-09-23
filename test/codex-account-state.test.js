@@ -3,6 +3,7 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const {
+  resolveActiveAccount,
   resolveExpectedAccount,
   verifyActiveAccountState,
 } = require('../lib/codex-account-state');
@@ -22,6 +23,17 @@ test('resolves the configured selector to one stable account id and key', () => 
     accountId: 'account-b',
     accountKey: 'key-b',
   });
+});
+
+test('resolves and verifies the currently active stable account identity', () => {
+  assert.deepEqual(resolveActiveAccount(
+    registry('key-b'),
+    { tokens: { account_id: 'account-b', access_token: 'not-inspected' } },
+  ), { accountId: 'account-b', accountKey: 'key-b' });
+  assert.throws(() => resolveActiveAccount(
+    registry('key-b'),
+    { tokens: { account_id: 'account-a' } },
+  ), /ACTIVE_ACCOUNT_STATE_MISMATCH/);
 });
 
 test('postcondition accepts matching global auth and registry state', () => {

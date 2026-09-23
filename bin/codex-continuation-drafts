@@ -1,0 +1,129 @@
+#!/usr/bin/env node
+
+'use strict';
+
+const childProcess = require('node:child_process');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const {
+  buildContinuationPlan,
+  continuationDeepLinks,
+  validateContinuationPlan,
+} = require(path.join(__dirname, '..', 'lib', 'codex-continuation-drafts'));
+const { normalizeResumeState } = require(path.join(__dirname, '..', 'lib', 'codex-manual-resume'));
+const { normalizeState } = require(path.join(__dirname, '..', 'lib', 'codex-turn-observer'));
+const { verifyActiveAccountState } = require(path.join(__dirname, '..', 'lib', 'codex-account-state'));
+
+const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+const cacheHome = process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache');
+const eventStatePath = process.env.CODEX_EVENT_STATE || path.join(cacheHome, 'codex-account-switcher', 'turn-events.json');
+const resumeStatePath = process.env.CODEX_RESUME_STATE || path.join(cacheHome, 'codex-account-switcher', 'manual-resume.json');
+const usageCachePath = process.env.USAGE_CACHE || path.join(cacheHome, 'codex-account-switcher', 'usage.json');
+const desktopBinary = process.env.CHATGPT_BINARY_PATTERN || '/usr/lib/chatgpt/ChatGPT';
+
+function fail(message, code = 3) {
+  process.stderr.write(`${message}\n`);
+  process.exit(code);
+}
+
+function readJson(filename, fallback) {
+  try {
+    return JSON.parse(fs.readFileSync(filename, 'utf8'));
+  } catch (error) {
+    if (fallback !== undefined && error.code === 'ENOENT') return fallback;
+    throw error;
+  }
+}
+
+function atomicWriteJson(filename, value) {
+  fs.mkdirSync(path.dirname(filename), { recursive: true, mode: 0o700 });
+  fs.chmodSync(path.dirname(filename), 0o700);
+  const temporary = `${filename}.tmp-${process.pid}`;
+  fs.writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+  fs.renameSync(temporary, filename);
+  fs.chmodSync(filename, 0o600);
+}
+
+function stateSnapshot() {
+  return {
+    eventState: normalizeState(readJson(eventStatePath)),
+    resumeState: normalizeResumeState(readJson(resumeStatePath, {})),
+    usageCache: readJson(usageCachePath),
+  };
+}
+
+function prepare(args) {
+  const [planPath, sourceAccountId, sourceAccountKey, targetAccountId, targetAccountKey] = args;
+  if (!planPath || !sourceAccountId || !sourceAccountKey || !targetAccountId || !targetAccountKey) {
+    fail('Usage: codex-continuation-drafts prepare <plan-file> <source-id> <source-key> <target-id> <target-key>', 64);
+  }
+  const state = stateSnapshot();
+  const plan = buildContinuationPlan({
+    sourceAccountId,
+    sourceAccountKey,
+    targetAccountId,
+    targetAccountKey,
+    ...state,
+  });
+  atomicWriteJson(planPath, plan);
+  process.stdout.write(`${plan.action}${plan.reason ? `:${plan.reason}` : ''}\n`);
+}
+
+function verifiedActiveTarget(plan) {
+  const registry = readJson(path.join(codexHome, 'accounts', 'registry.json'));
+  const globalAuth = readJson(path.join(codexHome, 'auth.json'));
+  const result = verifyActiveAccountState({
+    registry,
+    globalAuth,
+    expectedAccountId: plan.targetAccountId,
+    expectedAccountKey: plan.targetAccountKey,
+  });
+  return {
+    ok: result.ok,
+    accountId: globalAuth?.tokens?.account_id || null,
+    accountKey: registry?.active_account_key || null,
+    errors: result.errors,
+  };
+}
+
+function apply(args) {
+  const [planPath] = args;
+  if (!planPath) fail('Usage: codex-continuation-drafts apply <plan-file>', 64);
+  const plan = readJson(planPath);
+  if (plan.action !== 'prefill') {
+    process.stdout.write('skipped\n');
+    return;
+  }
+  const active = verifiedActiveTarget(plan);
+  if (!active.ok) fail(`CONTINUATION_DRAFT_BLOCKED:target-auth-unverified:${active.errors.join(',')}`);
+  const validation = validateContinuationPlan({
+    plan,
+    ...stateSnapshot(),
+    activeAccountId: active.accountId,
+    activeAccountKey: active.accountKey,
+  });
+  if (!validation.ok) fail(`CONTINUATION_DRAFT_BLOCKED:${validation.reason}`);
+
+  const links = continuationDeepLinks(validation.candidates);
+  for (const link of links) {
+    const result = childProcess.spawnSync(desktopBinary, [link], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 15_000,
+    });
+    if (result.error || result.status !== 0) {
+      fail(`CONTINUATION_DRAFT_DEEPLINK_FAILED:${result.error?.code || result.status || 'unknown'}`);
+    }
+  }
+  process.stdout.write(`prefilled:${links.length}\n`);
+}
+
+try {
+  const [command, ...args] = process.argv.slice(2);
+  if (command === 'prepare') prepare(args);
+  else if (command === 'apply') apply(args);
+  else fail('Usage: codex-continuation-drafts <prepare|apply> ...', 64);
+} catch (error) {
+  fail(`CONTINUATION_DRAFT_FAILED:${error.message}`);
+}

@@ -5,6 +5,7 @@
 const fs = require('fs');
 const path = require('path');
 const {
+  resolveActiveAccount,
   resolveExpectedAccount,
   verifyActiveAccountState,
 } = require(path.join(__dirname, '..', 'lib', 'codex-account-state'));
@@ -15,8 +16,8 @@ function fail(message, code = 1) {
 }
 
 const [command, codexHome, ...args] = process.argv.slice(2);
-if (!['resolve', 'verify'].includes(command) || !codexHome) {
-  fail('Usage: codex-account-state resolve <CODEX_HOME> <selector> | verify <CODEX_HOME> <account-id> <account-key>', 64);
+if (!['active', 'resolve', 'verify'].includes(command) || !codexHome) {
+  fail('Usage: codex-account-state active <CODEX_HOME> | resolve <CODEX_HOME> <selector> | verify <CODEX_HOME> <account-id> <account-key>', 64);
 }
 
 function readJson(filename) {
@@ -25,7 +26,11 @@ function readJson(filename) {
 
 try {
   const registry = readJson(path.join(codexHome, 'accounts', 'registry.json'));
-  if (command === 'resolve') {
+  if (command === 'active') {
+    const globalAuth = readJson(path.join(codexHome, 'auth.json'));
+    const active = resolveActiveAccount(registry, globalAuth);
+    process.stdout.write(`${active.accountId}\t${active.accountKey}\n`);
+  } else if (command === 'resolve') {
     const [selector] = args;
     if (!selector) fail('Missing account selector', 64);
     const expected = resolveExpectedAccount(registry, selector);

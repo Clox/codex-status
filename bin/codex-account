@@ -16,7 +16,16 @@ source "$config_file"
 export CODEX_HOME
 export PATH="$NODE_BIN_DIR:${PATH:-/usr/local/bin:/usr/bin:/bin}"
 ACCOUNT_STATE_CHECKER=${ACCOUNT_STATE_CHECKER:-"$HOME/.local/bin/codex-account-state"}
+CONTINUATION_DRAFTS=${CONTINUATION_DRAFTS:-"$HOME/.local/bin/codex-continuation-drafts"}
+USAGE_REFRESHER=${USAGE_REFRESHER:-"$HOME/.local/bin/codex-usage-refresh"}
 operation_lock_dir=${CODEX_OPERATION_LOCK_DIR:-"${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/exclusive-codex-operation.lock"}
+continuation_plan=''
+
+cleanup_operation() {
+  rm -f -- "$operation_lock_dir/owner"
+  rmdir -- "$operation_lock_dir" 2>/dev/null || true
+  [[ -z $continuation_plan ]] || rm -f -- "$continuation_plan"
+}
 
 acquire_operation_lock() {
   mkdir -p "$(dirname -- "$operation_lock_dir")"
@@ -36,12 +45,11 @@ acquire_operation_lock() {
     mkdir -m 700 "$operation_lock_dir"
   fi
   printf '%s\n' "$BASHPID" >"$operation_lock_dir/owner"
-  trap 'rm -f -- "$operation_lock_dir/owner"; rmdir -- "$operation_lock_dir" 2>/dev/null || true' EXIT
+  trap cleanup_operation EXIT
 }
 
 release_operation_lock() {
-  rm -f -- "$operation_lock_dir/owner"
-  rmdir -- "$operation_lock_dir" 2>/dev/null || true
+  cleanup_operation
   trap - EXIT
 }
 
@@ -74,6 +82,26 @@ launch_desktop=false
 if [[ ${1:-} == '--desktop' ]]; then
   launch_desktop=true
   shift
+fi
+
+continuation_action='none'
+if [[ $launch_desktop == true && -x $CONTINUATION_DRAFTS ]]; then
+  source_state=$("$ACCOUNT_STATE_CHECKER" active "$CODEX_HOME" 2>/dev/null || true)
+  IFS=$'\t' read -r source_account_id source_account_key <<<"$source_state"
+  if [[ -n ${source_account_id:-} && -n ${source_account_key:-} ]]; then
+    continuation_dir=${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher
+    mkdir -p "$continuation_dir"
+    chmod 700 "$continuation_dir"
+    continuation_plan=$(mktemp "$continuation_dir/continuation-plan.XXXXXX")
+    chmod 600 "$continuation_plan"
+    continuation_result=$("$CONTINUATION_DRAFTS" prepare "$continuation_plan" \
+      "$source_account_id" "$source_account_key" "$expected_account_id" "$expected_account_key" 2>/dev/null || true)
+    continuation_action=${continuation_result%%:*}
+    if [[ $continuation_action == blocked ]]; then
+      notify-send 'Continuation-utkast hoppades över' \
+        'Observer- eller usage-state kunde inte verifieras före kontobytet. Inget draft injiceras.' 2>/dev/null || true
+    fi
+  fi
 fi
 
 desktop_running() {
@@ -117,8 +145,26 @@ fi
 
 if [[ $launch_desktop == true ]]; then
   notify-send 'Codex-konto valt' 'Startar Codex Desktop med det valda kontot.' 2>/dev/null || true
+  USAGE_REFRESH_INTERVAL_MS=0 "$USAGE_REFRESHER" >/dev/null 2>&1 || true
+  setsid -f "$CHATGPT_LAUNCHER" "$@" </dev/null >/dev/null 2>&1
+  for ((attempt = 0; attempt < 75; attempt++)); do
+    desktop_running && break
+    sleep 0.2
+  done
+  if ! desktop_running; then
+    message='Codex Desktop startade inte inom 15 sekunder efter det verifierade kontobytet.'
+    notify-send 'Codex Desktop kunde inte starta' "$message" 2>/dev/null || true
+    printf '%s\n' "$message" >&2
+    exit 4
+  fi
+  if [[ $continuation_action == prefill ]]; then
+    if ! "$CONTINUATION_DRAFTS" apply "$continuation_plan" >/dev/null 2>&1; then
+      notify-send 'Continuation-utkast hoppades över' \
+        'Efterkontrollen var osäker eller en deep-link misslyckades. Ingen automatisk Send har gjorts.' 2>/dev/null || true
+    fi
+  fi
   release_operation_lock
-  exec "$CHATGPT_LAUNCHER" "$@"
+  exit 0
 fi
 
 printf 'Konto %s är nu valt. Starta om Codex Desktop eller kör "Developer: Reload Window" i VS Code.\n' "$account_number"
