@@ -44,19 +44,85 @@ function usageCache({ dormant = true, quality = 'verified', observedAtMs = NOW_M
   };
 }
 
-async function cycle({ cache = usageCache(), previousState = {}, activateAccount, nowMs = NOW_MS } = {}) {
+async function cycle({
+  cache = usageCache(),
+  previousState = {},
+  activateAccount,
+  verifiedExhaustionForAccount = () => null,
+  nowMs = NOW_MS,
+} = {}) {
   const persisted = [];
   const state = await runFiveHourActivationCycle({
     accounts: [account],
     usageCache: cache,
     previousState,
     activateAccount,
+    verifiedExhaustionForAccount,
     persistState: async value => persisted.push(JSON.parse(JSON.stringify(value))),
     now: () => nowMs,
     createAttemptId: () => 'attempt-1',
   });
   return { state, persisted };
 }
+
+test('verified terminal exhaustion skips dormant activation and clears only a later invalid attempt', async () => {
+  let calls = 0;
+  const exhaustion = { observedAtMs: NOW_MS - 60_000 };
+  const previousState = {
+    accounts: {
+      [ACCOUNT_ID]: {
+        phase: 'blocked',
+        lastAttemptAtMs: NOW_MS - 30_000,
+        errorKind: 'APP_SERVER_TURN_FAILED',
+        actionRequired: true,
+        turnSentOrUncertain: true,
+      },
+    },
+  };
+  const { state } = await cycle({
+    previousState,
+    verifiedExhaustionForAccount: () => exhaustion,
+    activateAccount: async () => { calls += 1; },
+  });
+  assert.equal(calls, 0);
+  assert.deepEqual(state.accounts[ACCOUNT_ID], {
+    phase: 'exhausted-skip',
+    exhaustionObservedAtMs: NOW_MS - 60_000,
+    skippedAtMs: NOW_MS,
+    actionRequired: false,
+    errorKind: null,
+  });
+});
+
+test('exhaustion skip preserves genuine older and turn-committed activation failures', async () => {
+  const exhaustion = { observedAtMs: NOW_MS - 60_000 };
+  for (const prior of [
+    { phase: 'blocked', lastAttemptAtMs: NOW_MS - 120_000, errorKind: 'GLOBAL_AUTH_STATE_CHANGED', actionRequired: true },
+    { phase: 'turn-committed', lastAttemptAtMs: NOW_MS - 30_000, attemptId: 'uncertain' },
+  ]) {
+    const { state } = await cycle({
+      previousState: { accounts: { [ACCOUNT_ID]: prior } },
+      verifiedExhaustionForAccount: () => exhaustion,
+      activateAccount: async () => { assert.fail('exhausted account must never activate'); },
+    });
+    assert.deepEqual(state.accounts[ACCOUNT_ID], prior);
+  }
+});
+
+test('exhaustion discovered during pre-turn revalidation becomes a non-error skip', async () => {
+  const error = new Error('ACCOUNT_VERIFIED_EXHAUSTED');
+  error.exhaustionObservedAtMs = NOW_MS - 1_000;
+  const { state } = await cycle({
+    activateAccount: async () => { throw error; },
+  });
+  assert.deepEqual(state.accounts[ACCOUNT_ID], {
+    phase: 'exhausted-skip',
+    exhaustionObservedAtMs: NOW_MS - 1_000,
+    skippedAtMs: NOW_MS,
+    actionRequired: false,
+    errorKind: null,
+  });
+});
 
 test('verified dormant account gets exactly one committed activation attempt', async () => {
   let calls = 0;

@@ -24,11 +24,11 @@ const {
 } = require(path.join(__dirname, '..', 'lib', 'codex-auth-repair'));
 const {
   accountIdentifiers,
-  colorAccountTableRow,
   normalizeAccountRow,
   recommendationLines,
   renderAccountTableRow,
 } = require(path.join(__dirname, '..', 'lib', 'codex-status-render'));
+const { quotaAvailabilitySnapshot } = require(path.join(__dirname, '..', 'lib', 'codex-quota-transition'));
 const {
   activationWorkerHealth,
 } = require(path.join(__dirname, '..', 'lib', 'codex-five-hour-worker'));
@@ -37,6 +37,7 @@ const {
   observerHealth,
 } = require(path.join(__dirname, '..', 'lib', 'codex-turn-observer'));
 const {
+  currentResumeProblemLines,
   emptyResumeState,
   normalizeResumeState,
   pendingInterruptedTurns,
@@ -52,7 +53,7 @@ const {
   activationProblemLine,
   activationWorkerProblem,
   usageProblemLine,
-  weeklyUrgencyLabel,
+  scoreLabel,
 } = require(path.join(__dirname, '..', 'lib', 'codex-usage-format'));
 
 const registryPath = path.join(process.env.CODEX_HOME || path.join(process.env.HOME, '.codex'), 'accounts', 'registry.json');
@@ -86,11 +87,16 @@ const input = fs.readFileSync(0, 'utf8').replace(/\r/g, '');
 const mappingOnly = process.argv.includes('--key-map');
 const resumeMappingOnly = process.argv.includes('--resume-map');
 const attentionOnly = process.argv.includes('--attention-state');
-const rankingEnabled = mappingOnly || resumeMappingOnly || attentionOnly || process.env.CODEX_STATUS_RANKING === '1';
+const availabilityOnly = process.argv.includes('--availability-state');
+const rankingEnabled = mappingOnly || resumeMappingOnly || attentionOnly || availabilityOnly || process.env.CODEX_STATUS_RANKING === '1';
 const pendingSourceCandidate = process.env.CODEX_PENDING_SOURCE_ROW || process.env.CODEX_PENDING_ROW || '';
 const pendingSourceRow = /^(1|2|3)$/.test(pendingSourceCandidate)
   ? pendingSourceCandidate
   : null;
+const pendingStatusCandidate = process.env.CODEX_PENDING_STATUS || 'WAIT/';
+const pendingStatus = /^WAIT[\/\\|\-]$/.test(pendingStatusCandidate)
+  ? pendingStatusCandidate
+  : 'WAIT/';
 const nowMs = Number.isFinite(Number(process.env.CODEX_STATUS_NOW_MS))
   ? Number(process.env.CODEX_STATUS_NOW_MS)
   : Date.now();
@@ -135,7 +141,7 @@ try {
     ? registry.accounts
     : Object.values(registry.accounts || {});
 } catch {
-  if (mappingOnly || resumeMappingOnly || attentionOnly) process.exit(1);
+  if (mappingOnly || resumeMappingOnly || attentionOnly || availabilityOnly) process.exit(1);
   process.stdout.write(input);
   process.exit(0);
 }
@@ -179,7 +185,7 @@ const headerIndex = visibleLines.findIndex(line =>
 );
 
 if (headerIndex < 0) {
-  if (mappingOnly || resumeMappingOnly || attentionOnly) process.exit(1);
+  if (mappingOnly || resumeMappingOnly || attentionOnly || availabilityOnly) process.exit(1);
   process.stdout.write(input);
   process.exit(0);
 }
@@ -234,6 +240,11 @@ if (attentionOnly) {
   process.exit(0);
 }
 
+if (availabilityOnly) {
+  process.stdout.write(JSON.stringify(quotaAvailabilitySnapshot(rankedRows)));
+  process.exit(0);
+}
+
 if (mappingOnly) {
   process.stdout.write(rankedRows
     .map(row => `${row.rank}\t${row.sourceRow}\t${row.active ? 'active' : '-'}\t${row.accountNumber}`)
@@ -261,37 +272,30 @@ for (const [index, lineIndex] of rowLineIndexes.entries()) {
   rankedByLineIndex.set(lineIndex, rankedRows[index]);
 }
 
-const fiveHourWidth = Math.max(
-  '5H USAGE'.length + 1,
-  ...rankedRows.map(row => row.fiveHour.length + 1)
-);
-const resetValues = rankedRows.map(row => formatResetValue(row.resetCredits, nowMs));
-const resetWidth = Math.max(
-  'RESETS'.length + 1,
-  ...resetValues.map(value => value.length + 1)
-);
-const weeklyUrgencyWidth = Math.max(
-  'W%/H'.length + 2,
-  ...rankedRows.map(row => weeklyUrgencyLabel(row).length + 1)
-);
-const weeklyWidth = Math.max(
-  'WEEKLY USAGE'.length + 1,
-  ...rankedRows.map(row => row.weekly.length + 1)
-);
-const tableSeparatorOverhead = 5;
-const widthBeforeActivity = columns.activity - columns.account;
+const statusWidth = 5;
+const resetWidth = 8;
+const fiveHourWidth = 15;
+const weeklyWidth = 17;
+const scoreWidth = 5;
+const activityWidth = 8;
+const tableSeparatorOverhead = 6;
+const requestedTableWidth = Number(process.env.CODEX_STATUS_COLUMNS);
+const tableWidth = Number.isInteger(requestedTableWidth) && requestedTableWidth > 0
+  ? requestedTableWidth
+  : plain(header).trimEnd().length;
 const accountWidth = Math.max(
-  'ACCOUNT'.length + 1,
-  widthBeforeActivity - resetWidth - fiveHourWidth - weeklyWidth - weeklyUrgencyWidth - tableSeparatorOverhead
+  'ACCOUNT'.length,
+  tableWidth - statusWidth - resetWidth - fiveHourWidth - weeklyWidth - scoreWidth - activityWidth - tableSeparatorOverhead
 );
 
-const renderedHeader = header.slice(0, columns.account) +
-  tableCell('ACCOUNT', accountWidth) +
-  tableCell('RESETS', resetWidth) +
-  tableCell('5H USAGE', fiveHourWidth) +
-  tableCell('WEEKLY USAGE', weeklyWidth) +
-  tableCell('W%/H', weeklyUrgencyWidth) +
-  header.slice(columns.activity).trimEnd();
+const renderedHeader =
+  tableCell('ACCOUNT', accountWidth, 'center') +
+  tableCell('STATU', statusWidth) +
+  tableCell('RESETS', resetWidth, 'center') +
+  tableCell('5H USAGE', fiveHourWidth, 'center') +
+  tableCell('WEEKLY USAGE', weeklyWidth, 'center') +
+  tableCell('PRIOR', scoreWidth) +
+  fit('ACTIVITY', activityWidth);
 
 function tableDivider(length) {
   const divider = Array.from({ length }, () => '─');
@@ -307,30 +311,25 @@ const output = lines.map((line, lineIndex) => {
   }
 
   if (lineIndex === headerIndex + 1 && /^\s*-+\s*$/.test(visibleLines[lineIndex])) {
-    return tableDivider(Math.max(plain(line).trimEnd().length, renderedHeader.length));
+    return tableDivider(renderedHeader.length);
   }
 
   const row = rankedByLineIndex.get(lineIndex);
   if (!row) return line;
 
-  const pending = pendingSourceRow === row.sourceRow;
-  const color = row.usageQuality === 'unverified'
-    ? '\x1b[1;31m'
-    : row.active
-      ? '\x1b[0;32m'
-      : pending
-        ? '\x1b[0;33m'
-        : '\x1b[0;2m';
+  const pending = pendingSourceRow === row.sourceRow ? pendingStatus : false;
   const rendered = renderAccountTableRow(row, {
     columns,
     accountWidth,
+    statusWidth,
     resetWidth,
     fiveHourWidth,
     weeklyWidth,
-    weeklyUrgencyWidth,
+    scoreWidth,
     nowMs,
+    pending,
   });
-  return colorAccountTableRow(rendered, color);
+  return rendered;
 });
 
 const renderedRecommendationLines = recommendationLines(recommendation);
@@ -386,31 +385,19 @@ const activeTurnsSection = activeTurns.length > 0
       return `\x1b[36m${accountLabel} | ${thread}${role}${title} | running\x1b[0m`;
     }).join('\n')}`
   : '';
-const interruptedTurnsSection = interruptedWithKeys.length > 0
-  ? `\n\x1b[1;33mINTERRUPTED CODEX TURNS:\x1b[0m\n${interruptedWithKeys.map(candidate => {
+const interruptedTurnsSection = interruptedCandidates.length > 0
+  ? `\n\x1b[1;33mINTERRUPTED CODEX TURNS:\x1b[0m\n${interruptedCandidates.map(candidate => {
       const accountLabel = labelByAccountId.get(candidate.accountId) || 'unknown account';
       const thread = `…${candidate.threadId.slice(-8)}`;
       const title = candidate.title ? ` — ${candidate.title.slice(0, 42)}` : '';
-      return `\x1b[33m[${candidate.continueKey}] ${accountLabel} | ${thread}${title} | quota-interrupted\x1b[0m`;
-    }).join('\n')}\n\x1b[1;33mPress [${interruptedWithKeys.map(candidate => candidate.continueKey).join('/')}] to continue after a manual account switch\x1b[0m`
+      return `\x1b[33m${accountLabel} | ${thread}${title} | quota-interrupted\x1b[0m`;
+    }).join('\n')}`
   : '';
-const exhaustionLines = rankedRows
-  .filter(row => row.verifiedExhausted)
-  .map(row => `VERIFIED EXHAUSTION: ${row.label} — quota pool unknown.`);
-const exhaustionSection = exhaustionLines.length > 0
-  ? `\n\x1b[1;31mACCOUNT STATUS:\x1b[0m\n${exhaustionLines.map(line => `\x1b[31m${line}\x1b[0m`).join('\n')}`
-  : '';
-const resumeAttemptProblems = Object.values(resumeState.attempts || {})
-  .filter(attempt => attempt.status === 'MANUAL_REQUIRED_AFTER_COMMIT')
-  .map(attempt => `MANUAL RESUME / ACTION REQUIRED: …${String(attempt.threadId || '').slice(-8)} was committed; no automatic retry (${attempt.errorKind || 'unknown error'}).`);
-if (resumeState.lastError?.actionRequired) {
-  problems.push(`MANUAL RESUME: no turn was sent; ${resumeState.lastError.errorKind || 'preflight failed'}.`);
-}
-problems.push(...resumeAttemptProblems);
+problems.push(...currentResumeProblemLines(resumeState));
 const problemSection = problems.length > 0
-  ? `\n\x1b[1;31mACCOUNT PROBLEMS:\x1b[0m\n${problems.map(line => `\x1b[31m${line}\x1b[0m`).join('\n')}${repairableProblemCount > 0 ? '\n\x1b[1;33mPress [R] to repair authentication\x1b[0m' : ''}`
+  ? `\n\x1b[1;31mACCOUNT PROBLEMS:\x1b[0m\n${problems.map(line => `\x1b[0m  • ${line}\x1b[0m`).join('\n')}${repairableProblemCount > 0 ? '\n\x1b[1;33m  Press [R] to repair authentication\x1b[0m' : ''}`
   : '';
-const footerParts = [`\x1b[1;36m${autoContinueLine(statusPreferences)}\x1b[0m`, renderedRecommendationLines.join('\n')];
+const footerParts = [`\x1b[1;36m${autoContinueLine(statusPreferences)}\x1b[0m`];
 if (usageQualityLine) footerParts.push(usageQualityLine);
-const footer = `${footerParts.join('\n')}${activeTurnsSection}${interruptedTurnsSection}${exhaustionSection}${informationSection}${problemSection}`;
-process.stdout.write(`${output.join('\n').trimEnd()}\n\n${footer}`);
+const footer = `${footerParts.join('\n')}${activeTurnsSection}${interruptedTurnsSection}${informationSection}${problemSection}`;
+process.stdout.write(`${output.join('\n').trimEnd()}\n\n${renderedRecommendationLines.join('\n')}\n\n${footer}`);

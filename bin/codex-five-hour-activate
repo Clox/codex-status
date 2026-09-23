@@ -17,6 +17,7 @@ const {
   releaseAccountActivationLock,
 } = require(path.join(__dirname, '..', 'lib', 'codex-activation-lock'));
 const {
+  assertAccountNotVerifiedExhausted,
   configuredSelector,
   configuredValue,
   findAccount,
@@ -49,6 +50,8 @@ function friendlyError(error, label) {
   const code = error?.message || '';
   if (code === 'USAGE_HTTP_401') return `${label}: server-auth svarar 401. Förnya kontots credential med en ny interaktiv inloggning.`;
   if (code === 'ACCOUNT_NOT_FIVE_HOUR_DORMANT') return `${label} har inte VERIFIED fiveHourDormant=true. Ingen Codex-turn skickades.`;
+  if (code === 'ACCOUNT_VERIFIED_EXHAUSTED') return `${label} har verifierad terminal quota exhaustion. Ingen activation-turn eller App Server startades.`;
+  if (code === 'ACTIVATION_EXHAUSTION_STATE_UNVERIFIED') return 'Turn-observerns exhaustion-state kunde inte verifieras. Avbryter säkert utan activation.';
   if (code === 'ACTIVATION_OBSERVATION_HOLD') return `${label}: WEEKLY OBSERVATION HOLD är aktiv. Alla manuella activation-turns är blockerade; usage-observation fortsätter.`;
   if (code === 'ACTIVATION_HOLDS_INVALID') return 'Activation-hold-konfigurationen är ogiltig. Avbryter säkert utan Codex-turn.';
   if (code === 'APP_SERVER_CAPABILITY_MISMATCH') return 'Den installerade Codex App Server-versionen saknar den verifierade experimentella protokollformen. Avbryter säkert.';
@@ -74,6 +77,8 @@ async function main() {
   const configFile = path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'codex-account-switcher', 'accounts.conf');
   const usageCacheFile = configuredValue(configFile, 'USAGE_CACHE') ||
     path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache'), 'codex-account-switcher', 'usage.json');
+  const eventStateFile = process.env.CODEX_EVENT_STATE || configuredValue(configFile, 'CODEX_EVENT_STATE') ||
+    path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache'), 'codex-account-switcher', 'turn-events.json');
   const activationLockDirectory = path.join(path.dirname(usageCacheFile), 'activation-locks');
   const codexBin = process.env.CODEX_ACTIVATION_BIN || '/usr/lib/chatgpt/resources/codex';
   const selector = configuredSelector(configFile, number);
@@ -92,6 +97,12 @@ async function main() {
   }
   if (activationHoldForAccount(activationHolds, accountId)) {
     fail(friendlyError(new Error('ACTIVATION_OBSERVATION_HOLD'), label));
+    return;
+  }
+  try {
+    assertAccountNotVerifiedExhausted(eventStateFile, accountId);
+  } catch (error) {
+    fail(friendlyError(error, label));
     return;
   }
   const accessToken = loadCredential(codexHome, accountId);
@@ -126,6 +137,7 @@ async function main() {
 
     const activationLock = acquireAccountActivationLock(activationLockDirectory, accountId);
     try {
+      assertAccountNotVerifiedExhausted(eventStateFile, accountId);
       fs.rmSync(schemaDirectory, { recursive: true, force: true });
       generateAndCheckSchema({ codexBin, privateHome, schemaDirectory });
       const beforeFingerprint = fingerprintAuthState(codexHome);
@@ -137,6 +149,7 @@ async function main() {
           accountId,
           accessToken,
           fetchObservation,
+          assertCanActivate: () => assertAccountNotVerifiedExhausted(eventStateFile, accountId),
           runTurn: () => {
             assertQuotaActivationAllowed(accountId, activationHoldsFile);
             return runIsolatedCodexTurn({

@@ -5,6 +5,7 @@ const test = require('node:test');
 const {
   appServerExclusivityReport,
   candidateKey,
+  currentResumeProblemLines,
   emptyResumeState,
   markResumeCommitted,
   markResumeFailure,
@@ -15,6 +16,30 @@ const {
   validateThreadMetadataForResume,
   validateThreadForResume,
 } = require('../lib/codex-manual-resume');
+
+test('status problems omit stale pre-commit failures but retain uncertain post-commit failures', () => {
+  assert.deepEqual(currentResumeProblemLines({
+    version: 1,
+    attempts: {},
+    lastError: {
+      actionRequired: true,
+      errorKind: 'VSCODE_EXTENSION_HOST_UNVERIFIED',
+      failedAtMs: 100,
+    },
+  }), []);
+  assert.deepEqual(currentResumeProblemLines({
+    version: 1,
+    attempts: {
+      committed: {
+        status: 'MANUAL_REQUIRED_AFTER_COMMIT',
+        threadId: 'thread-abcdefgh',
+        errorKind: 'APP_SERVER_TIMEOUT',
+      },
+    },
+  }), [
+    'MANUAL RESUME / ACTION REQUIRED: …abcdefgh was committed; no automatic retry (APP_SERVER_TIMEOUT).',
+  ]);
+});
 
 const candidate = {
   threadId: 'thread-a', turnId: 'turn-failed', accountId: 'account-a',

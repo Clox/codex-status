@@ -132,6 +132,22 @@ test('fails closed before a turn when the account is not dormant', async () => {
   assert.equal(turns, 0);
 });
 
+test('verified exhaustion guard blocks generic weekly activation before its turn', async () => {
+  let turns = 0;
+  let guardCalls = 0;
+  await assert.rejects(executeVerifiedActivation({
+    fetchUsage: async () => usage(100, 168, true),
+    assertCanActivate: async () => {
+      guardCalls += 1;
+      throw new Error('ACCOUNT_VERIFIED_EXHAUSTED');
+    },
+    runTurn: async () => { turns += 1; },
+    now: () => NOW_MS,
+  }), /ACCOUNT_VERIFIED_EXHAUSTED/);
+  assert.equal(guardCalls, 1);
+  assert.equal(turns, 0);
+});
+
 test('does not retry when post-turn verification is unexpected', async () => {
   const observations = [usage(100, 168, true), usage(99, 168, false)];
   let turns = 0;

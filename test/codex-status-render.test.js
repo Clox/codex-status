@@ -3,7 +3,6 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const {
-  colorAccountTableRow,
   normalizeAccountRow,
   recommendationLines,
   renderAccountTableRow,
@@ -52,15 +51,17 @@ function normalizeExhausted({ serverEntry, account }) {
   });
 }
 
-function render(row) {
+function render(row, { pending = false } = {}) {
   return renderAccountTableRow(row, {
     columns,
-    accountWidth: 20,
-    resetWidth: 10,
-    fiveHourWidth: 14,
-    weeklyWidth: 16,
-    weeklyUrgencyWidth: 7,
+    accountWidth: 28,
+    statusWidth: 5,
+    resetWidth: 8,
+    fiveHourWidth: 15,
+    weeklyWidth: 17,
+    scoreWidth: 5,
     nowMs: NOW_MS,
+    pending,
   });
 }
 
@@ -91,8 +92,8 @@ test('repair followed by fresh refresh uses server usage despite missing registr
 
   assert.equal(row.usageQuality, 'verified');
   assert.match(output, /account-c@example\.c/);
-  assert.match(output, /100% █ \(5:00\)/);
-  assert.match(output, /11% ▁ \(12:00\)/);
+  assert.match(output.replace(/\x1b\[[0-9;]*m/g, ''), /100%█████\(5:00\)/);
+  assert.match(output.replace(/\x1b\[[0-9;]*m/g, ''), /11%▌ {4}\(12:00\)/);
   assert.doesNotMatch(output, /\bPlus\b/);
   assert.equal(recommendAccount(ranked).action, 'stay');
 });
@@ -107,31 +108,62 @@ test('missing or unmapped data still renders inside the normalized schema', () =
   assert.equal(row.errorKind, 'identity-unmatched');
   assert.match(output, /account-c@example\.c/);
   assert.doesNotMatch(output, /\bPlus\b/);
-  assert.match(output, /│\s+-\s*│\s+-\s*│ ERROR/);
+  assert.match(output.replace(/\x1b\[[0-9;]*m/g, ''), /ERROR│\s+\?\s*│\s+-│\s+-│ERROR/);
   assert.equal(recommendation.action, 'none');
   assert.equal(recommendation.reason, 'active-unverified');
   assert.deepEqual(recommendationLines(recommendation).map(line => line.replace(/\x1b\[[0-9;]*m/g, '')), [
-    'RECOMMENDATION PAUSED:',
-    'Active account account-c@example.c is UNVERIFIED',
-    'No safe account recommendation is available',
+    'RECOMMENDATION: Waiting for verified server usage',
   ]);
 });
 
-test('missing recommendation object still renders an explicit paused reason', () => {
+test('missing recommendation object still renders an explicit waiting reason', () => {
   assert.deepEqual(recommendationLines(null).map(line => line.replace(/\x1b\[[0-9;]*m/g, '')), [
-    'RECOMMENDATION PAUSED:',
-    'Insufficient normalized account data',
+    'RECOMMENDATION: Waiting for verified server usage',
   ]);
 });
 
-test('row coloring leaves vertical column separators in the terminal default color', () => {
-  const color = '\x1b[0;32m';
-  const rendered = '01 account │ 1×025:04│ 100% READY │ Now  ACTIVE';
-  const output = colorAccountTableRow(rendered, color);
+test('active marker stays primary while only account text is bold and separators stay neutral', () => {
+  const account = { chatgpt_account_id: 'account-c', email: 'account-c@example.com' };
+  const serverEntry = {
+    primary: { remainingPercent: 78, resetsAt: NOW_MS / 1000 + 7200 },
+    secondary: { remainingPercent: 42, resetsAt: NOW_MS / 1000 + 7200 },
+    ordinaryUsageAllowed: true,
+    ordinaryUsageAllowedObserved: true,
+    refresh: { lastSuccessAt: NOW_MS, lastAttemptAt: NOW_MS, errorKind: null, consecutiveFailures: 0 },
+  };
+  const output = render(rankAccounts([normalize({ account, serverEntry })], { nowMs: NOW_MS })[0]);
+  const plain = output.replace(/\x1b\[[0-9;]*m/g, '');
+  assert.match(output, /^\x1b\[1m/);
+  assert.match(output, /\x1b\[38;2;[^m]+m[^\x1b]+\x1b\[0m\x1b\[1m/);
+  assert.match(output, /\x1b\[0m$/);
+  assert.match(plain, /^\*01/);
+  assert.doesNotMatch(plain, /ACTIVE|ACTE/);
+  assert.match(plain, /78%███▉/);
+  assert.match(plain, /42%██▏/);
+  assert.equal(Array.from(plain).length, 92);
+  assert.deepEqual(Array.from(plain)
+    .map((character, index) => character === '│' ? index : null)
+    .filter(Number.isInteger), [28, 34, 43, 59, 77, 83]);
+  assert.doesNotMatch(output, /\x1b\[38;2;[^m]+m│/);
+});
 
-  assert.equal(output.replace(/\x1b\[[0-9;]*m/g, ''), rendered);
-  assert.equal((output.match(/\x1b\[0m│\x1b\[0;32m/g) || []).length, 3);
-  assert.equal(output, `${color}01 account \x1b[0m│${color} 1×025:04\x1b[0m│${color} 100% READY \x1b[0m│${color} Now  ACTIVE\x1b[0m`);
+test('pending switch uses a compact spinner frame without moving the active marker or recoloring quota cells', () => {
+  const account = { chatgpt_account_id: 'account-c', email: 'account-c@example.com' };
+  const serverEntry = {
+    primary: { remainingPercent: 78, resetsAt: NOW_MS / 1000 + 7200 },
+    secondary: { remainingPercent: 42, resetsAt: NOW_MS / 1000 + 7200 },
+    ordinaryUsageAllowed: true,
+    ordinaryUsageAllowedObserved: true,
+    refresh: { lastSuccessAt: NOW_MS, lastAttemptAt: NOW_MS, errorKind: null, consecutiveFailures: 0 },
+  };
+  const row = rankAccounts([normalize({ account, serverEntry })], { nowMs: NOW_MS })[0];
+  row.active = false;
+  const output = render(row, { pending: 'WAIT\\' });
+  const plain = output.replace(/\x1b\[[0-9;]*m/g, '');
+  assert.match(plain, /^ 01/);
+  assert.match(plain, /WAIT\\/);
+  assert.match(output, /\x1b\[1;33mWAIT\\/);
+  assert.match(output, /\x1b\[38;2;/);
 });
 
 test('verified account-level exhaustion is rendered without inventing a 5H or weekly pool', () => {
@@ -145,9 +177,10 @@ test('verified account-level exhaustion is rendered without inventing a 5H or we
   const ranked = rankAccounts([row], { nowMs: NOW_MS });
   const output = render(ranked[0]);
   assert.equal(row.verifiedExhausted, true);
-  assert.match(output, /0%\s+\(2:00\)/);
-  assert.match(output, /20% ▂ \(2:00\)/);
-  assert.match(output, /ACTIVE$/);
+  const plain = output.replace(/\x1b\[[0-9;]*m/g, '');
+  assert.match(plain, /EXHAU/);
+  assert.match(plain, /0%\s{5}\(2:00\)/);
+  assert.match(plain, /20%█\s{4}\(2:00\)/);
   assert.doesNotMatch(output, /EXHAUSTED/);
   assert.equal(recommendAccount(ranked).reason, 'insufficient-verified-data');
 });
@@ -217,8 +250,8 @@ test('renders confirmed synthetic moving 5H and weekly deadlines as READY and ST
     assert.equal(row.fiveHourDormant, true);
     assert.equal(row.weeklyDormant, true);
     assert.equal(ranked[0].needsActivation, true);
-    assert.equal(row.fiveHour, '100% █ READY');
-    assert.equal(row.weekly, '100% █ READY');
+    assert.equal(row.fiveHour, '100%█████ READY');
+    assert.equal(row.weekly, '100%█████ READY');
     assert.match(render(ranked[0]), /START/);
     assert.doesNotMatch(row.fiveHour, /4:59|5:00|5:01/);
     assert.doesNotMatch(row.weekly, /167:59|168:00|168:01/);
@@ -270,6 +303,6 @@ test('renders a fixed active 100 percent weekly deadline as a normal countdown',
   const ranked = rankAccounts([row], { nowMs: NOW_MS });
 
   assert.equal(row.weeklyDormant, false);
-  assert.equal(row.weekly, '100% █ (168:00)');
+  assert.equal(row.weekly, '100%█████(168:00)');
   assert.equal(ranked[0].needsActivation, false);
 });

@@ -1,0 +1,25 @@
+#!/usr/bin/env node
+
+'use strict';
+
+const fs = require('node:fs');
+const path = require('node:path');
+const {
+  advanceQuotaTransition,
+  atomicWriteJson,
+  defaultQuotaTransitionPath,
+  readQuotaTransitionState,
+} = require(path.join(__dirname, '..', 'lib', 'codex-quota-transition'));
+
+const statePath = process.env.CODEX_QUOTA_TRANSITION_STATE || defaultQuotaTransitionPath();
+
+try {
+  const snapshot = JSON.parse(fs.readFileSync(0, 'utf8'));
+  const previous = readQuotaTransitionState(statePath);
+  const result = advanceQuotaTransition(previous, snapshot);
+  if (JSON.stringify(result.state) !== JSON.stringify(previous)) atomicWriteJson(statePath, result.state);
+  process.stdout.write(`${JSON.stringify(result.event || null)}\n`);
+} catch (error) {
+  process.stderr.write(`${error?.message || 'QUOTA_TRANSITION_FAILED'}\n`);
+  process.exitCode = 1;
+}

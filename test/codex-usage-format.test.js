@@ -7,22 +7,34 @@ const {
   activationObservationHoldLine,
   activationProblemLine,
   activationWorkerProblem,
+  fitCell,
   tableCell,
+  scoreLabel,
   usageBlock,
+  usageBar,
   usageProblemLine,
   weeklyUrgencyLabel,
 } = require('../lib/codex-usage-format');
 
-test('maps the complete 0-100% scale to eighth-block glyphs', () => {
+test('maps the complete 0-100% scale to partial block glyphs', () => {
   const percentages = [0, 12.5, 25, 37.5, 50, 62.5, 75, 87.5, 100];
   assert.deepEqual(percentages.map(usageBlock), USAGE_BLOCKS);
 });
 
 test('rounds intermediate percentages to the nearest block level', () => {
   assert.equal(usageBlock(6), ' ');
-  assert.equal(usageBlock(7), '▁');
-  assert.equal(usageBlock(73), '▆');
+  assert.equal(usageBlock(7), '▏');
+  assert.equal(usageBlock(73), '▊');
   assert.equal(usageBlock(94), '█');
+});
+
+test('renders a five-cell continuous usage bar with eighth-cell precision', () => {
+  assert.equal(usageBar(100), '█████');
+  assert.equal(usageBar(78), '███▉ ');
+  assert.equal(usageBar(70), '███▌ ');
+  assert.equal(usageBar(42), '██▏  ');
+  assert.equal(usageBar(5), '▎    ');
+  assert.equal(usageBar(0), '     ');
 });
 
 test('clamps out-of-range values and handles missing data', () => {
@@ -39,12 +51,16 @@ test('shows START instead of a false W%/H value for an unstarted weekly cycle', 
   }), 'START');
 });
 
-test('shows normal W%/H after the weekly cycle has started', () => {
-  assert.equal(weeklyUrgencyLabel({
+test('shows SCORE as W%/H times 100 without changing the underlying urgency', () => {
+  assert.equal(scoreLabel({
     needsActivation: false,
     weeklyResetHours: 168,
     weeklyUrgency: 100 / 168,
-  }), '0.60');
+  }), '60');
+  assert.equal(scoreLabel({ needsActivation: false, weeklyResetHours: 10, weeklyUrgency: 0.04 }), '4');
+  assert.equal(scoreLabel({ needsActivation: false, weeklyResetHours: 10, weeklyUrgency: 0.49 }), '49');
+  assert.equal(scoreLabel({ needsActivation: false, weeklyResetHours: 1, weeklyUrgency: 12 }), '999+');
+  assert.equal(scoreLabel({ verifiedExhausted: true }), '—');
 });
 
 test('marks stale usage and replaces unverified urgency with an error status', () => {
@@ -53,7 +69,7 @@ test('marks stale usage and replaces unverified urgency with an error status', (
     weeklyResetHours: 10,
     weeklyUrgency: 1.23,
     usageQuality: 'stale',
-  }), '1.23~');
+  }), '123~');
   assert.equal(weeklyUrgencyLabel({
     needsActivation: false,
     weeklyResetHours: Number.POSITIVE_INFINITY,
@@ -116,8 +132,12 @@ test('observation hold is informational and not presented as an activation error
   }), null);
 });
 
-test('renders a vertical boundary while preserving the cell content width', () => {
-  assert.equal(tableCell('ACCOUNT', 10), 'ACCOUNT  │ ');
-  assert.equal(tableCell('a-long-account', 10), 'a-long-ac│ ');
-  assert.equal(Array.from(tableCell('RESET', 9)).length, 10);
+test('renders exact-width cells with stable alignment and no separator padding', () => {
+  assert.equal(tableCell('ACCOUNT', 10), 'ACCOUNT   │');
+  assert.equal(tableCell('a-long-account', 10), 'a-long-acc│');
+  assert.equal(tableCell('STATU', 5), 'STATU│');
+  assert.equal(tableCell('RESETS', 8, 'center'), ' RESETS │');
+  assert.equal(tableCell('ACCOUNT', 15, 'center'), '    ACCOUNT    │');
+  assert.equal(fitCell('42', 5, 'right'), '   42');
+  assert.equal(Array.from(tableCell('RESET', 8)).length, 9);
 });

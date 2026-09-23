@@ -25,12 +25,17 @@ count=0
 [ ! -f "${count}" ] || count=$(cat "${count}")
 count=$((count + 1))
 printf '%s\n' "$count" >"${count}"
-[ "$count" -gt 1 ]
+if [ "$count" -gt 1 ]; then
+  : >"$CODEX_STATUS_READY_FILE"
+  exit 0
+fi
+exit 1
 `);
 
   const result = spawnSync(launcher, [], {
     env: {
       ...process.env,
+      XDG_CACHE_HOME: root,
       GNOME_TERMINAL_BIN: terminal,
       CODEX_USAGE_WATCH_BIN: status,
       CODEX_STATUS_LAUNCH_LOG: path.join(root, 'launch.log'),
@@ -50,14 +55,16 @@ test('status launcher does not retry deliberate old-code shutdown', t => {
   const terminal = path.join(root, 'terminal');
   const status = path.join(root, 'status');
   executable(status, '#!/bin/sh\nexit 0\n');
-  executable(terminal, `#!/bin/sh
+executable(terminal, `#!/bin/sh
 printf x >>"${count}"
+: >"$CODEX_STATUS_READY_FILE"
 exit 75
 `);
 
   const result = spawnSync(launcher, [], {
     env: {
       ...process.env,
+      XDG_CACHE_HOME: root,
       GNOME_TERMINAL_BIN: terminal,
       CODEX_USAGE_WATCH_BIN: status,
       CODEX_STATUS_LAUNCH_LOG: path.join(root, 'launch.log'),
@@ -74,9 +81,9 @@ test('status launcher assigns its dedicated WM class and role', t => {
   const status = path.join(root, 'status');
   const args = path.join(root, 'args');
   executable(status, '#!/bin/sh\nexit 0\n');
-  executable(terminal, `#!/bin/sh\nprintf '%s\\n' "$@" >"${args}"\nexit 0\n`);
+  executable(terminal, `#!/bin/sh\nprintf '%s\\n' "$@" >"${args}"\n: >"$CODEX_STATUS_READY_FILE"\nexit 0\n`);
   const result = spawnSync(launcher, [], {
-    env: { ...process.env, GNOME_TERMINAL_BIN: terminal, CODEX_USAGE_WATCH_BIN: status,
+    env: { ...process.env, XDG_CACHE_HOME: root, GNOME_TERMINAL_BIN: terminal, CODEX_USAGE_WATCH_BIN: status,
       CODEX_STATUS_LAUNCH_LOG: path.join(root, 'launch.log') },
   });
   assert.equal(result.status, 0);
@@ -97,9 +104,9 @@ test('production launcher starts a dedicated server before its terminal client',
   executable(status, '#!/bin/sh\nexit 0\n');
   executable(server, `#!/bin/sh\nprintf 'server %s\n' "$*" >>"${events}"\ntrap 'exit 0' TERM\nwhile :; do sleep 0.1; done\n`);
   executable(busctl, `#!/bin/sh\ngrep -q '^server ' "${events}" 2>/dev/null || exit 1\nprintf 'ready %s\n' "$*" >>"${events}"\nexit 0\n`);
-  executable(client, `#!/bin/sh\nprintf 'client %s\n' "$*" >>"${events}"\nexit 0\n`);
+  executable(client, `#!/bin/sh\nprintf 'client %s\n' "$*" >>"${events}"\n: >"$CODEX_STATUS_READY_FILE"\nexit 0\n`);
   const result = spawnSync(launcher, [], {
-    env: { ...process.env, GNOME_TERMINAL_BIN: '', GNOME_TERMINAL_SERVER_BIN: server,
+    env: { ...process.env, XDG_CACHE_HOME: root, GNOME_TERMINAL_BIN: '', GNOME_TERMINAL_SERVER_BIN: server,
       GNOME_TERMINAL_CLIENT_BIN: client, CODEX_STATUS_BUSCTL_BIN: busctl,
       CODEX_USAGE_WATCH_BIN: status, CODEX_STATUS_LAUNCH_LOG: path.join(root, 'launch.log') },
     encoding: 'utf8',
@@ -109,4 +116,61 @@ test('production launcher starts a dedicated server before its terminal client',
   assert.match(lines[0], /^server --app-id com\.canonical\.Terminal\.CodexStatus\.instance[0-9]+ --class CodexStatus$/);
   assert.match(lines[1], /^ready --user status com\.canonical\.Terminal\.CodexStatus\.instance[0-9]+$/);
   assert.match(lines[2], /^client --app-id com\.canonical\.Terminal\.CodexStatus\.instance[0-9]+ --wait /);
+});
+
+test('normal close after verified startup never sends a launch-failure notification', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-status-launch-test-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const terminal = path.join(root, 'terminal');
+  const status = path.join(root, 'status');
+  const notifications = path.join(root, 'notifications');
+  const notify = path.join(root, 'notify-send');
+  executable(status, '#!/bin/sh\nexit 0\n');
+  executable(terminal, '#!/bin/sh\n: >"$CODEX_STATUS_READY_FILE"\nsleep 0.05\nexit 129\n');
+  executable(notify, `#!/bin/sh\nprintf '%s\n' "$*" >>"${notifications}"\n`);
+
+  const result = spawnSync(launcher, [], {
+    env: {
+      ...process.env,
+      XDG_CACHE_HOME: root,
+      PATH: `${root}:${process.env.PATH}`,
+      GNOME_TERMINAL_BIN: terminal,
+      CODEX_USAGE_WATCH_BIN: status,
+      CODEX_STATUS_LAUNCH_LOG: path.join(root, 'launch.log'),
+      CODEX_STATUS_READY_POLL_DELAY: '0.01',
+    },
+    encoding: 'utf8',
+  });
+  assert.equal(result.status, 129, result.stderr);
+  assert.equal(fs.existsSync(notifications), false);
+  assert.match(fs.readFileSync(path.join(root, 'launch.log'), 'utf8'), /startup verified/);
+});
+
+test('missing readiness signal is treated as a real startup failure', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-status-launch-test-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const terminal = path.join(root, 'terminal');
+  const status = path.join(root, 'status');
+  const notifications = path.join(root, 'notifications');
+  const notify = path.join(root, 'notify-send');
+  executable(status, '#!/bin/sh\nexit 0\n');
+  executable(terminal, '#!/bin/sh\nexit 0\n');
+  executable(notify, `#!/bin/sh\nprintf '%s\n' "$*" >>"${notifications}"\n`);
+
+  const result = spawnSync(launcher, [], {
+    env: {
+      ...process.env,
+      XDG_CACHE_HOME: root,
+      PATH: `${root}:${process.env.PATH}`,
+      GNOME_TERMINAL_BIN: terminal,
+      CODEX_USAGE_WATCH_BIN: status,
+      CODEX_STATUS_LAUNCH_LOG: path.join(root, 'launch.log'),
+      CODEX_STATUS_LAUNCH_RETRY_DELAY: '0',
+      CODEX_STATUS_READY_CHECKS: '1',
+      CODEX_STATUS_READY_POLL_DELAY: '0.01',
+    },
+    encoding: 'utf8',
+  });
+  assert.equal(result.status, 70);
+  assert.match(fs.readFileSync(notifications, 'utf8'), /Codex-kontostatus kunde inte starta/);
 });

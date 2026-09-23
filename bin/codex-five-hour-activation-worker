@@ -17,9 +17,11 @@ const {
   releaseAccountActivationLock,
 } = require(path.join(__dirname, '..', 'lib', 'codex-activation-lock'));
 const {
+  assertAccountNotVerifiedExhausted,
   configuredValue,
   loadCredential,
   readJson,
+  verifiedExhaustionForAccount,
 } = require(path.join(__dirname, '..', 'lib', 'codex-activation-account'));
 const {
   executeVerifiedFiveHourActivation,
@@ -51,6 +53,9 @@ const usageCacheFile = process.env.USAGE_CACHE || configuredValue(configFile, 'U
 const stateFile = process.env.FIVE_HOUR_ACTIVATION_STATE ||
   configuredValue(configFile, 'FIVE_HOUR_ACTIVATION_STATE') ||
   path.join(cacheDirectory, 'five-hour-activation.json');
+const eventStateFile = process.env.CODEX_EVENT_STATE ||
+  configuredValue(configFile, 'CODEX_EVENT_STATE') ||
+  path.join(cacheDirectory, 'turn-events.json');
 const usageRefresher = process.env.USAGE_REFRESHER ||
   configuredValue(configFile, 'USAGE_REFRESHER') ||
   path.join(os.homedir(), '.local', 'bin', 'codex-usage-refresh');
@@ -114,6 +119,7 @@ function forceUsageRefresh() {
 }
 
 async function activateAccount(account, accountId, accessToken, usageCache, hooks) {
+  assertAccountNotVerifiedExhausted(eventStateFile, accountId);
   const accountLock = acquireAccountActivationLock(lockDirectory, accountId);
   let tempRoot = null;
 
@@ -124,6 +130,7 @@ async function activateAccount(account, accountId, accessToken, usageCache, hook
     const schemaDirectory = path.join(tempRoot, 'schema');
     fs.mkdirSync(privateHome, { mode: 0o700 });
     const fetchObservation = () => fetchFreshUsageObservation({ accountId, accessToken });
+    assertAccountNotVerifiedExhausted(eventStateFile, accountId);
     generateAndCheckSchema({ codexBin, privateHome, schemaDirectory });
     const beforeFingerprint = fingerprintAuthState(codexHome);
     let activationResult = null;
@@ -134,6 +141,7 @@ async function activateAccount(account, accountId, accessToken, usageCache, hook
         accountId,
         accessToken,
         fetchObservation,
+        assertCanActivate: () => assertAccountNotVerifiedExhausted(eventStateFile, accountId),
         runTurn: async () => {
           assertQuotaActivationAllowed(accountId, activationHoldsFile);
           await hooks.beforeTurn();
@@ -171,11 +179,16 @@ async function main() {
     const registry = readJson(path.join(codexHome, 'accounts', 'registry.json'));
     const accounts = accountsFromRegistry(registry);
     const usageCache = readJson(usageCacheFile);
+    const eventState = readJson(eventStateFile);
     const activationHolds = readActivationHolds(activationHoldsFile);
     const finalState = await runFiveHourActivationCycle({
       accounts,
       usageCache,
       previousState,
+      verifiedExhaustionForAccount: account => verifiedExhaustionForAccount(
+        eventState,
+        account.chatgpt_account_id || account.accountId
+      ),
       activationHoldForAccount: account => activationHoldForAccount(
         activationHolds,
         account.chatgpt_account_id || account.accountId

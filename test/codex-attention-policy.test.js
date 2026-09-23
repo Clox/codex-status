@@ -171,3 +171,20 @@ test('different target or situation class can alert without re-arming old finger
   assert.equal(state.attention, true);
   assert.notEqual(first.fingerprint, urgent.fingerprint);
 });
+
+test('quota recovery attention stays latched until focus even after ordinary decisions resume', () => {
+  const recovery = {
+    worthy: true,
+    immediate: true,
+    persistentUntilFocus: true,
+    fingerprint: 'quota-recovered:1',
+    situationClass: 'quota-recovered',
+    observationKey: 'recovery-1',
+  };
+  let state = advanceAttentionState(null, recovery, false);
+  assert.equal(state.attention, true);
+  state = advanceAttentionState(state, { worthy: false, observationKey: null }, false);
+  assert.equal(state.attention, true);
+  state = advanceAttentionState(state, { worthy: false, observationKey: null }, true);
+  assert.equal(state.attention, false);
+});

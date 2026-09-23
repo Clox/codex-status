@@ -188,6 +188,29 @@ test('state that changed while confirmation waited stops before any turn', async
   assert.equal(turns, 0);
 });
 
+test('verified exhaustion guard runs after fresh dormant revalidation and before the 5H turn', async () => {
+  const observations = [
+    usageEnvelope(NOW_MS, { dormant: true }),
+    usageEnvelope(NOW_MS + 6_000, { dormant: true }),
+  ];
+  let turns = 0;
+  let guardCalls = 0;
+  await assert.rejects(executeVerifiedFiveHourActivation({
+    cache: dormantCache(),
+    accountId: ACCOUNT_ID,
+    accessToken: ACCESS_TOKEN,
+    fetchObservation: async () => observations.shift(),
+    assertCanActivate: async () => {
+      guardCalls += 1;
+      throw new Error('ACCOUNT_VERIFIED_EXHAUSTED');
+    },
+    runTurn: async () => { turns += 1; },
+    delay: async () => {},
+  }), /ACCOUNT_VERIFIED_EXHAUSTED/);
+  assert.equal(guardCalls, 1);
+  assert.equal(turns, 0);
+});
+
 test('post-confirmation recheck requires two newly fetched observations', async () => {
   let fetches = 0;
   await assert.rejects(reverifyFiveHourDormantAfterConfirmation({

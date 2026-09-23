@@ -63,25 +63,25 @@ test('a redeemed banked reset reduces the available count and removes the consum
 });
 
 test('formats zero, one and multiple resets with a three-digit hour countdown', () => {
-  assert.equal(formatResetValue({ availableCount: 0 }, NOW_MS), '    -    ');
+  assert.equal(formatResetValue({ availableCount: 0 }, NOW_MS), '-');
   assert.equal(formatResetValue({
     availableCount: 1,
     detailsComplete: true,
     earliestExpirationMs: NOW_MS + (25 * 60 + 4) * 60_000,
-  }, NOW_MS), ' 1×025:04');
+  }, NOW_MS), '1×025:04');
   assert.equal(formatResetValue({
     availableCount: 12,
     detailsComplete: true,
     earliestExpirationMs: NOW_MS + (120 * 60 + 45) * 60_000,
-  }, NOW_MS), '12×120:45');
+  }, NOW_MS), '9×120:45');
 });
 
-test('keeps exact hours beyond 999 instead of truncating the countdown', () => {
+test('uses a compact explicit overflow marker beyond 999 hours', () => {
   assert.equal(formatResetValue({
     availableCount: 2,
     detailsComplete: true,
     earliestExpirationMs: NOW_MS + (1_204 * 60 + 7) * 60_000,
-  }, NOW_MS), ' 2×1204:07');
+  }, NOW_MS), '2×>999h');
 });
 
 test('does not claim an expiration when detail rows are incomplete', () => {
@@ -89,7 +89,7 @@ test('does not claim an expiration when detail rows are incomplete', () => {
     availableCount: 2,
     detailsComplete: false,
     earliestExpirationMs: NOW_MS + 60_000,
-  }, NOW_MS), ' 2×???:??');
+  }, NOW_MS), '2×???:??');
 });
 
 test('rounds a partial minute upward and clamps expired credits to zero', () => {

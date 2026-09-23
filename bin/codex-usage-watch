@@ -27,7 +27,10 @@ CODEX_RESUME_STATE=${CODEX_RESUME_STATE:-"${XDG_CACHE_HOME:-$HOME/.cache}/codex-
 CODEX_MANUAL_RESUME=${CODEX_MANUAL_RESUME:-"$HOME/.local/bin/codex-manual-resume"}
 CODEX_STATUS_PREFERENCES=${CODEX_STATUS_PREFERENCES:-"${XDG_CONFIG_HOME:-$HOME/.config}/codex-account-switcher/status-preferences.json"}
 CODEX_STATUS_PREFERENCES_BIN=${CODEX_STATUS_PREFERENCES_BIN:-"$HOME/.local/bin/codex-status-preferences"}
+CODEX_QUOTA_TRANSITION_STATE=${CODEX_QUOTA_TRANSITION_STATE:-"${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/quota-transition.json"}
+CODEX_QUOTA_TRANSITION_BIN=${CODEX_QUOTA_TRANSITION_BIN:-"$HOME/.local/bin/codex-quota-transition"}
 export CODEX_RESUME_STATE CODEX_MANUAL_RESUME CODEX_STATUS_PREFERENCES CODEX_STATUS_PREFERENCES_BIN
+export CODEX_QUOTA_TRANSITION_STATE CODEX_QUOTA_TRANSITION_BIN
 USAGE_REFRESH_LOG=${USAGE_REFRESH_LOG:-"${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/usage-refresh.log"}
 loaded_script_hash=$(sha256sum "$0" | awk '{ print $1 }')
 printf '\033]0;Codex-kontostatus\007'
@@ -38,9 +41,16 @@ chmod 700 "$status_runtime_dir"
 exec {status_lock_fd}>"$status_runtime_dir/status-window-v2.lock"
 if ! flock -n "$status_lock_fd"; then
   printf '%s status singleton already held\n' "$(date --iso-8601=seconds)" >>"$status_runtime_dir/status-launch.log"
+  if [[ ${CODEX_STATUS_READY_FILE:-} == "$status_runtime_dir"/status-launch-ready.* ]]; then
+    : >"$CODEX_STATUS_READY_FILE"
+    chmod 600 "$CODEX_STATUS_READY_FILE"
+  fi
   exit 0
 fi
 status_started_at=$SECONDS
+status_raw_frame_cache="$status_runtime_dir/status-raw-frame.txt"
+collector_pid=''
+collector_tmp=''
 
 attention_fd=''
 attention_pid=''
@@ -63,6 +73,11 @@ cleanup() {
   if [[ -n $attention_pid ]]; then
     wait "$attention_pid" 2>/dev/null || true
   fi
+  if [[ -n $collector_pid ]] && kill -0 "$collector_pid" 2>/dev/null; then
+    kill "$collector_pid" 2>/dev/null || true
+    wait "$collector_pid" 2>/dev/null || true
+  fi
+  [[ -z $collector_tmp ]] || rm -f -- "$collector_tmp"
   if [[ -n $saved_stty ]]; then
     stty "$saved_stty" </dev/tty 2>/dev/null || true
     tput smam 2>/dev/null || true
@@ -84,9 +99,20 @@ fi
 
 pending_source_row=''
 pending_since=0
+pending_spinner_index=0
+pending_spinner_frames=('WAIT/' 'WAIT-' 'WAIT\' 'WAIT|')
 key_map=''
-resume_map=''
 last_background_refresh=-10
+paused_rendering=0
+last_drawn_frame=''
+base_frame=''
+raw_frame=''
+attention_json='{"worthy":false,"observationKey":null}'
+active_source_row=''
+ui_tick=0
+collector_tick=0
+last_columns=''
+force_render=0
 
 launch_detached() {
   setsid -f "$@" {status_lock_fd}>&- </dev/null >/dev/null 2>&1
@@ -108,37 +134,147 @@ draw_frame() {
   tput cup 0 0 2>/dev/null || printf '\033[H'
   tput ed 2>/dev/null || printf '\033[J'
   printf '%s\n' "$frame_to_draw"
-  printf '\033[2mW%%/H = weekly %% kvar per timme till reset.\033[0m\n'
-  printf '\033[2mTryck 1–3 för konto, A för auto-continue och visad continue-tangent för avbruten tråd. Ctrl+C stänger.\033[0m\n'
+  if ((paused_rendering)); then
+    printf '\033[1;33mPAUSED — tryck [P] för att återuppta och uppdatera vyn.\033[0m\n'
+  fi
+  printf '\n\033[2mPRIOR = weekly %% kvar per timme till reset × 100. Högre är mer angeläget.\033[0m\n'
+  printf '\033[2mTryck 1–3 för konto, A för auto-continue eller P för pause. Ctrl+C stänger.\033[0m\n'
   tput ed 2>/dev/null || printf '\033[J'
   tput smam 2>/dev/null || printf '\033[?7h'
 }
 
-highlight_pending_frame() {
-  local target_row=$1
-  printf '%s\n' "$frame" | awk -v row="$target_row" '
-    BEGIN { escape = sprintf("%c", 27); dim = escape "[0;2m"; yellow = escape "[0;33m" }
-    {
-      visible = $0
-      gsub(escape "\\[[0-9;]*m", "", visible)
-      if (visible ~ "^[[:space:]]+0?" row "[[:space:]]" && index($0, dim) == 1) {
-        sub("^" escape "\\[0;2m", yellow)
-      }
-      print
-    }
-  '
+draw_current_frame() {
+  local display_frame=$base_frame
+  if [[ -n $pending_source_row ]]; then
+    display_frame=${display_frame//WAIT\//${pending_spinner_frames[$pending_spinner_index]}}
+  fi
+  if ((!paused_rendering)) && [[ $display_frame != "$last_drawn_frame" ]]; then
+    draw_frame "$display_frame"
+    last_drawn_frame=$display_frame
+  fi
 }
 
-while true; do
-  current_script_hash=$(sha256sum "$0" 2>/dev/null | awk '{ print $1 }')
-  if [[ -z $current_script_hash || $current_script_hash != "$loaded_script_hash" ]]; then
-    notify-send 'Codex-kontostatus uppdaterad' 'Statusfönstret stängs för att inte fortsätta med gammal kod. Öppna det igen.' 2>/dev/null || true
-    printf '\nStatusverktyget har uppdaterats. Öppna Codex-kontostatus igen.\n'
-    exit 75
+signal_launcher_ready() {
+  if [[ ${CODEX_STATUS_READY_FILE:-} == "$status_runtime_dir"/status-launch-ready.* ]]; then
+    : >"$CODEX_STATUS_READY_FILE"
+    chmod 600 "$CODEX_STATUS_READY_FILE"
   fi
-  columns=$(tput cols 2>/dev/null || printf '100')
-  [[ $columns =~ ^[0-9]+$ ]] || columns=100
+}
+
+start_local_collection() {
+  [[ -z $collector_pid ]] || return 0
+  collector_tmp=$(mktemp "$status_runtime_dir/status-raw-frame.XXXXXX")
+  chmod 600 "$collector_tmp"
+  (
+    if script -qefc "stty cols $columns; exec \"$CODEX_AUTH_BIN\" list --skip-api" /dev/null </dev/null >"$collector_tmp"; then
+      mv -f -- "$collector_tmp" "$status_raw_frame_cache"
+      chmod 600 "$status_raw_frame_cache"
+    fi
+  ) {status_lock_fd}>&- &
+  collector_pid=$!
+}
+
+finish_local_collection() {
+  [[ -n $collector_pid ]] || return 1
+  kill -0 "$collector_pid" 2>/dev/null && return 1
+  if wait "$collector_pid" && [[ -s $status_raw_frame_cache ]]; then
+    raw_frame=$(<"$status_raw_frame_cache")
+    force_render=1
+  fi
+  collector_pid=''
+  collector_tmp=''
+  return 0
+}
+
+process_snapshot() {
   status_now_ms=$(($(date +%s) * 1000))
+  local frame key_map_next attention_next availability_json quota_transition
+  if frame=$(
+      printf '%s\n' "$raw_frame" |
+        CODEX_STATUS_RANKING=1 CODEX_STATUS_COLUMNS="$columns" CODEX_PENDING_SOURCE_ROW="$pending_source_row" CODEX_PENDING_STATUS='WAIT/' CODEX_STATUS_NOW_MS="$status_now_ms" "$USAGE_ANNOTATOR"
+    ) &&
+    key_map_next=$(
+      printf '%s\n' "$raw_frame" |
+        CODEX_STATUS_RANKING=1 CODEX_STATUS_COLUMNS="$columns" CODEX_STATUS_NOW_MS="$status_now_ms" "$USAGE_ANNOTATOR" --key-map
+    ) &&
+    attention_next=$(
+      printf '%s\n' "$raw_frame" |
+        CODEX_STATUS_RANKING=1 CODEX_STATUS_COLUMNS="$columns" CODEX_STATUS_NOW_MS="$status_now_ms" "$USAGE_ANNOTATOR" --attention-state
+    ) &&
+    availability_json=$(
+      printf '%s\n' "$raw_frame" |
+        CODEX_STATUS_RANKING=1 CODEX_STATUS_COLUMNS="$columns" CODEX_STATUS_NOW_MS="$status_now_ms" "$USAGE_ANNOTATOR" --availability-state
+    ); then
+    key_map=$key_map_next
+    attention_json=$attention_next
+    quota_transition=$(printf '%s\n' "$availability_json" | "$CODEX_QUOTA_TRANSITION_BIN" 2>>"$status_runtime_dir/status-launch.log") || quota_transition=null
+    active_source_row=$(printf '%s\n' "$key_map" | awk '$3 == "active" { print $2; exit }')
+    if [[ -n $pending_source_row && $pending_source_row == "$active_source_row" ]]; then
+      pending_source_row=''
+      pending_since=0
+      pending_spinner_index=0
+      frame=$(printf '%s\n' "$raw_frame" |
+        CODEX_STATUS_RANKING=1 CODEX_STATUS_COLUMNS="$columns" CODEX_STATUS_NOW_MS="$status_now_ms" "$USAGE_ANNOTATOR")
+    elif [[ -n $pending_source_row && $((SECONDS - pending_since)) -ge 2 ]] &&
+        ! pgrep -f "^${ACCOUNT_SWITCHER} [123] --desktop( |$)" >/dev/null 2>&1; then
+      pending_source_row=''
+      pending_since=0
+      pending_spinner_index=0
+      frame=$(printf '%s\n' "$raw_frame" |
+        CODEX_STATUS_RANKING=1 CODEX_STATUS_COLUMNS="$columns" CODEX_STATUS_NOW_MS="$status_now_ms" "$USAGE_ANNOTATOR")
+    fi
+    recovery_fingerprint=$(printf '%s\n' "$quota_transition" | node -e '
+      let input=""; process.stdin.on("data", chunk => input += chunk); process.stdin.on("end", () => {
+        try { const event=JSON.parse(input); if (event?.type === "quota-available") process.stdout.write(event.fingerprint || ""); } catch {}
+      });
+    ')
+    if [[ -n $recovery_fingerprint ]]; then
+      recovery_labels=$(printf '%s\n' "$quota_transition" | node -e '
+        let input=""; process.stdin.on("data", chunk => input += chunk); process.stdin.on("end", () => {
+          try { const event=JSON.parse(input); process.stdout.write((event?.accounts || []).map(account => account.label).join(", ")); } catch {}
+        });
+      ')
+      notify-send 'Codex-kvot åter tillgänglig' "Åter användbart: ${recovery_labels:-ett verifierat konto}." 2>/dev/null || true
+      attention_json=$(printf '{"worthy":true,"immediate":true,"persistentUntilFocus":true,"fingerprint":"%s","situationClass":"quota-recovered","observationKey":"%s"}' "$recovery_fingerprint" "$recovery_fingerprint")
+    fi
+    base_frame=$frame
+    if [[ -n $attention_fd ]]; then
+      printf '%s\n' "$attention_json" >&"$attention_fd" 2>/dev/null || attention_fd=''
+    fi
+  elif [[ -n $attention_fd ]]; then
+    printf '%s\n' '{"worthy":false,"observationKey":null}' >&"$attention_fd" 2>/dev/null || attention_fd=''
+  fi
+}
+
+columns=$(tput cols 2>/dev/null || printf '100')
+[[ $columns =~ ^[0-9]+$ ]] || columns=100
+last_columns=$columns
+if [[ -s $status_raw_frame_cache ]]; then
+  raw_frame=$(<"$status_raw_frame_cache")
+  process_snapshot
+else
+  base_frame=$'Codex-kontostatus\n\nLoading cached account state…'
+fi
+draw_current_frame
+signal_launcher_ready
+start_local_collection
+
+while true; do
+  ui_tick=$((ui_tick + 1))
+  if ((ui_tick % 5 == 0)); then
+    current_script_hash=$(sha256sum "$0" 2>/dev/null | awk '{ print $1 }')
+    if [[ -z $current_script_hash || $current_script_hash != "$loaded_script_hash" ]]; then
+      notify-send 'Codex-kontostatus uppdaterad' 'Statusfönstret stängs för att inte fortsätta med gammal kod. Öppna det igen.' 2>/dev/null || true
+      printf '\nStatusverktyget har uppdaterats. Öppna Codex-kontostatus igen.\n'
+      exit 75
+    fi
+    columns=$(tput cols 2>/dev/null || printf '100')
+    [[ $columns =~ ^[0-9]+$ ]] || columns=100
+    if [[ $columns != "$last_columns" ]]; then
+      last_columns=$columns
+      force_render=1
+    fi
+  fi
 
   if ((SECONDS - last_background_refresh >= 10)); then
     launch_usage_refresh
@@ -146,43 +282,27 @@ while true; do
     last_background_refresh=$SECONDS
   fi
 
-  if raw_frame=$(
-    script -qefc "stty cols $columns; exec \"$CODEX_AUTH_BIN\" list --skip-api" /dev/null </dev/null
-  ) &&
-    frame=$(
-      printf '%s\n' "$raw_frame" |
-        CODEX_STATUS_RANKING=1 CODEX_PENDING_SOURCE_ROW="$pending_source_row" CODEX_STATUS_NOW_MS="$status_now_ms" "$USAGE_ANNOTATOR"
-    ) &&
-    key_map=$(
-      printf '%s\n' "$raw_frame" |
-        CODEX_STATUS_RANKING=1 CODEX_STATUS_NOW_MS="$status_now_ms" "$USAGE_ANNOTATOR" --key-map
-    ) &&
-    resume_map=$(
-      printf '%s\n' "$raw_frame" |
-        CODEX_STATUS_RANKING=1 CODEX_STATUS_NOW_MS="$status_now_ms" "$USAGE_ANNOTATOR" --resume-map
-    ) &&
-    attention_json=$(
-      printf '%s\n' "$raw_frame" |
-        CODEX_STATUS_RANKING=1 CODEX_STATUS_NOW_MS="$status_now_ms" "$USAGE_ANNOTATOR" --attention-state
-    ); then
-    active_source_row=$(printf '%s\n' "$key_map" | awk '$3 == "active" { print $2; exit }')
-    if [[ -n $pending_source_row && $pending_source_row == "$active_source_row" ]]; then
-      pending_source_row=''
-      pending_since=0
-    elif [[ -n $pending_source_row && $((SECONDS - pending_since)) -ge 60 ]]; then
-      pending_source_row=''
-      pending_since=0
-    fi
-    draw_frame "$frame"
-    if [[ -n $attention_fd ]]; then
-      printf '%s\n' "$attention_json" >&"$attention_fd" 2>/dev/null || attention_fd=''
-    fi
-  elif [[ -n $attention_fd ]]; then
-    printf '%s\n' '{"worthy":false,"observationKey":null}' >&"$attention_fd" 2>/dev/null || attention_fd=''
+  if finish_local_collection; then
+    collector_tick=0
+  else
+    collector_tick=$((collector_tick + 1))
+  fi
+  if [[ -z $collector_pid ]] && ((collector_tick >= 10)); then
+    start_local_collection
+    collector_tick=0
+  fi
+  if ((force_render)) && [[ -n $raw_frame ]]; then
+    process_snapshot
+    force_render=0
+  fi
+
+  draw_current_frame
+  if ((!paused_rendering)) && [[ -n $pending_source_row ]]; then
+    pending_spinner_index=$(((pending_spinner_index + 1) % ${#pending_spinner_frames[@]}))
   fi
 
   key=''
-  if IFS= read -rsn 1 -t 2 key </dev/tty; then
+  if IFS= read -rsn 1 -t 0.2 key </dev/tty; then
     case "$key" in
       1|2|3)
         if pgrep -f "^${ACCOUNT_SWITCHER} [123] --desktop( |$)" >/dev/null 2>&1; then
@@ -204,13 +324,19 @@ while true; do
           fi
           pending_source_row=$source_row
           pending_since=$SECONDS
-          frame=$(highlight_pending_frame "$key")
-          draw_frame "$frame"
+          pending_spinner_index=0
+          base_frame=$(printf '%s\n' "$raw_frame" |
+            CODEX_STATUS_RANKING=1 CODEX_STATUS_COLUMNS="$columns" CODEX_PENDING_SOURCE_ROW="$pending_source_row" CODEX_PENDING_STATUS='WAIT/' CODEX_STATUS_NOW_MS="$status_now_ms" "$USAGE_ANNOTATOR")
+          if ((!paused_rendering)); then
+            last_drawn_frame=''
+            draw_current_frame
+            pending_spinner_index=$(((pending_spinner_index + 1) % ${#pending_spinner_frames[@]}))
+          fi
           launch_detached "$ACCOUNT_SWITCHER" "$launcher_account" --desktop
         fi
         ;;
       r|R)
-        if printf '%s\n' "$frame" | grep -Fq 'Press [R] to repair authentication'; then
+        if printf '%s\n' "$base_frame" | grep -Fq 'Press [R] to repair authentication'; then
           if pgrep -f "${AUTH_REPAIRER}([[:space:]]|$)" >/dev/null 2>&1; then
             notify-send 'Codex auth-reparation' 'En auth-reparation pågår redan.' 2>/dev/null || true
           else
@@ -223,17 +349,26 @@ while true; do
       a|A)
         if ! "$CODEX_STATUS_PREFERENCES_BIN" toggle-auto-continue >/dev/null 2>>"$status_runtime_dir/status-launch.log"; then
           notify-send 'Codex auto-continue' 'Inställningen kunde inte ändras. Se statusfönstrets problemsektion.' 2>/dev/null || true
+        else
+          force_render=1
         fi
         ;;
-      4|5|6|7|8|9)
-        resume_thread=$(printf '%s\n' "$resume_map" | awk -v key="$key" '$1 == key { print $2; exit }')
-        resume_turn=$(printf '%s\n' "$resume_map" | awk -v key="$key" '$1 == key { print $3; exit }')
-        if [[ ! $resume_thread =~ ^[0-9a-f-]{20,}$ || ! $resume_turn =~ ^[0-9a-f-]{20,}$ ]]; then
-          notify-send 'Codex continue' 'Ingen verifierad quota-avbruten tråd är kopplad till tangenten.' 2>/dev/null || true
-        elif pgrep -f "${CODEX_MANUAL_RESUME}([[:space:]]|$)" >/dev/null 2>&1; then
-          notify-send 'Codex continue' 'En manuell resume pågår redan.' 2>/dev/null || true
+      p|P)
+        if ((paused_rendering)); then
+          paused_rendering=0
+          last_drawn_frame=''
+          force_render=1
+          [[ -z $raw_frame ]] || process_snapshot
+          force_render=0
+          draw_current_frame
         else
-          launch_detached "$(command -v gnome-terminal)" --hide-menubar --title='Codex manuell continue' -- "$CODEX_MANUAL_RESUME" "$resume_thread" "$resume_turn"
+          paused_rendering=1
+          frozen_frame=$base_frame
+          if [[ -n $pending_source_row ]]; then
+            frozen_frame=${frozen_frame//WAIT\//${pending_spinner_frames[$pending_spinner_index]}}
+          fi
+          draw_frame "$frozen_frame"
+          last_drawn_frame=$frozen_frame
         fi
         ;;
     esac
