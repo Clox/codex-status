@@ -1,0 +1,378 @@
+#!/usr/bin/env node
+
+'use strict';
+
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { spawn } = require('node:child_process');
+const { verifyActiveAccountState } = require(path.join(__dirname, '..', 'lib', 'codex-account-state'));
+const {
+  accountStateError,
+  discoverVsCodeCodexChain,
+  extensionHostRestartBudget,
+  mergeExtensionHostCrashEvents,
+  parseExtensionHostCrashEvents,
+  processSignalPlan,
+} = require(path.join(__dirname, '..', 'lib', 'codex-vscode-normalize'));
+
+const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+const cacheDirectory = path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache'), 'codex-account-switcher');
+const eventStatePath = process.env.CODEX_EVENT_STATE || path.join(cacheDirectory, 'turn-events.json');
+const resultPath = process.env.VSCODE_NORMALIZE_STATE || path.join(cacheDirectory, 'vscode-normalize-result.json');
+const lockPath = path.join(cacheDirectory, 'exclusive-codex-operation.lock');
+const registryPath = path.join(codexHome, 'accounts', 'registry.json');
+const globalAuthPath = path.join(codexHome, 'auth.json');
+const vscodeLogRoot = process.env.VSCODE_LOG_ROOT || path.join(os.homedir(), '.config', 'Code', 'logs');
+const [expectedAccountId, expectedAccountKey, waitSecondsValue = '0'] = process.argv.slice(2);
+const waitSeconds = Number(waitSecondsValue);
+
+if (!expectedAccountId || !expectedAccountKey || !Number.isFinite(waitSeconds) || waitSeconds < 0) {
+  process.stderr.write('Usage: codex-vscode-normalize <target-account-id> <target-account-key> [wait-idle-seconds]\n');
+  process.exit(64);
+}
+
+function readJson(filename) { return JSON.parse(fs.readFileSync(filename, 'utf8')); }
+function sleep(milliseconds) { return new Promise(resolve => setTimeout(resolve, milliseconds)); }
+function processExists(pid) { try { process.kill(pid, 0); return true; } catch { return false; } }
+
+function atomicWriteJson(filename, value) {
+  fs.mkdirSync(path.dirname(filename), { recursive: true, mode: 0o700 });
+  const temporary = `${filename}.tmp-${process.pid}`;
+  fs.writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+  fs.renameSync(temporary, filename);
+  fs.chmodSync(filename, 0o600);
+}
+
+function processEntries() {
+  const entries = [];
+  for (const name of fs.readdirSync('/proc')) {
+    if (!/^\d+$/.test(name)) continue;
+    try {
+      const args = fs.readFileSync(`/proc/${name}/cmdline`).toString().split('\0').filter(Boolean);
+      const status = fs.readFileSync(`/proc/${name}/status`, 'utf8');
+      const stat = fs.readFileSync(`/proc/${name}/stat`, 'utf8').split(' ');
+      entries.push({
+        pid: Number(name),
+        ppid: Number(status.match(/^PPid:\s+(\d+)/m)?.[1]),
+        state: status.match(/^State:\s+(\S)/m)?.[1] || '?',
+        startTicks: stat[21],
+        args,
+      });
+    } catch {}
+  }
+  return entries;
+}
+
+function sameProcess(captured) {
+  const current = processEntries().find(entry => entry.pid === captured.pid);
+  return Boolean(current && current.startTicks === captured.startTicks);
+}
+
+function signalCaptured(captured, signal) {
+  if (!captured) return;
+  if (!sameProcess(captured)) return;
+  try { process.kill(captured.pid, signal); } catch (error) { if (error.code !== 'ESRCH') throw error; }
+}
+
+async function waitUntil(predicate, timeoutMs, errorKind) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await sleep(100);
+  }
+  throw new Error(errorKind);
+}
+
+function observerIdle() {
+  const state = readJson(eventStatePath);
+  const heartbeatAtMs = Number(state?.worker?.heartbeatAtMs || 0);
+  return Date.now() - heartbeatAtMs <= 15_000 && !state?.worker?.errorKind &&
+    Object.keys(state?.activeTurns || {}).length === 0;
+}
+
+function extensionHostLogSources(hostPid) {
+  let sessions;
+  try { sessions = fs.readdirSync(vscodeLogRoot, { withFileTypes: true }); } catch { throw new Error('VSCODE_CRASH_BUDGET_UNVERIFIED'); }
+  const candidates = [];
+  for (const session of sessions) {
+    if (!session.isDirectory()) continue;
+    const sessionPath = path.join(vscodeLogRoot, session.name);
+    let windows;
+    try { windows = fs.readdirSync(sessionPath, { withFileTypes: true }); } catch { continue; }
+    for (const windowEntry of windows) {
+      if (!windowEntry.isDirectory() || !/^window\d+$/.test(windowEntry.name)) continue;
+      const windowPath = path.join(sessionPath, windowEntry.name);
+      const extensionHostLog = path.join(windowPath, 'exthost', 'exthost.log');
+      try {
+        const contents = fs.readFileSync(extensionHostLog, 'utf8');
+        if (contents.includes(`Extension host with pid ${hostPid} started`) ||
+            contents.includes(`Started local extension host with pid ${hostPid}.`)) {
+          candidates.push({
+            filenames: [path.join(windowPath, 'renderer.log'), extensionHostLog],
+            mtimeMs: fs.statSync(extensionHostLog).mtimeMs,
+          });
+        }
+      } catch {}
+    }
+  }
+  candidates.sort((left, right) => right.mtimeMs - left.mtimeMs);
+  if (candidates.length === 0) throw new Error('VSCODE_CRASH_BUDGET_UNVERIFIED');
+  return candidates[0].filenames;
+}
+
+function restartBudget(logPaths, nowMs = Date.now()) {
+  let contents;
+  try { contents = logPaths.map(filename => fs.readFileSync(filename, 'utf8')); }
+  catch { throw new Error('VSCODE_CRASH_BUDGET_UNVERIFIED'); }
+  return extensionHostRestartBudget(mergeExtensionHostCrashEvents(contents), nowMs);
+}
+
+async function waitForRestartBudget(chain, captured) {
+  const logPaths = extensionHostLogSources(chain.host.pid);
+  const deadline = Date.now() + 10 * 60 * 1000;
+  while (true) {
+    if (!sameProcess(captured.find(entry => entry.pid === chain.host.pid)) ||
+        !sameProcess(captured.find(entry => entry.pid === chain.server.pid))) {
+      throw new Error('VSCODE_CHAIN_CHANGED_DURING_RESTART_BUDGET_WAIT');
+    }
+    if (!observerIdle()) throw new Error('OBSERVER_CHANGED_DURING_RESTART_BUDGET_WAIT');
+    verifyTargetAccount();
+    const budget = restartBudget(logPaths);
+    if (budget.safe) return { ...budget, logPaths };
+    if (budget.safeAtMs > deadline) throw new Error('VSCODE_CRASH_BUDGET_WAIT_TIMEOUT');
+    atomicWriteJson(resultPath, {
+      status: 'WAITING_FOR_VSCODE_RESTART_BUDGET',
+      targetAccountId: expectedAccountId,
+      safeAtMs: budget.safeAtMs,
+      recentCrashCount: budget.recentCrashCount,
+    });
+    await sleep(Math.max(50, Math.min(1_000, budget.safeAtMs - Date.now())));
+  }
+}
+
+async function waitForIdle() {
+  if (observerIdle()) return;
+  if (waitSeconds === 0) throw new Error('ACTIVE_TURNS_OR_OBSERVER_UNVERIFIED');
+  const deadline = Date.now() + waitSeconds * 1000;
+  while (Date.now() < deadline) {
+    await sleep(1000);
+    if (observerIdle()) return;
+  }
+  throw new Error('OBSERVER_IDLE_TIMEOUT');
+}
+
+function verifyTargetAccount() {
+  let registry;
+  let globalAuth;
+  try {
+    registry = readJson(registryPath);
+    globalAuth = readJson(globalAuthPath);
+  } catch {
+    throw new Error('AUTH_STATE_MISSING_OR_INVALID');
+  }
+  const verification = verifyActiveAccountState({
+    registry,
+    globalAuth,
+    expectedAccountId,
+    expectedAccountKey,
+  });
+  const errorKind = accountStateError(verification);
+  if (errorKind) {
+    const error = new Error(errorKind);
+    error.diagnostics = { fields: verification.errors };
+    throw error;
+  }
+  return { accountId: expectedAccountId, accountKey: expectedAccountKey };
+}
+
+function acquireLock() {
+  fs.mkdirSync(cacheDirectory, { recursive: true, mode: 0o700 });
+  try {
+    fs.mkdirSync(lockPath, { mode: 0o700 });
+    fs.writeFileSync(path.join(lockPath, 'owner'), `${process.pid}\n`, { mode: 0o600 });
+  } catch (error) {
+    if (error.code === 'EEXIST') throw new Error('EXCLUSIVE_CODEX_OPERATION_IN_PROGRESS');
+    throw error;
+  }
+}
+
+function releaseLock() {
+  try { fs.unlinkSync(path.join(lockPath, 'owner')); } catch {}
+  try { fs.rmdirSync(lockPath); } catch {}
+}
+
+function authEnvironment(serverPid) {
+  const values = fs.readFileSync(`/proc/${serverPid}/environ`).toString().split('\0').filter(Boolean);
+  const env = Object.fromEntries(values.map(value => {
+    const separator = value.indexOf('=');
+    return [value.slice(0, separator), value.slice(separator + 1)];
+  }));
+  const forbidden = ['CODEX_ACCESS_TOKEN', 'OPENAI_API_KEY', 'CODEX_API_KEY', 'CHATGPT_ACCESS_TOKEN']
+    .filter(name => env[name]);
+  if (forbidden.length > 0) throw new Error(`NEW_VSCODE_SERVER_HAS_INJECTED_AUTH:${forbidden.join(',')}`);
+  if (env.CODEX_HOME && path.resolve(env.CODEX_HOME) !== path.resolve(codexHome)) {
+    throw new Error('NEW_VSCODE_SERVER_WRONG_CODEX_HOME');
+  }
+  return { codexHome: env.CODEX_HOME || codexHome, injectedCredentials: [] };
+}
+
+async function probeAccount(executable) {
+  const child = spawn(executable, ['-c', 'features.code_mode_host=true', 'app-server', '--analytics-default-enabled'], {
+    stdio: ['pipe', 'pipe', 'ignore'], env: process.env,
+  });
+  const exited = new Promise(resolve => child.once('exit', resolve));
+  let buffer = '';
+  let nextId = 1;
+  let finished = false;
+  const pending = new Map();
+  function request(method, params) {
+    const id = nextId++;
+    child.stdin.write(`${JSON.stringify({ id, method, params })}\n`);
+    return new Promise((resolve, reject) => pending.set(id, { resolve, reject }));
+  }
+  const result = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => finish(new Error('ACCOUNT_PROBE_TIMEOUT')), 15_000);
+    function finish(error, value) {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      child.stdin.end();
+      child.kill('SIGTERM');
+      error ? reject(error) : resolve(value);
+    }
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', chunk => {
+      buffer += chunk;
+      let newline;
+      while ((newline = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1);
+        if (!line.trim()) continue;
+        let message;
+        try { message = JSON.parse(line); } catch { return finish(new Error('ACCOUNT_PROBE_PROTOCOL')); }
+        if (message.id === undefined || message.method) continue;
+        const waiter = pending.get(message.id);
+        if (!waiter) continue;
+        pending.delete(message.id);
+        message.error ? waiter.reject(new Error('ACCOUNT_PROBE_REQUEST_FAILED')) : waiter.resolve(message.result);
+      }
+    });
+    child.on('error', () => finish(new Error('ACCOUNT_PROBE_START_FAILED')));
+    child.on('exit', () => { if (!finished) finish(new Error('ACCOUNT_PROBE_EXITED')); });
+    (async () => {
+      await request('initialize', {
+        clientInfo: { name: 'codex_vscode_normalize', title: 'Codex VS Code normalization', version: '1.0.0' },
+        capabilities: { experimentalApi: true, requestAttestation: false },
+      });
+      child.stdin.write(`${JSON.stringify({ method: 'initialized', params: {} })}\n`);
+      const response = await request('account/rateLimits/read', {
+        excludeResetCreditDetails: true,
+        supportsLunaReserve: false,
+      });
+      finish(null, { accountId: response?.accountId || null, ordinaryUsageAllowed: response?.ordinaryUsageAllowed ?? null });
+    })().catch(error => finish(error));
+  });
+  await Promise.race([exited, sleep(2_000)]);
+  if (processExists(child.pid)) {
+    child.kill('SIGKILL');
+    await Promise.race([exited, sleep(2_000)]);
+  }
+  if (processExists(child.pid)) throw new Error('ACCOUNT_PROBE_DID_NOT_EXIT');
+  return result;
+}
+
+async function terminateCapturedTree(chain, entries) {
+  const captured = chain.tree.map(pid => entries.find(entry => entry.pid === pid)).filter(Boolean);
+  const byPid = new Map(captured.map(entry => [entry.pid, entry]));
+  const plan = processSignalPlan(chain.tree);
+  for (const pid of plan.terminate) signalCaptured(byPid.get(pid), 'SIGTERM');
+  for (const pid of plan.continue) signalCaptured(byPid.get(pid), 'SIGCONT');
+  const gone = () => captured.every(entry => !sameProcess(entry));
+  try {
+    await waitUntil(gone, 5_000, 'OLD_VSCODE_TREE_TERM_TIMEOUT');
+    return { forcedPids: [] };
+  } catch {
+    const survivors = captured.filter(sameProcess);
+    for (const entry of survivors) signalCaptured(entry, 'SIGKILL');
+    await waitUntil(gone, 5_000, `OLD_VSCODE_TREE_REMAINS:${survivors.map(entry => entry.pid).join(',')}`);
+    return { forcedPids: survivors.map(entry => entry.pid) };
+  }
+}
+
+async function main() {
+  atomicWriteJson(resultPath, { status: 'WAITING_FOR_IDLE', startedAtMs: Date.now(), targetAccountId: expectedAccountId });
+  await waitForIdle();
+  acquireLock();
+  let captured = [];
+  let plan = null;
+  let oldTreeDrained = false;
+  try {
+    if (!observerIdle()) throw new Error('OBSERVER_NO_LONGER_IDLE');
+    const beforeAccount = verifyTargetAccount();
+    const beforeEntries = processEntries();
+    const before = discoverVsCodeCodexChain(beforeEntries);
+    captured = before.tree.map(pid => beforeEntries.find(entry => entry.pid === pid)).filter(Boolean);
+    plan = processSignalPlan(before.tree);
+    const restartBudgetState = await waitForRestartBudget(before, captured);
+    if (!observerIdle()) throw new Error('OBSERVER_CHANGED_BEFORE_QUIESCE');
+    verifyTargetAccount();
+    for (const pid of plan.stop) signalCaptured(captured.find(entry => entry.pid === pid), 'SIGSTOP');
+    await waitUntil(() => captured.every(entry => !sameProcess(entry) || ['T', 't'].includes(processEntries().find(item => item.pid === entry.pid)?.state)), 5_000, 'VSCODE_TREE_NOT_QUIESCENT');
+    if (!observerIdle()) {
+      for (const pid of plan.continue) signalCaptured(captured.find(entry => entry.pid === pid), 'SIGCONT');
+      throw new Error('OBSERVER_CHANGED_DURING_QUIESCE');
+    }
+    const quiescedAccount = verifyTargetAccount();
+    const finalBudget = restartBudget(restartBudgetState.logPaths);
+    if (!finalBudget.safe) {
+      for (const pid of plan.continue) signalCaptured(captured.find(entry => entry.pid === pid), 'SIGCONT');
+      throw new Error('VSCODE_CRASH_BUDGET_CHANGED_DURING_QUIESCE');
+    }
+    const drained = await terminateCapturedTree(before, beforeEntries);
+    oldTreeDrained = true;
+
+    let after;
+    await waitUntil(() => {
+      try {
+        const candidate = discoverVsCodeCodexChain(processEntries());
+        if (candidate.host.pid === before.host.pid || candidate.server.pid === before.server.pid) return false;
+        after = candidate;
+        return true;
+      } catch { return false; }
+    }, 30_000, 'NEW_VSCODE_CHAIN_NOT_READY');
+
+    const afterAccount = verifyTargetAccount();
+    const environment = authEnvironment(after.server.pid);
+    const probe = await probeAccount(after.server.args[0]);
+    if (probe.accountId !== expectedAccountId) throw new Error('NEW_APP_SERVER_ACCOUNT_MISMATCH');
+    verifyTargetAccount();
+    atomicWriteJson(resultPath, {
+      status: 'VERIFIED', completedAtMs: Date.now(), targetAccountId: expectedAccountId,
+      beforeAccount, quiescedAccount, afterAccount,
+      oldHostPid: before.host.pid, oldServerPid: before.server.pid,
+      newHostPid: after.host.pid, newServerPid: after.server.pid,
+      probe, environment, forcedOldPids: drained.forcedPids,
+      restartBudget: {
+        recentCrashCountBeforeTermination: finalBudget.recentCrashCount,
+        logPaths: restartBudgetState.logPaths.map(filename => path.relative(os.homedir(), filename)),
+      },
+    });
+  } catch (error) {
+    if (plan && !oldTreeDrained) {
+      for (const pid of plan.continue) signalCaptured(captured.find(entry => entry.pid === pid), 'SIGCONT');
+    }
+    throw error;
+  } finally {
+    releaseLock();
+  }
+}
+
+main().catch(error => {
+  atomicWriteJson(resultPath, {
+    status: 'FAILED', failedAtMs: Date.now(), targetAccountId: expectedAccountId,
+    errorKind: error.message,
+    diagnostics: error?.diagnostics || null,
+  });
+  releaseLock();
+  process.exitCode = 1;
+});

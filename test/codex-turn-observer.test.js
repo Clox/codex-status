@@ -141,6 +141,55 @@ test('turn identity is the thread and turn pair, including repeated events and l
   assert.deepEqual(Object.keys(state.activeTurns), [turnKey('child-thread', 'next-turn')]);
 });
 
+test('rollout turn_aborted removes only the matching turn among multiple turns in one thread', () => {
+  let state = started(emptyEventState(NOW), 'thread-a', 'turn-a');
+  state = started(state, 'thread-a', 'turn-b');
+  state = applyRolloutRecord(state, {
+    type: 'event_msg', timestamp: new Date(NOW + 100).toISOString(),
+    payload: { type: 'turn_aborted', turn_id: 'turn-a', completed_at: NOW + 100, reason: 'interrupted' },
+  }, { threadId: 'thread-a', nowMs: NOW + 100 });
+  assert.deepEqual(Object.keys(state.activeTurns), [turnKey('thread-a', 'turn-b')]);
+  assert.equal(state.terminalTurns.at(-1).threadId, 'thread-a');
+  assert.equal(state.terminalTurns.at(-1).turnId, 'turn-a');
+  assert.equal(state.terminalTurns.at(-1).status, 'aborted');
+});
+
+test('turn_aborted matches the exact thread-turn pair, clears pending usage errors, and is replay safe', () => {
+  let state = started(emptyEventState(NOW), 'thread-a', 'shared-turn');
+  state = started(state, 'thread-b', 'shared-turn');
+  state = applyProtocolNotification(state, {
+    method: 'error',
+    params: {
+      threadId: 'thread-a', turnId: 'shared-turn', willRetry: false,
+      error: { codexErrorInfo: 'usageLimitExceeded' },
+    },
+  }, { nowMs: NOW + 10 });
+  const abortedRecord = {
+    type: 'event_msg', timestamp: new Date(NOW + 20).toISOString(),
+    payload: { type: 'turn_aborted', turn_id: 'shared-turn', completed_at: NOW + 20, reason: 'interrupted' },
+  };
+  state = applyRolloutRecord(state, abortedRecord, { threadId: 'thread-a', nowMs: NOW + 20 });
+  assert.deepEqual(Object.keys(state.activeTurns), [turnKey('thread-b', 'shared-turn')]);
+  assert.equal(state.pendingErrors[turnKey('thread-a', 'shared-turn')], undefined);
+  assert.deepEqual(state.exhaustions, {});
+  assert.deepEqual(state.interruptedTurns, {});
+  assert.equal(state.terminalTurns.length, 1);
+  assert.equal(state.terminalTurns[0].status, 'aborted');
+
+  state.activeTurns[turnKey('thread-a', 'shared-turn')] = {
+    threadId: 'thread-a', turnId: 'shared-turn', accountId: 'account-a', state: 'running',
+  };
+  state.pendingErrors[turnKey('thread-a', 'shared-turn')] = {
+    threadId: 'thread-a', turnId: 'shared-turn', usageLimitExceeded: true, willRetry: false,
+  };
+  state = applyRolloutRecord(state, abortedRecord, { threadId: 'thread-a', nowMs: NOW + 30 });
+  assert.deepEqual(Object.keys(state.activeTurns), [turnKey('thread-b', 'shared-turn')]);
+  assert.equal(state.pendingErrors[turnKey('thread-a', 'shared-turn')], undefined);
+  assert.deepEqual(state.exhaustions, {});
+  assert.deepEqual(state.interruptedTurns, {});
+  assert.equal(state.terminalTurns.length, 1);
+});
+
 test('same turn ID in two threads cannot cross-bind exhaustion or create duplicate failed candidates', () => {
   let state = started(emptyEventState(NOW), 'parent-thread', 'shared-turn');
   state = started(state, 'child-thread', 'shared-turn');
@@ -325,6 +374,71 @@ test('observer checkpoints atomically and does not resurrect old active turns af
   state = JSON.parse(fs.readFileSync(path.join(cache, 'codex-account-switcher', 'turn-events.json')));
   assert.deepEqual(state.activeTurns, {});
   assert.equal(fs.statSync(path.join(cache, 'codex-account-switcher', 'turn-events.json')).mode & 0o777, 0o600);
+});
+
+test('observer checkpoints turn_aborted terminal state across restart without replaying it', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-turn-observer-aborted-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const codexHome = path.join(root, '.codex');
+  const sessionDirectory = path.join(codexHome, 'sessions', '2026', '09', '23');
+  const registryDirectory = path.join(codexHome, 'accounts');
+  const cache = path.join(root, 'cache');
+  fs.mkdirSync(sessionDirectory, { recursive: true });
+  fs.mkdirSync(registryDirectory, { recursive: true });
+  fs.writeFileSync(path.join(registryDirectory, 'registry.json'), JSON.stringify({
+    active_account_key: 'key-a',
+    accounts: [{ account_key: 'key-a', chatgpt_account_id: 'account-a' }],
+  }));
+  const rollout = path.join(sessionDirectory, 'rollout-aborted.jsonl');
+  fs.writeFileSync(rollout, `${JSON.stringify({
+    type: 'session_meta', payload: { id: 'thread-aborted' }, timestamp: new Date().toISOString(),
+  })}\n`);
+  const observer = path.join(__dirname, '..', 'bin', 'codex-turn-observer');
+  const statePath = path.join(cache, 'codex-account-switcher', 'turn-events.json');
+  const environment = {
+    ...process.env,
+    HOME: root,
+    CODEX_HOME: codexHome,
+    XDG_CACHE_HOME: cache,
+    CODEX_EVENT_STATE: statePath,
+    USAGE_CACHE: path.join(cache, 'codex-account-switcher', 'usage.json'),
+  };
+  const run = () => spawnSync(process.execPath, [observer, '--once'], { env: environment, encoding: 'utf8' });
+  assert.equal(run().status, 0);
+
+  const startedAt = Date.now();
+  fs.appendFileSync(rollout, `${JSON.stringify({
+    type: 'event_msg', timestamp: new Date(startedAt).toISOString(),
+    payload: { type: 'task_started', turn_id: 'turn-aborted', started_at: startedAt },
+  })}\n`);
+  assert.equal(run().status, 0);
+  let state = JSON.parse(fs.readFileSync(statePath));
+  assert.ok(state.activeTurns[turnKey('thread-aborted', 'turn-aborted')]);
+
+  const completedAt = startedAt + 100;
+  fs.appendFileSync(rollout, `${JSON.stringify({
+    type: 'event_msg', timestamp: new Date(completedAt).toISOString(),
+    payload: {
+      type: 'turn_aborted', turn_id: 'turn-aborted', completed_at: completedAt,
+      duration_ms: 100, reason: 'interrupted',
+    },
+  })}\n`);
+  assert.equal(run().status, 0);
+  state = JSON.parse(fs.readFileSync(statePath));
+  assert.deepEqual(state.activeTurns, {});
+  assert.deepEqual(state.pendingErrors, {});
+  assert.deepEqual(state.exhaustions, {});
+  assert.deepEqual(state.interruptedTurns, {});
+  assert.equal(state.terminalTurns.length, 1);
+  assert.equal(state.terminalTurns[0].status, 'aborted');
+  assert.equal(state.terminalTurns[0].completedAtMs, completedAt);
+  const checkpointOffset = Object.values(state.files)[0].offset;
+
+  assert.equal(run().status, 0);
+  state = JSON.parse(fs.readFileSync(statePath));
+  assert.deepEqual(state.activeTurns, {});
+  assert.equal(state.terminalTurns.length, 1);
+  assert.equal(Object.values(state.files)[0].offset, checkpointOffset);
 });
 
 test('observer sees future appends in an existing rollout with a large session_meta record', t => {

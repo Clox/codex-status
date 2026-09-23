@@ -1,0 +1,28 @@
+#!/usr/bin/env node
+
+'use strict';
+
+const path = require('path');
+const {
+  defaultStatusPreferencesPath,
+  readStatusPreferences,
+  toggleAutoContinue,
+} = require(path.join(__dirname, '..', 'lib', 'codex-status-preferences'));
+
+const statePath = process.env.CODEX_STATUS_PREFERENCES || defaultStatusPreferencesPath();
+const command = process.argv[2] || 'show';
+
+try {
+  let preferences;
+  if (command === 'show') {
+    preferences = readStatusPreferences(statePath);
+  } else if (command === 'toggle-auto-continue') {
+    preferences = toggleAutoContinue(statePath);
+  } else {
+    throw new Error('USAGE: codex-status-preferences [show|toggle-auto-continue]');
+  }
+  process.stdout.write(`${preferences.autoContinue ? 'on' : 'off'}\n`);
+} catch (error) {
+  process.stderr.write(`${error?.message || 'STATUS_PREFERENCES_FAILED'}\n`);
+  process.exitCode = 1;
+}

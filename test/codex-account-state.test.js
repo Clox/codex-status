@@ -41,5 +41,32 @@ test('postcondition fails closed for either global auth or registry mismatch', (
     expectedAccountKey: 'key-b',
   });
   assert.equal(result.ok, false);
-  assert.deepEqual(result.errors, ['registry-active-key-mismatch', 'registry-account-id-mismatch']);
+  assert.deepEqual(result.errors, ['registry-active-key-mismatch', 'registry-active-account-id-mismatch']);
+});
+
+test('postcondition distinguishes missing registry target, active key, account id and global auth', () => {
+  const missing = verifyActiveAccountState({
+    registry: { active_account_key: 'missing-key', accounts: registry().accounts },
+    globalAuth: { tokens: { account_id: 'wrong-global' } },
+    expectedAccountId: 'account-c',
+    expectedAccountKey: 'key-c',
+  });
+  assert.deepEqual(missing.errors, [
+    'registry-target-account-missing',
+    'registry-active-key-mismatch',
+    'registry-active-account-missing',
+    'global-auth-account-id-mismatch',
+  ]);
+
+  const wrongId = verifyActiveAccountState({
+    registry: registry('key-b'),
+    globalAuth: { tokens: { account_id: 'account-b' } },
+    expectedAccountId: 'different-account-b',
+    expectedAccountKey: 'key-b',
+  });
+  assert.deepEqual(wrongId.errors, [
+    'registry-target-account-id-mismatch',
+    'registry-active-account-id-mismatch',
+    'global-auth-account-id-mismatch',
+  ]);
 });

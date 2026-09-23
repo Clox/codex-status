@@ -10,15 +10,21 @@ const { once } = require('node:events');
 const { spawn } = require('node:child_process');
 const {
   CONTINUATION_PROMPT,
+  appServerExclusivityReport,
   atomicWriteJson,
   candidateKey,
   codexErrorKind,
   emptyResumeState,
+  isAppServerProcess,
+  isVsCodeCodexAppServerProcess,
   markResumeCommitted,
   markResumeFailure,
   markResumeTerminal,
   normalizeResumeState,
   pendingInterruptedTurns,
+  resumeProtocolRequests,
+  splitJsonLines,
+  validateThreadMetadataForResume,
   validateThreadForResume,
 } = require(path.join(__dirname, '..', 'lib', 'codex-manual-resume'));
 const { normalizeState, observerHealth } = require(path.join(__dirname, '..', 'lib', 'codex-turn-observer'));
@@ -38,6 +44,7 @@ const desktopLauncher = process.env.CHATGPT_LAUNCHER || '/usr/bin/chatgpt';
 const desktopBinary = process.env.CHATGPT_BINARY_PATTERN || '/usr/lib/chatgpt/ChatGPT';
 const MAX_USAGE_AGE_MS = 3 * 60 * 1000;
 const TURN_TIMEOUT_MS = 12 * 60 * 60 * 1000;
+const MAX_PROTOCOL_FRAME_BYTES = 4 * 1024 * 1024;
 
 function readJson(filename, fallback = null) {
   try { return JSON.parse(fs.readFileSync(filename, 'utf8')); } catch { return fallback; }
@@ -61,14 +68,6 @@ function processEntries() {
     } catch {}
   }
   return entries;
-}
-
-function isAppServer(entry) {
-  return entry.args.includes('app-server');
-}
-
-function isVsCodeCodexAppServer(entry) {
-  return isAppServer(entry) && /\/\.vscode\/extensions\/openai\.chatgpt-[^/]+\/bin\/[^/]+\/codex$/.test(entry.args[0] || '');
 }
 
 function isDesktopRoot(entry) {
@@ -113,7 +112,7 @@ async function waitUntil(predicate, timeoutMs, errorKind) {
 
 function discoverClientProcesses() {
   const entries = processEntries();
-  const vscodeServers = entries.filter(isVsCodeCodexAppServer);
+  const vscodeServers = entries.filter(isVsCodeCodexAppServerProcess);
   const vscodeHosts = [...new Set(vscodeServers.map(server => server.ppid))];
   for (const hostPid of vscodeHosts) {
     const host = entries.find(entry => entry.pid === hostPid);
@@ -125,7 +124,33 @@ function discoverClientProcesses() {
     vscodeHosts,
     vscodePids: descendants(entries, vscodeHosts),
     desktopRoots: entries.filter(isDesktopRoot).map(entry => entry.pid),
+    desktopPids: descendants(entries, entries.filter(isDesktopRoot).map(entry => entry.pid)),
   };
+}
+
+function blockerSummary(blockers) {
+  return blockers.map(blocker =>
+    `${blocker.role} pid=${blocker.pid} ppid=${blocker.ppid} state=${blocker.state}`
+  ).join('; ');
+}
+
+async function waitForAppServerExclusivity(desktopPids, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  let report = appServerExclusivityReport(processEntries(), {
+    desktopPids,
+    ignoredPids: [process.pid],
+  });
+  while (!report.exclusive && Date.now() < deadline) {
+    await sleep(100);
+    report = appServerExclusivityReport(processEntries(), {
+      desktopPids,
+      ignoredPids: [process.pid],
+    });
+  }
+  if (report.exclusive) return;
+  const error = new Error('APP_SERVER_EXCLUSIVITY_FAILED');
+  error.diagnostics = { blockers: report.blockers };
+  throw error;
 }
 
 function launchDesktop() {
@@ -188,9 +213,10 @@ async function acquireExclusiveClients() {
     signalExisting(discovered.desktopRoots, 'SIGTERM');
     await waitUntil(() => !processEntries().some(isDesktopRoot), 15_000, 'DESKTOP_DID_NOT_STOP');
 
-    const competitors = processEntries().filter(entry => isAppServer(entry) && entry.pid !== process.pid);
-    const unsafe = competitors.filter(entry => !isVsCodeCodexAppServer(entry) || !['T', 't'].includes(entry.state));
-    if (unsafe.length > 0) throw new Error('APP_SERVER_EXCLUSIVITY_FAILED');
+    // Electron's root can exit slightly before its App Server child. Wait for
+    // that already identified Desktop tree to drain, while every unknown or
+    // non-quiescent App Server remains a fail-closed blocker.
+    await waitForAppServerExclusivity(discovered.desktopPids);
     return lease;
   } catch (error) {
     await restoreClients(lease);
@@ -249,6 +275,8 @@ class RpcConnection {
     this.waiters = new Set();
     this.buffer = '';
     this.failure = null;
+    this.phase = 'startup';
+    this.receivedMessages = [];
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', chunk => this.onData(chunk));
     child.stderr.on('data', () => {});
@@ -257,13 +285,19 @@ class RpcConnection {
   }
 
   onData(chunk) {
-    this.buffer += chunk;
-    if (this.buffer.length > 4 * 1024 * 1024) return this.fail(new Error('APP_SERVER_PROTOCOL_OVERFLOW'));
-    let newline;
-    while ((newline = this.buffer.indexOf('\n')) >= 0) {
-      const line = this.buffer.slice(0, newline);
-      this.buffer = this.buffer.slice(newline + 1);
-      if (!line.trim()) continue;
+    let decoded;
+    try {
+      decoded = splitJsonLines(this.buffer, chunk, MAX_PROTOCOL_FRAME_BYTES);
+    } catch (error) {
+      error.diagnostics = {
+        phase: this.phase,
+        ...(error.diagnostics || {}),
+        receivedMessages: this.receivedMessages.slice(-32),
+      };
+      return this.fail(error);
+    }
+    this.buffer = decoded.remaining;
+    for (const line of decoded.lines) {
       let message;
       try { message = JSON.parse(line); } catch { return this.fail(new Error('APP_SERVER_PROTOCOL_MISMATCH')); }
       this.onMessage(message);
@@ -274,16 +308,19 @@ class RpcConnection {
     if (message.id !== undefined && !message.method) {
       const pending = this.pending.get(message.id);
       if (!pending) return;
+      this.recordMessage({ kind: 'response', method: pending.method, ok: !message.error });
       this.pending.delete(message.id);
       message.error ? pending.reject(new Error('APP_SERVER_REQUEST_FAILED')) : pending.resolve(message.result);
       return;
     }
     if (message.id !== undefined && message.method) {
+      this.recordMessage({ kind: 'server-request', method: message.method });
       this.handleServerRequest(message).catch(() => {
         this.respond(message.id, null, { code: -32603, message: 'Manual resume client could not safely answer request' });
       });
       return;
     }
+    this.recordMessage({ kind: 'notification', method: message.method || 'unknown' });
     this.notifications.push(message);
     if (this.notifications.length > 512) this.notifications.shift();
     for (const waiter of [...this.waiters]) {
@@ -292,6 +329,15 @@ class RpcConnection {
         waiter.resolve(message);
       }
     }
+  }
+
+  setPhase(phase) {
+    this.phase = phase;
+  }
+
+  recordMessage(summary) {
+    this.receivedMessages.push(summary);
+    if (this.receivedMessages.length > 64) this.receivedMessages.shift();
   }
 
   async handleServerRequest(message) {
@@ -323,7 +369,7 @@ class RpcConnection {
   request(method, params) {
     if (this.failure) return Promise.reject(this.failure);
     const id = this.nextId++;
-    const promise = new Promise((resolve, reject) => this.pending.set(id, { resolve, reject }));
+    const promise = new Promise((resolve, reject) => this.pending.set(id, { resolve, reject, method }));
     this.child.stdin.write(`${JSON.stringify({ id, method, params })}\n`);
     return promise;
   }
@@ -379,20 +425,37 @@ async function runResume(candidate, targetAccountId, onCommit) {
   const rpc = new RpcConnection(child);
   try {
     return await withTimeout((async () => {
+      const requests = resumeProtocolRequests(candidate.threadId);
+      rpc.setPhase('initialize');
       await rpc.request('initialize', {
         clientInfo: { name: 'codex_manual_resume', title: 'Codex Manual Resume', version: '1.0.0' },
         capabilities: { experimentalApi: true, requestAttestation: false },
       });
       rpc.notify('initialized');
-      const read = await rpc.request('thread/read', { threadId: candidate.threadId, includeTurns: true });
+      rpc.setPhase('thread-read-metadata');
+      const read = await rpc.request('thread/read', requests.read);
       const eventState = readJson(eventStatePath, {});
       const resumeState = normalizeResumeState(readJson(resumeStatePath, emptyResumeState()));
-      validateThreadForResume({ candidate, thread: read?.thread, eventState, resumeState });
-      const resumed = await rpc.request('thread/resume', { threadId: candidate.threadId });
+      validateThreadMetadataForResume({ candidate, thread: read?.thread, eventState, resumeState });
+      rpc.setPhase('thread-resume');
+      const resumed = await rpc.request('thread/resume', requests.resume);
       if (resumed?.thread?.id !== candidate.threadId || resumed.thread.status?.type !== 'idle') {
         throw new Error('THREAD_RESUME_POSTCONDITION_FAILED');
       }
+      rpc.setPhase('thread-turns-list');
+      const turns = await rpc.request('thread/turns/list', requests.latestTurn);
+      validateThreadForResume({
+        candidate,
+        thread: {
+          ...(resumed.thread || {}),
+          turns: Array.isArray(turns?.data) ? turns.data : [],
+        },
+        eventState: readJson(eventStatePath, {}),
+        resumeState: normalizeResumeState(readJson(resumeStatePath, emptyResumeState())),
+      });
+      rpc.setPhase('pre-turn-commit');
       await onCommit();
+      rpc.setPhase('turn-start');
       const started = await rpc.request('turn/start', {
         threadId: candidate.threadId,
         input: [{ type: 'text', text: CONTINUATION_PROMPT }],
@@ -400,6 +463,7 @@ async function runResume(candidate, targetAccountId, onCommit) {
       });
       const turnId = started?.turn?.id;
       if (!turnId) throw new Error('TURN_START_OUTCOME_UNKNOWN');
+      rpc.setPhase('turn-running');
       const terminal = await rpc.waitFor(message =>
         message.method === 'turn/completed' &&
         message.params?.threadId === candidate.threadId &&
@@ -486,9 +550,15 @@ async function main() {
     process.stdout.write(`Fortsättningsturnen avslutades med status ${result.status}. Klienterna återställs.\n`);
   } catch (error) {
     let journal = normalizeResumeState(readJson(resumeStatePath, emptyResumeState()));
-    journal = markResumeFailure(journal, candidate, error?.message || 'MANUAL_RESUME_FAILED', { committed });
+    journal = markResumeFailure(journal, candidate, error?.message || 'MANUAL_RESUME_FAILED', {
+      committed,
+      diagnostics: error?.diagnostics || null,
+    });
     atomicWriteJson(resumeStatePath, journal);
-    process.stderr.write(`MANUAL_REQUIRED: ${error?.message || 'MANUAL_RESUME_FAILED'}\n`);
+    const details = error?.diagnostics?.blockers?.length
+      ? ` (${blockerSummary(error.diagnostics.blockers)})`
+      : '';
+    process.stderr.write(`MANUAL_REQUIRED: ${error?.message || 'MANUAL_RESUME_FAILED'}${details}\n`);
     process.exitCode = 1;
   } finally {
     if (lease) await restoreClients(lease);

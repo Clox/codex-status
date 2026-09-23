@@ -25,7 +25,9 @@ CODEX_EVENT_STATE=${CODEX_EVENT_STATE:-"${XDG_CACHE_HOME:-$HOME/.cache}/codex-ac
 export CODEX_EVENT_STATE
 CODEX_RESUME_STATE=${CODEX_RESUME_STATE:-"${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/manual-resume.json"}
 CODEX_MANUAL_RESUME=${CODEX_MANUAL_RESUME:-"$HOME/.local/bin/codex-manual-resume"}
-export CODEX_RESUME_STATE CODEX_MANUAL_RESUME
+CODEX_STATUS_PREFERENCES=${CODEX_STATUS_PREFERENCES:-"${XDG_CONFIG_HOME:-$HOME/.config}/codex-account-switcher/status-preferences.json"}
+CODEX_STATUS_PREFERENCES_BIN=${CODEX_STATUS_PREFERENCES_BIN:-"$HOME/.local/bin/codex-status-preferences"}
+export CODEX_RESUME_STATE CODEX_MANUAL_RESUME CODEX_STATUS_PREFERENCES CODEX_STATUS_PREFERENCES_BIN
 USAGE_REFRESH_LOG=${USAGE_REFRESH_LOG:-"${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/usage-refresh.log"}
 loaded_script_hash=$(sha256sum "$0" | awk '{ print $1 }')
 printf '\033]0;Codex-kontostatus\007'
@@ -107,7 +109,7 @@ draw_frame() {
   tput ed 2>/dev/null || printf '\033[J'
   printf '%s\n' "$frame_to_draw"
   printf '\033[2mW%%/H = weekly %% kvar per timme till reset.\033[0m\n'
-  printf '\033[2mTryck 1–3 för konto och visad continue-tangent för avbruten tråd. Ctrl+C stänger.\033[0m\n'
+  printf '\033[2mTryck 1–3 för konto, A för auto-continue och visad continue-tangent för avbruten tråd. Ctrl+C stänger.\033[0m\n'
   tput ed 2>/dev/null || printf '\033[J'
   tput smam 2>/dev/null || printf '\033[?7h'
 }
@@ -216,6 +218,11 @@ while true; do
           fi
         else
           notify-send 'Codex auth-reparation' 'Inget konto har ett reparerbart authfel just nu.' 2>/dev/null || true
+        fi
+        ;;
+      a|A)
+        if ! "$CODEX_STATUS_PREFERENCES_BIN" toggle-auto-continue >/dev/null 2>>"$status_runtime_dir/status-launch.log"; then
+          notify-send 'Codex auto-continue' 'Inställningen kunde inte ändras. Se statusfönstrets problemsektion.' 2>/dev/null || true
         fi
         ;;
       4|5|6|7|8|9)

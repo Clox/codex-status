@@ -37,6 +37,31 @@ test('marks details incomplete when the authoritative count exceeds returned row
   assert.equal(parsed.detailsComplete, false);
 });
 
+test('a redeemed banked reset reduces the available count and removes the consumed expiration', () => {
+  const firstExpiration = '2026-10-04T01:45:34.046219Z';
+  const secondExpiration = '2026-10-04T21:52:33.848416Z';
+  const thirdExpiration = '2026-10-22T19:18:01.820169Z';
+  const available = expiration => ({
+    status: 'available',
+    reset_type: 'codex_rate_limits',
+    expires_at: expiration,
+  });
+  const before = parseResetCreditsResponse({
+    available_count: 3,
+    credits: [available(firstExpiration), available(secondExpiration), available(thirdExpiration)],
+  });
+  const after = parseResetCreditsResponse({
+    available_count: 2,
+    credits: [available(secondExpiration), available(thirdExpiration)],
+  });
+
+  assert.equal(before.availableCount, 3);
+  assert.equal(after.availableCount, 2);
+  assert.deepEqual(after.expirationsMs, [Date.parse(secondExpiration), Date.parse(thirdExpiration)]);
+  assert.equal(after.expirationsMs.includes(Date.parse(firstExpiration)), false);
+  assert.equal(after.detailsComplete, true);
+});
+
 test('formats zero, one and multiple resets with a three-digit hour countdown', () => {
   assert.equal(formatResetValue({ availableCount: 0 }, NOW_MS), '    -    ');
   assert.equal(formatResetValue({

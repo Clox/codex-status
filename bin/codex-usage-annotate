@@ -42,6 +42,11 @@ const {
   pendingInterruptedTurns,
 } = require(path.join(__dirname, '..', 'lib', 'codex-manual-resume'));
 const {
+  autoContinueLine,
+  defaultStatusPreferencesPath,
+  readStatusPreferences,
+} = require(path.join(__dirname, '..', 'lib', 'codex-status-preferences'));
+const {
   tableCell,
   activationObservationHoldLine,
   activationProblemLine,
@@ -76,6 +81,7 @@ const resumeStatePath = process.env.CODEX_RESUME_STATE || path.join(
   'codex-account-switcher',
   'manual-resume.json'
 );
+const statusPreferencesPath = process.env.CODEX_STATUS_PREFERENCES || defaultStatusPreferencesPath();
 const input = fs.readFileSync(0, 'utf8').replace(/\r/g, '');
 const mappingOnly = process.argv.includes('--key-map');
 const resumeMappingOnly = process.argv.includes('--resume-map');
@@ -121,6 +127,8 @@ let eventState = {};
 let resumeState = emptyResumeState();
 let activationHolds = { version: 1, accounts: {} };
 let activationHoldsError = null;
+let statusPreferences = { version: 1, autoContinue: false };
+let statusPreferencesError = null;
 try {
   const registry = JSON.parse(fs.readFileSync(registryPath, 'utf8'));
   accounts = Array.isArray(registry.accounts)
@@ -154,6 +162,11 @@ try {
   activationHolds = readActivationHolds(defaultActivationHoldsPath());
 } catch (error) {
   activationHoldsError = error?.message || 'ACTIVATION_HOLDS_INVALID';
+}
+try {
+  statusPreferences = readStatusPreferences(statusPreferencesPath);
+} catch (error) {
+  statusPreferencesError = error?.message || 'STATUS_PREFERENCES_INVALID';
 }
 const fiveHourWorkerHealth = activationWorkerHealth(activationState, nowMs);
 const turnObserverHealth = observerHealth(eventState, nowMs);
@@ -340,6 +353,9 @@ const problems = [
   activationHoldsError
     ? `ACTIVATION HOLD CONFIG ERROR / ACTION REQUIRED: ${activationHoldsError}; activation-workern avbryter säkert tills konfigurationen rättats.`
     : null,
+  statusPreferencesError
+    ? `AUTO-CONTINUE CONFIG ERROR / ACTION REQUIRED: ${statusPreferencesError}; AUTO-CONTINUE är fail-closed OFF.`
+    : null,
   ...rankedRows.flatMap(row => [
     usageProblemLine(row),
     activationProblemLine(row, activationState.accounts?.[row.accountId]),
@@ -394,7 +410,7 @@ problems.push(...resumeAttemptProblems);
 const problemSection = problems.length > 0
   ? `\n\x1b[1;31mACCOUNT PROBLEMS:\x1b[0m\n${problems.map(line => `\x1b[31m${line}\x1b[0m`).join('\n')}${repairableProblemCount > 0 ? '\n\x1b[1;33mPress [R] to repair authentication\x1b[0m' : ''}`
   : '';
-const footerParts = [renderedRecommendationLines.join('\n')];
+const footerParts = [`\x1b[1;36m${autoContinueLine(statusPreferences)}\x1b[0m`, renderedRecommendationLines.join('\n')];
 if (usageQualityLine) footerParts.push(usageQualityLine);
 const footer = `${footerParts.join('\n')}${activeTurnsSection}${interruptedTurnsSection}${exhaustionSection}${informationSection}${problemSection}`;
 process.stdout.write(`${output.join('\n').trimEnd()}\n\n${footer}`);

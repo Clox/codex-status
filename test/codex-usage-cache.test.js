@@ -204,6 +204,50 @@ test('fixed weekly deadline stays active even while used_percent still rounds to
   assert.equal(isWeeklyDormant(second.accounts['account-a'], { nowMs: NOW_MS }), false);
 });
 
+test('a banked reset transition restores both windows through the generic dormant classifier', async () => {
+  const beforeAt = NOW_MS - 120_000;
+  const firstAfterAt = NOW_MS - 60_000;
+  const before = await refreshObserved({}, observedResponse({
+    observedAtMs: beforeAt,
+    primaryUsed: 100,
+    primaryResetAt: beforeAt / 1000 + 3_263,
+    primaryResetAfter: 3_263,
+    secondaryUsed: 92,
+    secondaryResetAt: beforeAt / 1000 + 341_356,
+    secondaryResetAfter: 341_356,
+  }));
+  const firstAfter = await refreshObserved(before, observedResponse({
+    observedAtMs: firstAfterAt,
+    primaryUsed: 0,
+    primaryResetAt: firstAfterAt / 1000 + 18_000,
+    primaryResetAfter: 18_000,
+    secondaryUsed: 0,
+    secondaryResetAt: firstAfterAt / 1000 + 604_800,
+    secondaryResetAfter: 604_800,
+  }));
+
+  assert.equal(isFiveHourDormant(firstAfter.accounts['account-a'], { nowMs: firstAfterAt }), false);
+  assert.equal(isWeeklyDormant(firstAfter.accounts['account-a'], { nowMs: firstAfterAt }), false);
+
+  const secondAfter = await refreshObserved(firstAfter, observedResponse({
+    observedAtMs: NOW_MS,
+    primaryUsed: 0,
+    primaryResetAt: NOW_MS / 1000 + 18_000,
+    primaryResetAfter: 18_000,
+    secondaryUsed: 0,
+    secondaryResetAt: NOW_MS / 1000 + 604_800,
+    secondaryResetAfter: 604_800,
+  }));
+  const entry = secondAfter.accounts['account-a'];
+
+  assert.equal(entry.primary.remainingPercent, 100);
+  assert.equal(entry.secondary.remainingPercent, 100);
+  assert.equal(entry.primary.raw.resetAfterSeconds, 18_000);
+  assert.equal(entry.secondary.raw.resetAfterSeconds, 604_800);
+  assert.equal(isFiveHourDormant(entry, { nowMs: NOW_MS }), true);
+  assert.equal(isWeeklyDormant(entry, { nowMs: NOW_MS }), true);
+});
+
 test('classifies 5H dormant only after two fresh moving full-window observations', async () => {
   const firstAt = NOW_MS - 60_000;
   const first = await refreshObserved({}, observedResponse({
