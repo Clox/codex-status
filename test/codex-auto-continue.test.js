@@ -10,6 +10,11 @@ const {
   automaticClientBlocker,
   markResumeCommitted,
 } = require('../lib/codex-manual-resume');
+const {
+  INTERRUPTION_CLASS,
+  continuationForCandidate,
+  inputHash,
+} = require('../lib/codex-turn-continuation');
 
 const NOW = 1_790_200_000_000;
 const selectors = ['a@example.com', 'b@example.com', 'c@example.com'];
@@ -61,10 +66,12 @@ function eventState(overrides = {}) {
       first: {
         threadId: 'thread-first', turnId: 'turn-first', accountId: 'account-a',
         completedAtMs: NOW - 2_000, resumable: true, threadIdentityVerified: true,
+        interruptionClass: INTERRUPTION_CLASS.AFTER_WORK, classificationVerified: true,
       },
       second: {
         threadId: 'thread-second', turnId: 'turn-second', accountId: 'account-a',
         completedAtMs: NOW - 1_000, resumable: true, threadIdentityVerified: true,
+        interruptionClass: INTERRUPTION_CLASS.AFTER_WORK, classificationVerified: true,
       },
     },
     exhaustions: {
@@ -171,14 +178,69 @@ test('an active or unclassifiable VS Code Codex client is a blocker without a pr
 test('already committed candidates are excluded after crash/restart and can never be sent twice', () => {
   const state = eventState();
   const candidate = state.interruptedTurns.first;
-  const resumeState = markResumeCommitted({}, candidate, { targetAccountId: 'account-b' }, NOW - 500);
+  const resumeState = markResumeCommitted({}, candidate, {
+    targetAccountId: 'account-b', continuation: continuationForCandidate(candidate),
+  }, NOW - 500);
   const decision = decide({ eventState: state, resumeState });
   assert.equal(decision.action, 'resume');
   assert.deepEqual(decision.candidates.map(item => item.threadId), ['thread-second']);
 
   assert.throws(() =>
-    markResumeCommitted(resumeState, candidate, { targetAccountId: 'account-b' }, NOW),
+    markResumeCommitted(resumeState, candidate, {
+      targetAccountId: 'account-b', continuation: continuationForCandidate(candidate),
+    }, NOW),
   /RESUME_ALREADY_COMMITTED/);
+});
+
+test('AUTO replays exact original structured input only when its hash and classification verify', () => {
+  const originalInput = [
+    { type: 'text', text: 'Inspect this image' },
+    { type: 'image', url: 'https://example.test/image.png', detail: 'low' },
+  ];
+  const state = eventState();
+  state.interruptedTurns = {
+    before: {
+      threadId: 'thread-before', turnId: 'turn-before', accountId: 'account-a',
+      completedAtMs: NOW - 1_000, resumable: true, threadIdentityVerified: true,
+      interruptionClass: INTERRUPTION_CLASS.BEFORE_WORK, classificationVerified: true,
+      originalInput, originalInputHash: inputHash(originalInput),
+    },
+  };
+  const decision = decide({ eventState: state });
+  assert.equal(decision.action, 'resume');
+  const continuation = continuationForCandidate(decision.candidates[0]);
+  assert.equal(continuation.kind, 'replay-original');
+  assert.deepEqual(continuation.input, originalInput);
+
+  state.interruptedTurns.before.originalInputHash = '0'.repeat(64);
+  const blocked = decide({ eventState: state });
+  assert.equal(blocked.action, 'blocked');
+  assert.equal(blocked.reason, 'original-input-unverified');
+});
+
+test('AUTO fails closed for unknown interruption classification', () => {
+  const state = eventState();
+  state.interruptedTurns.first.interruptionClass = INTERRUPTION_CLASS.UNKNOWN;
+  state.interruptedTurns.first.classificationVerified = false;
+  const result = decide({ eventState: state });
+  assert.equal(result.action, 'blocked');
+  assert.equal(result.reason, 'interruption-class-unknown');
+});
+
+test('AUTO fails closed when rejected structured input cannot be losslessly reconstructed', () => {
+  const unsupported = [{ type: 'futureAttachment', opaqueId: 'attachment-a' }];
+  const state = eventState();
+  state.interruptedTurns = {
+    unsupported: {
+      threadId: 'thread-unsupported', turnId: 'turn-unsupported', accountId: 'account-a',
+      completedAtMs: NOW, resumable: true, threadIdentityVerified: true,
+      interruptionClass: INTERRUPTION_CLASS.BEFORE_WORK, classificationVerified: true,
+      originalInput: unsupported, originalInputHash: inputHash(unsupported),
+    },
+  };
+  const result = decide({ eventState: state });
+  assert.equal(result.action, 'blocked');
+  assert.equal(result.reason, 'original-input-unverified');
 });
 
 test('a later real turn removes an advanced candidate from the automation set', () => {

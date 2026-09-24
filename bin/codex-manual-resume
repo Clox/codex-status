@@ -9,7 +9,6 @@ const readline = require('node:readline');
 const { once } = require('node:events');
 const { spawn, spawnSync } = require('node:child_process');
 const {
-  CONTINUATION_PROMPT,
   appServerExclusivityReport,
   atomicWriteJson,
   automaticClientBlocker,
@@ -28,6 +27,7 @@ const {
   validateThreadMetadataForResume,
   validateThreadForResume,
 } = require(path.join(__dirname, '..', 'lib', 'codex-manual-resume'));
+const { continuationForCandidate } = require(path.join(__dirname, '..', 'lib', 'codex-turn-continuation'));
 const { normalizeState, observerHealth } = require(path.join(__dirname, '..', 'lib', 'codex-turn-observer'));
 const { verifyActiveAccountState } = require(path.join(__dirname, '..', 'lib', 'codex-account-state'));
 const {
@@ -442,6 +442,10 @@ async function terminateChild(child) {
 }
 
 async function runResume(candidate, targetAccountId, onCommit, { automatic = false } = {}) {
+  const continuation = continuationForCandidate(candidate);
+  if (!continuation.ok || candidate.classificationVerified !== true) {
+    throw new Error(continuation.reason || 'CANDIDATE_CLASSIFICATION_UNVERIFIED');
+  }
   const child = spawn(codexBin, ['-c', 'features.code_mode_host=true', 'app-server', '--analytics-default-enabled'], {
     cwd: candidate.cwd || os.homedir(),
     env: { ...process.env, CODEX_HOME: codexHome },
@@ -479,11 +483,11 @@ async function runResume(candidate, targetAccountId, onCommit, { automatic = fal
         resumeState: normalizeResumeState(readJson(resumeStatePath, emptyResumeState())),
       });
       rpc.setPhase('pre-turn-commit');
-      await onCommit(child.pid);
+      await onCommit(child.pid, continuation);
       rpc.setPhase('turn-start');
       const started = await rpc.request('turn/start', {
         threadId: candidate.threadId,
-        input: [{ type: 'text', text: CONTINUATION_PROMPT }],
+        input: continuation.input,
         turnTrigger: automatic ? 'automatic-quota-resume' : 'manual-quota-resume',
       });
       const turnId = started?.turn?.id;
@@ -670,7 +674,7 @@ async function automaticMain() {
       const freshEventState = normalizeState(readJson(eventStatePath, {}), Date.now());
       const persisted = assertObserverIdle(freshEventState, currentCandidate);
 
-      const result = await runResume(persisted, target.accountId, async controlledAppServerPid => {
+      const result = await runResume(persisted, target.accountId, async (controlledAppServerPid, continuation) => {
         assertAutomaticOwnership(controlledAppServerPid);
         refreshUsageNow();
         const commitPlan = autoDecisionSnapshot();
@@ -680,7 +684,10 @@ async function automaticMain() {
           throw new Error('ACTIVE_ACCOUNT_CHANGED_BEFORE_COMMIT');
         }
         let journal = normalizeResumeState(readJson(resumeStatePath, emptyResumeState()));
-        journal = markResumeCommitted(journal, persisted, { targetAccountId: target.accountId });
+        journal = markResumeCommitted(journal, persisted, {
+          targetAccountId: target.accountId,
+          continuation,
+        });
         atomicWriteJson(resumeStatePath, journal);
         committed = true;
       }, { automatic: true });
@@ -779,9 +786,12 @@ async function main() {
     if (revalidatedTarget.accountId !== target.accountId) throw new Error('ACTIVE_ACCOUNT_CHANGED');
     assertFreshUsableTarget(target.accountId);
 
-    const result = await runResume(persisted, target.accountId, async () => {
+    const result = await runResume(persisted, target.accountId, async (_controlledAppServerPid, continuation) => {
       let journal = normalizeResumeState(readJson(resumeStatePath, emptyResumeState()));
-      journal = markResumeCommitted(journal, persisted, { targetAccountId: target.accountId });
+      journal = markResumeCommitted(journal, persisted, {
+        targetAccountId: target.accountId,
+        continuation,
+      });
       atomicWriteJson(resumeStatePath, journal);
       committed = true;
     });

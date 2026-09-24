@@ -7,6 +7,7 @@ const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const {
   applyRolloutRecord,
+  classifyRolloutTurn,
   clearRecoveredExhaustions,
   emptyEventState,
   normalizeState,
@@ -214,6 +215,44 @@ function titleForThread(threadId) {
   }
 }
 
+function readRolloutRecords(filename) {
+  const records = [];
+  for (const line of fs.readFileSync(filename, 'utf8').split('\n')) {
+    if (!line) continue;
+    try { records.push(JSON.parse(line)); } catch {}
+  }
+  return records;
+}
+
+function reconcileHistoricalClassifications(nowMs) {
+  const candidates = Object.values(state.interruptedTurns || {})
+    .filter(candidate => !candidate.classificationAttemptedAtMs);
+  if (candidates.length === 0) return;
+  const filesByThread = new Map();
+  for (const filename of rolloutFiles(sessionsPath)) {
+    const identity = threadIdentityFromFirstRecord(filename);
+    if (!identity?.threadId) continue;
+    if (!filesByThread.has(identity.threadId)) filesByThread.set(identity.threadId, []);
+    filesByThread.get(identity.threadId).push(filename);
+  }
+  for (const candidate of candidates) {
+    const matches = [];
+    for (const filename of filesByThread.get(candidate.threadId) || []) {
+      const result = classifyRolloutTurn(readRolloutRecords(filename), candidate.turnId);
+      if (result.found) matches.push(result);
+    }
+    const result = matches.length === 1 ? matches[0] : null;
+    candidate.interruptionClass = result?.verified ? result.interruptionClass : 'UNKNOWN';
+    candidate.classificationVerified = result?.verified === true;
+    candidate.classificationSource = result?.verified ? 'historical-rollout' : 'historical-rollout-unverified';
+    candidate.classificationAttemptedAtMs = nowMs;
+    candidate.workItemTypes = result?.verified ? result.workItemTypes : [];
+    candidate.originalInput = result?.verified ? result.originalInput : null;
+    candidate.originalInputHash = result?.verified ? result.originalInputHash : null;
+    candidate.originalInputError = result?.verified ? result.originalInputError : null;
+  }
+}
+
 const lockDescriptor = acquireLock();
 if (lockDescriptor === null) process.exit(0);
 let state = normalizeState(readJson(statePath), Date.now());
@@ -250,11 +289,16 @@ function scan() {
         const eventAtMs = recordTime(record, nowMs);
         const recent = Math.abs(nowMs - eventAtMs) <= bindingMaxDelayMs;
         const payload = record.payload || {};
-        const existing = payload.turn_id && checkpoint.threadId
-          ? state.activeTurns[turnKey(checkpoint.threadId, payload.turn_id)]
+        const recordTurnId = payload.turn_id || checkpoint.currentTurnId || null;
+        const existing = recordTurnId && checkpoint.threadId
+          ? state.activeTurns[turnKey(checkpoint.threadId, recordTurnId)]
           : null;
+        if (record.type === 'event_msg' && payload.type === 'task_started') {
+          checkpoint.currentTurnId = payload.turn_id || null;
+        }
         state = applyRolloutRecord(state, record, {
           threadId: checkpoint.threadId,
+          turnId: recordTurnId || payload.turn_id || checkpoint.currentTurnId || null,
           accountId: existing?.accountId || (payload.type === 'task_started' && recent ? stableIdentity?.accountId : null),
           accountKey: existing?.accountKey || (payload.type === 'task_started' && recent ? stableIdentity?.accountKey : null),
           title: checkpoint.threadId ? titleForThread(checkpoint.threadId) : null,
@@ -263,8 +307,12 @@ function scan() {
           observedAtMs: nowMs,
           nowMs,
         });
+        if (record.type === 'event_msg' && (payload.type === 'task_complete' || payload.type === 'turn_aborted')) {
+          checkpoint.currentTurnId = null;
+        }
       }
     }
+    reconcileHistoricalClassifications(nowMs);
     for (const turn of Object.values(state.activeTurns)) {
       if (!turn.title) turn.title = titleForThread(turn.threadId);
     }

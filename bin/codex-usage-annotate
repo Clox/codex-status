@@ -39,6 +39,7 @@ const {
 const {
   currentResumeProblemLines,
   emptyResumeState,
+  interruptedCandidateProblemLines,
   normalizeResumeState,
   pendingInterruptedTurns,
 } = require(path.join(__dirname, '..', 'lib', 'codex-manual-resume'));
@@ -370,6 +371,9 @@ const problems = [
     ? `AUTO-CONTINUE CONFIG ERROR / ACTION REQUIRED: ${statusPreferencesError}; AUTO-CONTINUE är fail-closed OFF.`
     : null,
   autoContinueProblemLine(autoContinueState, statusPreferences.autoContinue === true),
+  ...interruptedCandidateProblemLines(eventState, resumeState, {
+    autoContinue: statusPreferences.autoContinue === true,
+  }),
   ...rankedRows.flatMap(row => [
     usageProblemLine(row),
     activationProblemLine(row, activationState.accounts?.[row.accountId]),
@@ -405,7 +409,12 @@ const interruptedTurnsSection = interruptedCandidates.length > 0
       const accountLabel = labelByAccountId.get(candidate.accountId) || 'unknown account';
       const thread = `…${candidate.threadId.slice(-8)}`;
       const title = candidate.title ? ` — ${candidate.title.slice(0, 42)}` : '';
-      return `\x1b[33m${accountLabel} | ${thread}${title} | quota-interrupted\x1b[0m`;
+      const state = candidate.interruptionClass === 'INTERRUPTED_AFTER_WORK'
+        ? 'quota-interrupted-after-work'
+        : candidate.interruptionClass === 'REJECTED_BEFORE_WORK'
+          ? 'quota-rejected-before-work'
+          : 'quota-interruption-unverified';
+      return `\x1b[33m${accountLabel} | ${thread}${title} | ${state}\x1b[0m`;
     }).join('\n')}`
   : '';
 problems.push(...currentResumeProblemLines(resumeState));

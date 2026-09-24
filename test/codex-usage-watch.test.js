@@ -12,7 +12,7 @@ test('status watch avoids unchanged redraws and exposes a render-only pause togg
   assert.match(source, /\[\[ \$display_frame != "\$last_drawn_frame" \]\]/);
   assert.match(source, /p\|P\)/);
   assert.match(source, /PAUSED .*tryck \[P\]/);
-  assert.match(source, /P för pause/);
+  assert.match(source, /P to pause/);
   assert.match(source, /if \(\(paused_rendering\)\); then\s+paused_rendering=0/);
 });
 

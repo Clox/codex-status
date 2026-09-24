@@ -9,12 +9,14 @@ const test = require('node:test');
 const {
   applyProtocolNotification,
   applyRolloutRecord,
+  classifyRolloutTurn,
   clearRecoveredExhaustions,
   emptyEventState,
   observerHealth,
   pruneEventState,
   turnKey,
 } = require('../lib/codex-turn-observer');
+const { INTERRUPTION_CLASS } = require('../lib/codex-turn-continuation');
 
 const NOW = 1_800_000_000_000;
 const binding = { accountId: 'account-a', accountKey: 'key-a', title: 'Observed thread', nowMs: NOW };
@@ -251,8 +253,112 @@ test('version 2 verified main-thread exhaustion migrates to a persistent interru
     threadSource: 'user', threadIdentityVerified: true,
   });
   const migrated = started(previous, 'other-thread', 'other-turn');
-  assert.equal(migrated.version, 3);
+  assert.equal(migrated.version, 4);
   assert.equal(migrated.interruptedTurns[turnKey('thread-a', 'turn-a')].resumable, true);
+  assert.equal(migrated.interruptedTurns[turnKey('thread-a', 'turn-a')].interruptionClass, INTERRUPTION_CLASS.UNKNOWN);
+  assert.equal(migrated.interruptedTurns[turnKey('thread-a', 'turn-a')].classificationVerified, false);
+});
+
+function rolloutRecord(type, payload = {}) {
+  return { type, timestamp: new Date(NOW).toISOString(), payload };
+}
+
+function usageFailureSequence({ work = false, input = [{ type: 'text', text: 'Do the task' }] } = {}) {
+  const records = [
+    rolloutRecord('event_msg', { type: 'task_started', turn_id: 'turn-a' }),
+    rolloutRecord('turn_context', { turn_id: 'turn-a' }),
+    rolloutRecord('response_item', { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Do the task' }] }),
+    rolloutRecord('event_msg', { type: 'item_completed', turn_id: 'turn-a', item: { type: 'UserMessage', content: input } }),
+  ];
+  if (work) {
+    records.push(
+      rolloutRecord('event_msg', { type: 'item_completed', turn_id: 'turn-a', item: { type: 'Reasoning', content: [] } }),
+      rolloutRecord('event_msg', { type: 'token_usage_record', turn_id: 'turn-a' }),
+    );
+  }
+  records.push(
+    rolloutRecord('event_msg', { type: 'token_count' }),
+    rolloutRecord('event_msg', {
+      type: 'task_complete', turn_id: 'turn-a', error: { codex_error_info: 'usage_limit_exceeded' },
+    }),
+  );
+  return records;
+}
+
+test('persisted work items classify a terminal usage failure as interrupted after work', () => {
+  const result = classifyRolloutTurn(usageFailureSequence({ work: true }), 'turn-a');
+  assert.equal(result.verified, true);
+  assert.equal(result.interruptionClass, INTERRUPTION_CLASS.AFTER_WORK);
+  assert.deepEqual(result.workItemTypes, ['reasoning']);
+  assert.equal(result.originalInput, null);
+});
+
+test('the strict no-work rollout envelope classifies a quota preflight rejection', () => {
+  const result = classifyRolloutTurn(usageFailureSequence(), 'turn-a');
+  assert.equal(result.verified, true);
+  assert.equal(result.interruptionClass, INTERRUPTION_CLASS.BEFORE_WORK);
+  assert.deepEqual(result.originalInput, [{ type: 'text', text: 'Do the task' }]);
+  assert.match(result.originalInputHash, /^[0-9a-f]{64}$/);
+});
+
+test('an incomplete or novel no-work sequence remains unknown and fail closed', () => {
+  const records = usageFailureSequence();
+  records.splice(2, 0, rolloutRecord('event_msg', { type: 'novel_preflight_event' }));
+  const result = classifyRolloutTurn(records, 'turn-a');
+  assert.equal(result.verified, false);
+  assert.equal(result.interruptionClass, INTERRUPTION_CLASS.UNKNOWN);
+});
+
+test('observer migration reclassifies an existing candidate only from its retained rollout', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-turn-classification-migration-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const codexHome = path.join(root, '.codex');
+  const sessions = path.join(codexHome, 'sessions', '2026', '09', '23');
+  const accounts = path.join(codexHome, 'accounts');
+  const cache = path.join(root, 'cache', 'codex-account-switcher');
+  fs.mkdirSync(sessions, { recursive: true });
+  fs.mkdirSync(accounts, { recursive: true });
+  fs.mkdirSync(cache, { recursive: true });
+  fs.writeFileSync(path.join(accounts, 'registry.json'), JSON.stringify({
+    active_account_key: 'key-a',
+    accounts: [{ account_key: 'key-a', chatgpt_account_id: 'account-a' }],
+  }));
+  const rollout = [
+    rolloutRecord('session_meta', { id: 'thread-a' }),
+    ...usageFailureSequence(),
+  ];
+  fs.writeFileSync(path.join(sessions, 'rollout-existing.jsonl'), `${rollout.map(JSON.stringify).join('\n')}\n`);
+  const statePath = path.join(cache, 'turn-events.json');
+  fs.writeFileSync(statePath, JSON.stringify({
+    version: 3,
+    worker: { heartbeatAtMs: NOW },
+    files: {}, activeTurns: {}, pendingErrors: {},
+    exhaustions: { 'account-a': { verified: true, threadIdentityVerified: true } },
+    interruptedTurns: {
+      [turnKey('thread-a', 'turn-a')]: {
+        threadId: 'thread-a', turnId: 'turn-a', accountId: 'account-a',
+        resumable: true, threadIdentityVerified: true,
+      },
+    },
+    terminalTurns: [],
+  }));
+  const result = spawnSync(process.execPath, [path.join(__dirname, '..', 'bin', 'codex-turn-observer'), '--once'], {
+    env: {
+      ...process.env,
+      HOME: root,
+      CODEX_HOME: codexHome,
+      CODEX_EVENT_STATE: statePath,
+      USAGE_CACHE: path.join(cache, 'usage.json'),
+    },
+    encoding: 'utf8',
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const migrated = JSON.parse(fs.readFileSync(statePath));
+  const candidate = migrated.interruptedTurns[turnKey('thread-a', 'turn-a')];
+  assert.equal(candidate.interruptionClass, INTERRUPTION_CLASS.BEFORE_WORK);
+  assert.equal(candidate.classificationVerified, true);
+  assert.equal(candidate.classificationSource, 'historical-rollout');
+  assert.deepEqual(candidate.originalInput, [{ type: 'text', text: 'Do the task' }]);
 });
 
 test('a later turn on the same thread resolves its interrupted candidate only', () => {

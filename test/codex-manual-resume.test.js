@@ -16,6 +16,7 @@ const {
   validateThreadMetadataForResume,
   validateThreadForResume,
 } = require('../lib/codex-manual-resume');
+const { INTERRUPTION_CLASS, continuationForCandidate } = require('../lib/codex-turn-continuation');
 
 test('status problems omit stale pre-commit failures but retain uncertain post-commit failures', () => {
   assert.deepEqual(currentResumeProblemLines({
@@ -45,7 +46,19 @@ const candidate = {
   threadId: 'thread-a', turnId: 'turn-failed', accountId: 'account-a',
   status: 'failed', errorKind: 'usagelimitexceeded', resumable: true,
   threadIdentityVerified: true, completedAtMs: 100,
+  interruptionClass: INTERRUPTION_CLASS.AFTER_WORK, classificationVerified: true,
 };
+
+function verifiedEventState(value = candidate) {
+  return {
+    activeTurns: {},
+    interruptedTurns: { [candidateKey(value.threadId, value.turnId)]: value },
+  };
+}
+
+function commitDetails(value = candidate) {
+  return { targetAccountId: 'account-b', continuation: continuationForCandidate(value) };
+}
 
 function thread(turns = [{
   id: 'turn-failed', status: 'failed', error: { codexErrorInfo: 'usageLimitExceeded' }, items: [],
@@ -59,12 +72,12 @@ test('only verified main-thread candidates without a commit are listed', () => {
     child: { ...candidate, threadId: 'child', parentThreadId: 'thread-a' },
   } };
   assert.deepEqual(pendingInterruptedTurns(eventState).map(item => item.threadId), ['thread-a']);
-  const committed = markResumeCommitted(emptyResumeState(), candidate, { targetAccountId: 'account-b' }, 200);
+  const committed = markResumeCommitted(emptyResumeState(), candidate, commitDetails(), 200);
   assert.deepEqual(pendingInterruptedTurns(eventState, committed), []);
 });
 
 test('resume revalidation requires idle exact thread and latest verified failed turn', () => {
-  const eventState = { activeTurns: {} };
+  const eventState = verifiedEventState();
   assert.equal(validateThreadForResume({ candidate, thread: thread(), eventState, resumeState: emptyResumeState() }), true);
   assert.throws(() => validateThreadForResume({
     candidate, thread: thread([...thread().turns, { id: 'later', status: 'completed', items: [] }]),
@@ -80,28 +93,42 @@ test('metadata validation can safely precede resume without claiming latest-turn
   assert.equal(validateThreadMetadataForResume({
     candidate,
     thread: { id: 'thread-a', status: { type: 'notLoaded' }, turns: [] },
-    eventState: { activeTurns: {} },
+    eventState: verifiedEventState(),
     resumeState: emptyResumeState(),
   }), true);
   assert.throws(() => validateThreadForResume({
     candidate,
     thread: { id: 'thread-a', status: { type: 'notLoaded' }, turns: [] },
-    eventState: { activeTurns: {} },
+    eventState: verifiedEventState(),
     resumeState: emptyResumeState(),
   }), /CANDIDATE_NOT_LATEST_TURN/);
 });
 
 test('commit is crash-safe idempotency boundary and can never be committed twice', () => {
-  const committed = markResumeCommitted(emptyResumeState(), candidate, { targetAccountId: 'account-b' }, 200);
-  assert.equal(committed.attempts[candidateKey('thread-a', 'turn-failed')].status, 'RESUME_COMMITTED');
-  assert.throws(() => markResumeCommitted(committed, candidate), /RESUME_ALREADY_COMMITTED/);
+  const committed = markResumeCommitted(emptyResumeState(), candidate, commitDetails(), 200);
+  const attempt = committed.attempts[candidateKey('thread-a', 'turn-failed')];
+  assert.equal(attempt.status, 'RESUME_COMMITTED');
+  assert.equal(attempt.interruptionClass, INTERRUPTION_CLASS.AFTER_WORK);
+  assert.match(attempt.inputHash, /^[0-9a-f]{64}$/);
+  assert.equal(attempt.continuationKind, 'continue-after-work');
+  assert.throws(() => markResumeCommitted(committed, candidate, commitDetails()), /RESUME_ALREADY_COMMITTED/);
   const failed = markResumeFailure(committed, candidate, 'OUTCOME_UNKNOWN', { committed: true }, 300);
   assert.equal(failed.attempts[candidateKey('thread-a', 'turn-failed')].status, 'MANUAL_REQUIRED_AFTER_COMMIT');
-  assert.throws(() => validateThreadForResume({ candidate, thread: thread(), eventState: { activeTurns: {} }, resumeState: failed }), /RESUME_ALREADY_COMMITTED/);
+  assert.throws(() => validateThreadForResume({ candidate, thread: thread(), eventState: verifiedEventState(), resumeState: failed }), /RESUME_ALREADY_COMMITTED/);
+});
+
+test('resume revalidation fails when persisted classification or input hash changes', () => {
+  const changed = { ...candidate, interruptionClass: INTERRUPTION_CLASS.UNKNOWN, classificationVerified: false };
+  assert.throws(() => validateThreadMetadataForResume({
+    candidate,
+    thread: { id: 'thread-a', status: { type: 'idle' } },
+    eventState: verifiedEventState(changed),
+    resumeState: emptyResumeState(),
+  }), /CANDIDATE_EVIDENCE_CHANGED/);
 });
 
 test('terminal result is recorded against the one committed continuation', () => {
-  const committed = markResumeCommitted(emptyResumeState(), candidate, { targetAccountId: 'account-b' }, 200);
+  const committed = markResumeCommitted(emptyResumeState(), candidate, commitDetails(), 200);
   const terminal = markResumeTerminal(committed, candidate, { turnId: 'turn-next', status: 'completed' }, 400);
   const attempt = terminal.attempts[candidateKey('thread-a', 'turn-failed')];
   assert.equal(attempt.continuationTurnId, 'turn-next');
