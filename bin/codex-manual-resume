@@ -23,6 +23,7 @@ const {
   normalizeResumeState,
   pendingInterruptedTurns,
   resumeProtocolRequests,
+  desktopRestoreLaunchSpec,
   restoreDesktopWithRetry,
   splitJsonLines,
   validateThreadMetadataForResume,
@@ -62,6 +63,7 @@ const globalAuthPath = path.join(codexHome, 'auth.json');
 const codexBin = process.env.CODEX_LOGIN_BIN || '/usr/lib/chatgpt/resources/codex';
 const desktopLauncher = process.env.CHATGPT_LAUNCHER || '/usr/bin/chatgpt';
 const desktopBinary = process.env.CHATGPT_BINARY_PATTERN || '/usr/lib/chatgpt/ChatGPT';
+const systemdRunBin = process.env.SYSTEMD_RUN_BIN || '/usr/bin/systemd-run';
 const codexAuthBin = process.env.CODEX_AUTH_BIN || 'codex-auth';
 const usageRefresher = process.env.USAGE_REFRESHER || path.join(os.homedir(), '.local', 'bin', 'codex-usage-refresh');
 const MAX_USAGE_AGE_MS = 3 * 60 * 1000;
@@ -177,16 +179,28 @@ async function waitForAppServerExclusivity(desktopPids, timeoutMs = 5_000) {
   throw error;
 }
 
-function launchDesktopOnce() {
-  const child = spawn(desktopLauncher, [], { detached: true, stdio: 'ignore' });
+function desktopRootPids() {
+  return processEntries().filter(isDesktopRoot).map(entry => entry.pid);
+}
+
+function launchDesktopOnce(attempt) {
+  const spec = desktopRestoreLaunchSpec({
+    systemdRunBin,
+    desktopLauncher,
+    controllerPid: process.pid,
+    attempt,
+  });
+  const child = spawn(spec.command, spec.args, { detached: true, stdio: 'ignore' });
   child.unref();
+  return { pid: child.pid };
 }
 
 async function restoreClients(lease, { removeLease = true } = {}) {
   signalExisting([...(lease.vscodePids || [])].reverse(), 'SIGCONT');
+  let desktopRestore = null;
   if (lease.desktopWasRunning) {
-    await restoreDesktopWithRetry({
-      isRunning: () => processEntries().some(isDesktopRoot),
+    desktopRestore = await restoreDesktopWithRetry({
+      runningPids: desktopRootPids,
       launch: launchDesktopOnce,
       sleep,
     });
@@ -194,6 +208,7 @@ async function restoreClients(lease, { removeLease = true } = {}) {
   if (removeLease) {
     try { fs.unlinkSync(leasePath); } catch {}
   }
+  return { desktopRestore };
 }
 
 async function watchdogMode() {
@@ -836,7 +851,14 @@ async function automaticMain() {
   } finally {
     if (lease) {
       try {
-        await restoreClients(lease);
+        const restored = await restoreClients(lease);
+        writeAutoContinueState({
+          desktopRestore: restored.desktopRestore ? {
+            status: 'ready',
+            completedAtMs: Date.now(),
+            ...restored.desktopRestore,
+          } : null,
+        });
       } catch (error) {
         writeAutoContinueState({
           status: 'blocked',
@@ -847,6 +869,12 @@ async function automaticMain() {
           candidateTurnId: currentCandidate?.turnId || null,
           targetAccountId: initial.target?.accountId || null,
           pending: null,
+          desktopRestore: {
+            status: 'failed',
+            completedAtMs: Date.now(),
+            errorKind: error?.message || 'AUTO_CLIENT_RESTORE_FAILED',
+            diagnostics: error?.diagnostics || null,
+          },
         });
         process.exitCode = 1;
       }

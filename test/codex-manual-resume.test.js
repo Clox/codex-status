@@ -12,6 +12,7 @@ const {
   markResumeTerminal,
   pendingInterruptedTurns,
   resumeProtocolRequests,
+  desktopRestoreLaunchSpec,
   restoreDesktopWithRetry,
   splitJsonLines,
   validateThreadMetadataForResume,
@@ -194,31 +195,68 @@ test('line decoder consumes many complete frames before enforcing the partial-fr
   );
 });
 
-test('Desktop restore retries a startup that crashes before the stability window', async () => {
-  let running = false;
+test('Desktop restore retries a startup that crashes after the former three-second check', async () => {
+  let pid = null;
   let launches = 0;
+  let pollsThisAttempt = 0;
   const sleeps = [];
   const result = await restoreDesktopWithRetry({
-    isRunning: () => running,
+    runningPids: () => pid == null ? [] : [pid],
     launch: () => {
       launches += 1;
-      running = launches === 2;
+      pollsThisAttempt = 0;
+      pid = 100 + launches;
+      return { pid: 200 + launches };
     },
-    sleep: async milliseconds => { sleeps.push(milliseconds); },
-    stableMs: 3_000,
+    sleep: async milliseconds => {
+      sleeps.push(milliseconds);
+      if (milliseconds === 500) pollsThisAttempt += 1;
+      if (launches === 1 && pollsThisAttempt >= 8) pid = null;
+    },
+    stableMs: 10_000,
+    pollMs: 500,
     retryDelayMs: 1_000,
   });
-  assert.deepEqual(result, { launched: true, attempts: 2 });
+  assert.equal(result.launched, true);
+  assert.equal(result.attempts, 2);
+  assert.equal(result.desktopPid, 102);
+  assert.equal(result.history[0].result, 'exited-before-ready');
+  assert.equal(result.history[1].result, 'ready');
   assert.equal(launches, 2);
-  assert.deepEqual(sleeps, [3_000, 1_000, 3_000]);
 });
 
 test('Desktop restore reports failure after bounded retries without touching resume state', async () => {
   let launches = 0;
+  let capturedError = null;
   await assert.rejects(() => restoreDesktopWithRetry({
-    isRunning: () => false,
-    launch: () => { launches += 1; },
+    runningPids: () => [],
+    launch: () => { launches += 1; return { pid: 300 + launches }; },
     sleep: async () => {},
-  }), /DESKTOP_RESTORE_FAILED/);
+    startupTimeoutMs: 500,
+    pollMs: 250,
+  }), error => {
+    capturedError = error;
+    return error?.message === 'DESKTOP_RESTORE_FAILED';
+  });
   assert.equal(launches, 2);
+  assert.equal(capturedError.diagnostics.attempts.length, 2);
+  assert.ok(capturedError.diagnostics.attempts.every(attempt => attempt.result === 'startup-timeout'));
+});
+
+test('Desktop restore launch uses a transient user service instead of controller ownership', () => {
+  const spec = desktopRestoreLaunchSpec({
+    systemdRunBin: '/usr/bin/systemd-run',
+    desktopLauncher: '/usr/bin/chatgpt',
+    controllerPid: 1234,
+    attempt: 2,
+  });
+  assert.equal(spec.command, '/usr/bin/systemd-run');
+  assert.deepEqual(spec.args, [
+    '--user',
+    '--quiet',
+    '--collect',
+    '--unit=codex-desktop-restore-1234-2',
+    '--',
+    '/usr/bin/chatgpt',
+  ]);
 });
