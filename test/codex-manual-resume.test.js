@@ -12,6 +12,7 @@ const {
   markResumeTerminal,
   pendingInterruptedTurns,
   resumeProtocolRequests,
+  restoreDesktopWithRetry,
   splitJsonLines,
   validateThreadMetadataForResume,
   validateThreadForResume,
@@ -191,4 +192,33 @@ test('line decoder consumes many complete frames before enforcing the partial-fr
     error => error.message === 'APP_SERVER_PROTOCOL_OVERFLOW' &&
       error.diagnostics.frameBytes === 32 && error.diagnostics.terminated === true,
   );
+});
+
+test('Desktop restore retries a startup that crashes before the stability window', async () => {
+  let running = false;
+  let launches = 0;
+  const sleeps = [];
+  const result = await restoreDesktopWithRetry({
+    isRunning: () => running,
+    launch: () => {
+      launches += 1;
+      running = launches === 2;
+    },
+    sleep: async milliseconds => { sleeps.push(milliseconds); },
+    stableMs: 3_000,
+    retryDelayMs: 1_000,
+  });
+  assert.deepEqual(result, { launched: true, attempts: 2 });
+  assert.equal(launches, 2);
+  assert.deepEqual(sleeps, [3_000, 1_000, 3_000]);
+});
+
+test('Desktop restore reports failure after bounded retries without touching resume state', async () => {
+  let launches = 0;
+  await assert.rejects(() => restoreDesktopWithRetry({
+    isRunning: () => false,
+    launch: () => { launches += 1; },
+    sleep: async () => {},
+  }), /DESKTOP_RESTORE_FAILED/);
+  assert.equal(launches, 2);
 });

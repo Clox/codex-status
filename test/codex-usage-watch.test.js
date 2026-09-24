@@ -17,7 +17,7 @@ test('status watch avoids unchanged redraws and exposes a render-only pause togg
 });
 
 test('switch spinner uses a cheap five-fps UI tick independent of collection and freezes while paused', () => {
-  assert.match(source, /pending_spinner_frames=\('WAIT\/' 'WAIT-' 'WAIT\\' 'WAIT\|'\)/);
+  assert.match(source, /pending_spinner_frames=\('WAIT\/' 'WAIT─' 'WAIT\\' 'WAIT\|'\)/);
   assert.match(source, /CODEX_PENDING_STATUS='WAIT\/'/);
   assert.match(source, /read -rsn 1 -t 0\.2/);
   assert.match(source, /display_frame=\$\{display_frame\/\/WAIT\\\//);
@@ -41,12 +41,20 @@ test('recommendation precedes dynamic sections and magenta auto-continue remains
   assert.ok(outputExpression.indexOf('renderedRecommendationLines') < outputExpression.indexOf('${footer}'));
   const footerStatement = annotateSource.indexOf('const footerParts = [');
   const footerExpression = annotateSource.slice(footerStatement, footerStatement + 420);
-  assert.ok(footerExpression.indexOf('activeTurnsSection') < footerExpression.indexOf('autoContinueLine'));
-  assert.ok(footerExpression.indexOf('interruptedTurnsSection') < footerExpression.indexOf('autoContinueLine'));
-  assert.ok(footerExpression.indexOf('problemSection') < footerExpression.indexOf('autoContinueLine'));
-  assert.match(footerExpression, /\\x1b\[1;35m.*autoContinueLine/);
+  assert.ok(footerExpression.indexOf('activeTurnsSection') < footerExpression.indexOf('autoContinueStatusLine'));
+  assert.ok(footerExpression.indexOf('interruptedTurnsSection') < footerExpression.indexOf('autoContinueStatusLine'));
+  assert.ok(footerExpression.indexOf('problemSection') < footerExpression.indexOf('autoContinueStatusLine'));
+  assert.match(footerExpression, /\\x1b\[1;35m.*autoContinueStatusLine/);
   assert.ok(annotateSource.includes('  • ${line}'));
   assert.doesNotMatch(annotateSource, /resumeState\.lastError\?\.actionRequired/);
+});
+
+test('pending AUTO renders countdown attention and exposes an isolated X cancel action', () => {
+  assert.match(annotateSource, /pendingAttentionDecision\(autoContinueState, statusPreferences\.autoContinue === true, nowMs\)/);
+  assert.match(annotateSource, /autoContinueStatusLine\(statusPreferences, autoContinueState, nowMs\)/);
+  assert.match(source, /x\|X\)/);
+  assert.match(source, /grep -Fq '\[X\] Avbryt'/);
+  assert.match(source, /cancel-auto-pending/);
 });
 
 test('a quota recovery event sends one labelled desktop notification and persistent attention', () => {

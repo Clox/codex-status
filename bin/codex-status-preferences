@@ -2,15 +2,37 @@
 
 'use strict';
 
+const fs = require('node:fs');
+const os = require('node:os');
 const path = require('path');
 const {
   defaultStatusPreferencesPath,
   readStatusPreferences,
   toggleAutoContinue,
 } = require(path.join(__dirname, '..', 'lib', 'codex-status-preferences'));
+const {
+  cancelPendingAction,
+  emptyAutoContinueState,
+  normalizeAutoContinueState,
+  resetAutoContinueForToggle,
+  writeAutoContinueStateFile,
+} = require(path.join(__dirname, '..', 'lib', 'codex-auto-continue'));
 
 const statePath = process.env.CODEX_STATUS_PREFERENCES || defaultStatusPreferencesPath();
+const cacheHome = process.env.XDG_CACHE_HOME || path.join(process.env.HOME || os.homedir(), '.cache');
+const autoStatePath = process.env.CODEX_AUTO_CONTINUE_STATE || path.join(
+  cacheHome, 'codex-account-switcher', 'auto-continue.json'
+);
 const command = process.argv[2] || 'show';
+
+function readAutoState() {
+  try {
+    return normalizeAutoContinueState(JSON.parse(fs.readFileSync(autoStatePath, 'utf8')));
+  } catch (error) {
+    if (error?.code === 'ENOENT') return emptyAutoContinueState();
+    throw new Error('AUTO_CONTINUE_STATE_INVALID');
+  }
+}
 
 try {
   let preferences;
@@ -18,8 +40,18 @@ try {
     preferences = readStatusPreferences(statePath);
   } else if (command === 'toggle-auto-continue') {
     preferences = toggleAutoContinue(statePath);
+    writeAutoContinueStateFile(
+      autoStatePath,
+      resetAutoContinueForToggle(readAutoState(), preferences.autoContinue)
+    );
+  } else if (command === 'cancel-auto-pending') {
+    preferences = readStatusPreferences(statePath);
+    const result = cancelPendingAction(readAutoState());
+    if (result.canceled) writeAutoContinueStateFile(autoStatePath, result.state);
+    fs.writeSync(1, `${result.canceled ? 'canceled' : 'none'}\n`);
+    process.exit(0);
   } else {
-    throw new Error('USAGE: codex-status-preferences [show|toggle-auto-continue]');
+    throw new Error('USAGE: codex-status-preferences [show|toggle-auto-continue|cancel-auto-pending]');
   }
   process.stdout.write(`${preferences.autoContinue ? 'on' : 'off'}\n`);
 } catch (error) {

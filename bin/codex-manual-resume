@@ -23,6 +23,7 @@ const {
   normalizeResumeState,
   pendingInterruptedTurns,
   resumeProtocolRequests,
+  restoreDesktopWithRetry,
   splitJsonLines,
   validateThreadMetadataForResume,
   validateThreadForResume,
@@ -31,8 +32,15 @@ const { continuationForCandidate } = require(path.join(__dirname, '..', 'lib', '
 const { normalizeState, observerHealth } = require(path.join(__dirname, '..', 'lib', 'codex-turn-observer'));
 const { verifyActiveAccountState } = require(path.join(__dirname, '..', 'lib', 'codex-account-state'));
 const {
+  AUTO_CONTINUE_STATE_VERSION,
   automationDecision,
+  createOrResumePending,
   emptyAutoContinueState,
+  isAutoPlanSuppressed,
+  normalizeAutoContinueState,
+  pendingCountdownDecision,
+  reconcileSuppression,
+  requiresPendingCountdown,
   sameDecisionPlan,
 } = require(path.join(__dirname, '..', 'lib', 'codex-auto-continue'));
 const {
@@ -59,6 +67,8 @@ const usageRefresher = process.env.USAGE_REFRESHER || path.join(os.homedir(), '.
 const MAX_USAGE_AGE_MS = 3 * 60 * 1000;
 const TURN_TIMEOUT_MS = 12 * 60 * 60 * 1000;
 const MAX_PROTOCOL_FRAME_BYTES = 4 * 1024 * 1024;
+const AUTO_PENDING_POLL_MS = 200;
+const notifySendBin = process.env.NOTIFY_SEND_BIN || 'notify-send';
 
 function readJson(filename, fallback = null) {
   try { return JSON.parse(fs.readFileSync(filename, 'utf8')); } catch { return fallback; }
@@ -167,14 +177,20 @@ async function waitForAppServerExclusivity(desktopPids, timeoutMs = 5_000) {
   throw error;
 }
 
-function launchDesktop() {
+function launchDesktopOnce() {
   const child = spawn(desktopLauncher, [], { detached: true, stdio: 'ignore' });
   child.unref();
 }
 
 async function restoreClients(lease, { removeLease = true } = {}) {
   signalExisting([...(lease.vscodePids || [])].reverse(), 'SIGCONT');
-  if (lease.desktopWasRunning && !processEntries().some(isDesktopRoot)) launchDesktop();
+  if (lease.desktopWasRunning) {
+    await restoreDesktopWithRetry({
+      isRunning: () => processEntries().some(isDesktopRoot),
+      launch: launchDesktopOnce,
+      sleep,
+    });
+  }
   if (removeLease) {
     try { fs.unlinkSync(leasePath); } catch {}
   }
@@ -558,14 +574,46 @@ function autoDecisionSnapshot(nowMs = Date.now()) {
 }
 
 function writeAutoContinueState(patch) {
-  const previous = readJson(autoContinueStatePath, emptyAutoContinueState());
+  const previous = normalizeAutoContinueState(readJson(autoContinueStatePath, emptyAutoContinueState()));
   atomicWriteJson(autoContinueStatePath, {
     ...emptyAutoContinueState(),
     ...previous,
     ...patch,
-    version: 1,
+    version: AUTO_CONTINUE_STATE_VERSION,
     heartbeatAtMs: Date.now(),
   });
+}
+
+function readAutoContinueState() {
+  return normalizeAutoContinueState(readJson(autoContinueStatePath, emptyAutoContinueState()));
+}
+
+function sendPendingNotification(pending) {
+  const result = spawnSync(notifySendBin, [
+    '-r', String(pending.notificationReplaceId),
+    'Codex behöver byta konto',
+    'ChatGPT startas om automatiskt om 10 sekunder. Öppna Codex-status för att avbryta.',
+  ], { stdio: 'ignore', timeout: 5_000 });
+  const deliveredAtMs = !result.error && result.status === 0 ? Date.now() : null;
+  const state = readAutoContinueState();
+  if (state.pending?.fingerprint !== pending.fingerprint) return;
+  writeAutoContinueState({
+    pending: {
+      ...state.pending,
+      notificationDeliveredAtMs: deliveredAtMs,
+      notificationErrorKind: deliveredAtMs ? null : 'NOTIFY_SEND_FAILED',
+    },
+  });
+}
+
+async function awaitPendingCountdown(expectedPlan) {
+  while (true) {
+    const currentPlan = autoDecisionSnapshot();
+    if (!sameDecisionPlan(expectedPlan, currentPlan)) return 'changed';
+    const gate = pendingCountdownDecision(readAutoContinueState(), currentPlan, Date.now());
+    if (gate.action !== 'wait') return gate.action;
+    await sleep(Math.min(AUTO_PENDING_POLL_MS, gate.remainingMs));
+  }
 }
 
 function refreshUsageNow() {
@@ -618,7 +666,9 @@ async function waitForObserverIdleAfterTurn(timeoutMs = 15_000) {
 async function automaticMain() {
   const initial = autoDecisionSnapshot();
   if (initial.action !== 'resume') {
+    const reconciled = reconcileSuppression(readAutoContinueState(), initial);
     writeAutoContinueState({
+      ...reconciled,
       status: initial.action,
       lastAttemptAtMs: Date.now(),
       errorKind: initial.action === 'blocked' ? initial.reason : null,
@@ -626,6 +676,7 @@ async function automaticMain() {
       candidateThreadId: null,
       candidateTurnId: null,
       targetAccountId: null,
+      pending: null,
     });
     return;
   }
@@ -638,6 +689,53 @@ async function automaticMain() {
     lock = acquireLock();
     const lockedPlan = autoDecisionSnapshot();
     if (!sameDecisionPlan(initial, lockedPlan)) throw new Error('AUTO_PLAN_CHANGED_BEFORE_OWNERSHIP');
+    if (isAutoPlanSuppressed(readAutoContinueState(), lockedPlan)) {
+      writeAutoContinueState({
+        status: 'suppressed',
+        pending: null,
+        errorKind: null,
+        actionRequired: false,
+        candidateThreadId: lockedPlan.candidates[0]?.threadId || null,
+        candidateTurnId: lockedPlan.candidates[0]?.turnId || null,
+        targetAccountId: lockedPlan.target.accountId,
+      });
+      return;
+    }
+    const processSnapshot = processEntries();
+    const autoBlocker = automaticClientBlocker(processSnapshot);
+    if (autoBlocker) {
+      const blockerError = new Error(autoBlocker.errorKind);
+      blockerError.diagnostics = autoBlocker;
+      throw blockerError;
+    }
+    const desktopRunning = processSnapshot.some(isDesktopRoot);
+    if (requiresPendingCountdown(lockedPlan, desktopRunning)) {
+      const prepared = createOrResumePending(readAutoContinueState(), lockedPlan);
+      writeAutoContinueState(prepared.state);
+      if (prepared.notificationClaimed) sendPendingNotification(prepared.state.pending);
+      if (prepared.outcome === 'suppressed') return;
+      const countdownOutcome = await awaitPendingCountdown(lockedPlan);
+      if (countdownOutcome === 'canceled') return;
+      if (countdownOutcome !== 'execute') {
+        const changedPlan = autoDecisionSnapshot();
+        writeAutoContinueState({
+          status: changedPlan.action === 'resume' ? 'waiting' : changedPlan.action,
+          lastAttemptAtMs: Date.now(),
+          errorKind: null,
+          actionRequired: false,
+          candidateThreadId: null,
+          candidateTurnId: null,
+          targetAccountId: null,
+          pending: null,
+        });
+        return;
+      }
+      const expiredPlan = autoDecisionSnapshot();
+      if (!sameDecisionPlan(lockedPlan, expiredPlan)) {
+        writeAutoContinueState({ status: 'waiting', pending: null, errorKind: null, actionRequired: false });
+        return;
+      }
+    }
     writeAutoContinueState({
       status: 'running',
       lastAttemptAtMs: Date.now(),
@@ -646,6 +744,7 @@ async function automaticMain() {
       candidateThreadId: lockedPlan.candidates[0]?.threadId || null,
       candidateTurnId: lockedPlan.candidates[0]?.turnId || null,
       targetAccountId: lockedPlan.target.accountId,
+      pending: null,
     });
 
     lease = await acquireExclusiveClients({ autoMode: true });
@@ -711,6 +810,7 @@ async function automaticMain() {
       candidateThreadId: null,
       candidateTurnId: null,
       targetAccountId: switchedPlan.target.accountId,
+      pending: null,
     });
   } catch (error) {
     if (committed && currentCandidate) {
@@ -730,6 +830,7 @@ async function automaticMain() {
       candidateThreadId: currentCandidate?.threadId || initial.candidates[0]?.threadId || null,
       candidateTurnId: currentCandidate?.turnId || initial.candidates[0]?.turnId || null,
       targetAccountId: initial.target?.accountId || null,
+      pending: null,
     });
     if (!transient) process.exitCode = 1;
   } finally {
@@ -745,6 +846,7 @@ async function automaticMain() {
           candidateThreadId: currentCandidate?.threadId || null,
           candidateTurnId: currentCandidate?.turnId || null,
           targetAccountId: initial.target?.accountId || null,
+          pending: null,
         });
         process.exitCode = 1;
       }

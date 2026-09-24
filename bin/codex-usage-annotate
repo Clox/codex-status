@@ -44,14 +44,15 @@ const {
   pendingInterruptedTurns,
 } = require(path.join(__dirname, '..', 'lib', 'codex-manual-resume'));
 const {
-  autoContinueLine,
   defaultStatusPreferencesPath,
   readStatusPreferences,
 } = require(path.join(__dirname, '..', 'lib', 'codex-status-preferences'));
 const {
+  autoContinueStatusLine,
   autoContinueProblemLine,
   emptyAutoContinueState,
   normalizeAutoContinueState,
+  pendingAttentionDecision,
 } = require(path.join(__dirname, '..', 'lib', 'codex-auto-continue'));
 const {
   tableCell,
@@ -105,7 +106,7 @@ const pendingSourceRow = /^(1|2|3)$/.test(pendingSourceCandidate)
   ? pendingSourceCandidate
   : null;
 const pendingStatusCandidate = process.env.CODEX_PENDING_STATUS || 'WAIT/';
-const pendingStatus = /^WAIT[\/\\|\-]$/.test(pendingStatusCandidate)
+const pendingStatus = /^WAIT[\/\\|─]$/.test(pendingStatusCandidate)
   ? pendingStatusCandidate
   : 'WAIT/';
 const nowMs = Number.isFinite(Number(process.env.CODEX_STATUS_NOW_MS))
@@ -251,7 +252,10 @@ const rankedRows = rankingEnabled
 
 const recommendation = rankingEnabled ? recommendAccount(rankedRows) : null;
 if (attentionOnly) {
-  process.stdout.write(JSON.stringify(attentionDecision(rankedRows, recommendation, { nowMs })));
+  process.stdout.write(JSON.stringify(
+    pendingAttentionDecision(autoContinueState, statusPreferences.autoContinue === true, nowMs) ||
+    attentionDecision(rankedRows, recommendation, { nowMs })
+  ));
   process.exit(0);
 }
 
@@ -428,6 +432,6 @@ const footerParts = [
   problemSection,
   usageQualityLine,
 ].filter(Boolean).map(section => section.replace(/^\n/, ''));
-footerParts.push(`\x1b[1;35m${autoContinueLine(statusPreferences)}\x1b[0m`);
+footerParts.push(`\x1b[1;35m${autoContinueStatusLine(statusPreferences, autoContinueState, nowMs)}\x1b[0m`);
 const footer = footerParts.join('\n\n');
 process.stdout.write(`${output.join('\n').trimEnd()}\n\n${renderedRecommendationLines.join('\n')}\n\n${footer}`);

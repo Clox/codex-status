@@ -1,10 +1,25 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 const test = require('node:test');
 const {
+  autoContinueStatusLine,
   autoContinueProblemLine,
+  autoPlanFingerprint,
   automationDecision,
+  cancelPendingAction,
+  createOrResumePending,
+  isAutoPlanSuppressed,
+  normalizeAutoContinueState,
+  pendingAttentionDecision,
+  pendingCountdownDecision,
+  reconcileSuppression,
+  requiresPendingCountdown,
+  resetAutoContinueForToggle,
+  writeAutoContinueStateFile,
 } = require('../lib/codex-auto-continue');
 const {
   automaticClientBlocker,
@@ -248,4 +263,79 @@ test('a later real turn removes an advanced candidate from the automation set', 
   delete state.interruptedTurns.first;
   const decision = decide({ eventState: state });
   assert.deepEqual(decision.candidates.map(item => item.threadId), ['thread-second']);
+});
+
+test('pending countdown persists the exact plan and claims one notification across restart', () => {
+  const decision = decide();
+  const created = createOrResumePending({}, decision, NOW);
+  assert.equal(created.outcome, 'created');
+  assert.equal(created.notificationClaimed, true);
+  assert.equal(created.state.pending.sourceAccountId, 'account-a');
+  assert.equal(created.state.pending.targetAccountId, 'account-b');
+  assert.equal(created.state.pending.threadId, 'thread-first');
+  assert.equal(created.state.pending.failedTurnId, 'turn-first');
+  assert.equal(created.state.pending.interruptionClass, INTERRUPTION_CLASS.AFTER_WORK);
+  assert.equal(created.state.pending.inputHash, continuationForCandidate(decision.candidates[0]).inputHash);
+  assert.equal(created.state.pending.candidates.length, 2);
+
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-auto-pending-'));
+  const statePath = path.join(root, 'auto-continue.json');
+  writeAutoContinueStateFile(statePath, created.state);
+  const restarted = createOrResumePending(
+    normalizeAutoContinueState(JSON.parse(fs.readFileSync(statePath, 'utf8'))),
+    decision,
+    NOW + 4_000,
+  );
+  assert.equal(restarted.outcome, 'resumed');
+  assert.equal(restarted.notificationClaimed, true);
+  assert.equal(restarted.state.pending.notificationReplaceId, created.state.pending.notificationReplaceId);
+  assert.equal(restarted.state.pending.deadlineAtMs, NOW + 10_000);
+  assert.equal(autoContinueStatusLine({ autoContinue: true }, restarted.state, NOW + 3_100),
+    'AUTO-CONTINUE: ON · Restart om 7s [X] Avbryt');
+  assert.equal(pendingAttentionDecision(restarted.state, true, NOW + 3_100).situationClass,
+    'auto-continue-pending');
+});
+
+test('cancel suppresses the same plan but changed target or candidate re-arms it', () => {
+  const decision = decide();
+  const created = createOrResumePending({}, decision, NOW).state;
+  const canceled = cancelPendingAction(created, NOW + 1_000);
+  assert.equal(canceled.canceled, true);
+  assert.equal(canceled.state.pending, null);
+  assert.equal(canceled.state.suppression.fingerprint, autoPlanFingerprint(decision));
+  assert.equal(createOrResumePending(canceled.state, decision, NOW + 2_000).outcome, 'suppressed');
+  assert.equal(isAutoPlanSuppressed(canceled.state, decision), true);
+
+  const changedTarget = decide();
+  changedTarget.target = { ...changedTarget.target, accountId: 'account-c', accountKey: 'key-c' };
+  const targetRearmed = createOrResumePending(canceled.state, changedTarget, NOW + 2_000);
+  assert.equal(targetRearmed.outcome, 'created');
+  assert.equal(targetRearmed.state.suppression, null);
+
+  const changedCandidate = decide();
+  changedCandidate.candidates = changedCandidate.candidates.slice(1);
+  assert.equal(createOrResumePending(canceled.state, changedCandidate, NOW + 2_000).outcome, 'created');
+
+  const cleared = reconcileSuppression(canceled.state, { action: 'idle', reason: 'no-candidates' });
+  assert.equal(cleared.suppression, null);
+  assert.equal(resetAutoContinueForToggle(canceled.state, true, NOW + 3_000).suppression, null);
+});
+
+test('countdown expiry hands the unchanged plan to existing execution while changes fail closed', () => {
+  const decision = decide();
+  const state = createOrResumePending({}, decision, NOW).state;
+  assert.deepEqual(pendingCountdownDecision(state, decision, NOW + 9_500), {
+    action: 'wait', remainingMs: 500,
+  });
+  assert.deepEqual(pendingCountdownDecision(state, decision, NOW + 10_000), {
+    action: 'execute', remainingMs: 0,
+  });
+  assert.equal(pendingCountdownDecision(cancelPendingAction(state, NOW + 2_000).state, decision, NOW + 10_000).action,
+    'canceled');
+  const changed = decide();
+  changed.candidates = changed.candidates.slice(1);
+  assert.equal(pendingCountdownDecision(state, changed, NOW + 10_000).action, 'changed');
+  assert.equal(requiresPendingCountdown(decision, true), true);
+  assert.equal(requiresPendingCountdown(decision, false), false);
+  assert.equal(requiresPendingCountdown({ ...decision, target: { ...decision.target, accountId: 'account-a' } }, true), false);
 });

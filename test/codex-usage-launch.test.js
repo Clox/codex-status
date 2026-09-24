@@ -174,3 +174,36 @@ test('missing readiness signal is treated as a real startup failure', t => {
   assert.equal(result.status, 70);
   assert.match(fs.readFileSync(notifications, 'utf8'), /Codex-kontostatus kunde inte starta/);
 });
+
+test('production-style launcher moves itself into an independent user scope exactly once', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-status-launch-test-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const systemdRun = path.join(root, 'systemd-run');
+  const terminal = path.join(root, 'terminal');
+  const status = path.join(root, 'status');
+  const invocations = path.join(root, 'systemd-invocations');
+  executable(status, '#!/bin/sh\nexit 0\n');
+  executable(terminal, '#!/bin/sh\n: >"$CODEX_STATUS_READY_FILE"\nexit 0\n');
+  executable(systemdRun, `#!/bin/sh
+printf '%s\\n' "$*" >>"${invocations}"
+while [ "$1" != "--" ]; do shift; done
+shift
+exec "$@"
+`);
+  const result = spawnSync(launcher, [], {
+    env: {
+      ...process.env,
+      XDG_CACHE_HOME: root,
+      GNOME_TERMINAL_BIN: terminal,
+      CODEX_USAGE_WATCH_BIN: status,
+      CODEX_STATUS_LAUNCH_LOG: path.join(root, 'launch.log'),
+      CODEX_STATUS_SYSTEMD_RUN_BIN: systemdRun,
+      CODEX_STATUS_FORCE_SYSTEMD_ISOLATION: '1',
+    },
+    encoding: 'utf8',
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const lines = fs.readFileSync(invocations, 'utf8').trim().split('\n');
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /^--user --scope --quiet --unit=codex-status-launch-[0-9]+ -- /);
+});

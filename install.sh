@@ -18,7 +18,7 @@ fail() {
   exit 1
 }
 
-for command_name in node npm gnome-terminal gsettings dconf script setsid pgrep pkill systemctl busctl flock wmctrl xprop sqlite3; do
+for command_name in node npm gnome-terminal gsettings dconf script setsid pgrep pkill systemctl systemd-run busctl flock wmctrl xprop sqlite3; do
   command -v "$command_name" >/dev/null 2>&1 || fail "required command is missing: $command_name"
 done
 [[ -x /usr/libexec/gnome-terminal-server && -x /usr/bin/gnome-terminal.real ]] ||

@@ -12,6 +12,25 @@ status_runtime_dir=${XDG_CACHE_HOME:-"$HOME/.cache"}/codex-account-switcher
 retry_delay=${CODEX_STATUS_LAUNCH_RETRY_DELAY:-0.5}
 ready_checks=${CODEX_STATUS_READY_CHECKS:-50}
 ready_poll_delay=${CODEX_STATUS_READY_POLL_DELAY:-0.1}
+systemd_run_bin=${CODEX_STATUS_SYSTEMD_RUN_BIN:-/usr/bin/systemd-run}
+
+# Always move the production launcher and its dedicated terminal server out of
+# the caller's process tree. In particular, an install/update initiated from a
+# Codex Desktop turn must not make the status window a Desktop descendant that
+# disappears when AUTO-CONTINUE later quiesces Desktop.
+if [[ ${CODEX_STATUS_ISOLATED:-0} != 1 ]] &&
+    [[ ${CODEX_STATUS_SYSTEMD_ISOLATION:-1} == 1 ]] &&
+    [[ -x $systemd_run_bin ]] && {
+      [[ ${CODEX_STATUS_FORCE_SYSTEMD_ISOLATION:-0} == 1 ]] || {
+        [[ -z ${GNOME_TERMINAL_BIN:-} ]] &&
+        [[ -z ${GNOME_TERMINAL_SERVER_BIN:-} ]] &&
+        [[ -z ${GNOME_TERMINAL_CLIENT_BIN:-} ]];
+      };
+    }; then
+  export CODEX_STATUS_ISOLATED=1
+  exec "$systemd_run_bin" --user --scope --quiet \
+    --unit="codex-status-launch-${BASHPID}" -- "$0" "$@"
+fi
 
 mkdir -p "$(dirname -- "$log_file")"
 chmod 700 "$(dirname -- "$log_file")"

@@ -102,7 +102,7 @@ fi
 pending_source_row=''
 pending_since=0
 pending_spinner_index=0
-pending_spinner_frames=('WAIT/' 'WAIT-' 'WAIT\' 'WAIT|')
+pending_spinner_frames=('WAIT/' 'WAIT─' 'WAIT\' 'WAIT|')
 key_map=''
 last_background_refresh=-10
 paused_rendering=0
@@ -353,6 +353,15 @@ while true; do
           notify-send 'Codex auto-continue' 'Inställningen kunde inte ändras. Se statusfönstrets problemsektion.' 2>/dev/null || true
         else
           force_render=1
+        fi
+        ;;
+      x|X)
+        if printf '%s\n' "$base_frame" | grep -Fq '[X] Avbryt'; then
+          if ! "$CODEX_STATUS_PREFERENCES_BIN" cancel-auto-pending >/dev/null 2>>"$status_runtime_dir/status-launch.log"; then
+            notify-send 'Codex auto-continue' 'Den väntande åtgärden kunde inte avbrytas säkert.' 2>/dev/null || true
+          fi
+          force_render=1
+          [[ -z $raw_frame ]] || process_snapshot
         fi
         ;;
       p|P)
