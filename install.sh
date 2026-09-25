@@ -18,9 +18,11 @@ fail() {
   exit 1
 }
 
-for command_name in node npm gnome-terminal gsettings dconf script setsid pgrep pkill systemctl systemd-run busctl flock wmctrl xprop sqlite3; do
+for command_name in node npm python3 gnome-terminal gsettings dconf script setsid pgrep pkill systemctl systemd-run busctl flock wmctrl xprop sqlite3; do
   command -v "$command_name" >/dev/null 2>&1 || fail "required command is missing: $command_name"
 done
+python3 -c 'import gi; gi.require_version("Gtk", "3.0"); gi.require_version("Gdk", "3.0"); from gi.repository import Gtk, Gdk; import pyatspi' >/dev/null 2>&1 ||
+  fail 'python3-pyatspi and GTK 3 Python bindings are required for AUTO: DESKTOP'
 [[ -x /usr/libexec/gnome-terminal-server && -x /usr/bin/gnome-terminal.real ]] ||
   fail 'the GNOME Terminal server/client binaries are required for the status window'
 
@@ -81,6 +83,7 @@ backup_if_present "$local_bin/codex-account"
 backup_if_present "$local_bin/codex-account-state"
 backup_if_present "$local_bin/codex-auto-continue"
 backup_if_present "$local_bin/codex-continuation-drafts"
+backup_if_present "$local_bin/codex-desktop-atspi"
 backup_if_present "$local_bin/codex-auth-repair"
 backup_if_present "$local_bin/codex-usage-launch"
 backup_if_present "$local_bin/codex-usage-watch"
@@ -101,6 +104,7 @@ backup_if_present "$local_lib/codex-attention-policy.js"
 backup_if_present "$local_lib/codex-account-state.js"
 backup_if_present "$local_lib/codex-auto-continue.js"
 backup_if_present "$local_lib/codex-continuation-drafts.js"
+backup_if_present "$local_lib/codex-desktop-auto.js"
 backup_if_present "$local_lib/codex-auth-repair.js"
 backup_if_present "$local_lib/codex-reset-credits.js"
 backup_if_present "$local_lib/codex-status-render.js"
@@ -132,6 +136,7 @@ install -m 0755 "$bin_source/codex-account" "$local_bin/codex-account"
 install -m 0755 "$bin_source/codex-account-state" "$local_bin/codex-account-state"
 install -m 0755 "$bin_source/codex-auto-continue" "$local_bin/codex-auto-continue"
 install -m 0755 "$bin_source/codex-continuation-drafts" "$local_bin/codex-continuation-drafts"
+install -m 0755 "$bin_source/codex-desktop-atspi" "$local_bin/codex-desktop-atspi"
 install -m 0755 "$bin_source/codex-auth-repair" "$local_bin/codex-auth-repair"
 install -m 0755 "$bin_source/codex-usage-launch" "$local_bin/codex-usage-launch"
 install -m 0755 "$bin_source/codex-usage-watch" "$local_bin/codex-usage-watch"
@@ -152,6 +157,7 @@ install -m 0644 "$lib_source/codex-attention-policy.js" "$local_lib/codex-attent
 install -m 0644 "$lib_source/codex-account-state.js" "$local_lib/codex-account-state.js"
 install -m 0644 "$lib_source/codex-auto-continue.js" "$local_lib/codex-auto-continue.js"
 install -m 0644 "$lib_source/codex-continuation-drafts.js" "$local_lib/codex-continuation-drafts.js"
+install -m 0644 "$lib_source/codex-desktop-auto.js" "$local_lib/codex-desktop-auto.js"
 install -m 0644 "$lib_source/codex-auth-repair.js" "$local_lib/codex-auth-repair.js"
 install -m 0644 "$lib_source/codex-reset-credits.js" "$local_lib/codex-reset-credits.js"
 install -m 0644 "$lib_source/codex-status-render.js" "$local_lib/codex-status-render.js"
@@ -203,6 +209,7 @@ escape_config_value() {
   printf 'CODEX_EVENT_STATE=%s\n' "$(escape_config_value "${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/turn-events.json")"
   printf 'CODEX_RESUME_STATE=%s\n' "$(escape_config_value "${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/manual-resume.json")"
   printf 'CODEX_MANUAL_RESUME=%s\n' "$(escape_config_value "$local_bin/codex-manual-resume")"
+  printf 'CODEX_DESKTOP_ATSPI=%s\n' "$(escape_config_value "$local_bin/codex-desktop-atspi")"
   printf 'CODEX_AUTO_CONTINUE_STATE=%s\n' "$(escape_config_value "${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/auto-continue.json")"
   printf 'CODEX_STATUS_PREFERENCES=%s\n' "$(escape_config_value "$config_dir/status-preferences.json")"
   printf 'CODEX_STATUS_PREFERENCES_BIN=%s\n' "$(escape_config_value "$local_bin/codex-status-preferences")"
@@ -212,6 +219,9 @@ escape_config_value() {
   printf 'RESET_CREDITS_CACHE=%s\n' "$(escape_config_value "${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/reset-credits.json")"
 } >"$config_file"
 chmod 600 "$config_file"
+
+CODEX_STATUS_PREFERENCES="$config_dir/status-preferences.json" \
+  "$local_bin/codex-status-preferences" migrate >/dev/null
 
 systemctl --user daemon-reload
 systemctl --user enable --now codex-five-hour-activation.timer

@@ -45,6 +45,18 @@ const {
   sameDecisionPlan,
 } = require(path.join(__dirname, '..', 'lib', 'codex-auto-continue'));
 const {
+  DESKTOP_SEND_CONFIRM_TIMEOUT_MS,
+  committedDesktopAttempts,
+  desktopPlan,
+  desktopPrecommitFailureAction,
+  desktopQueueMayContinue,
+  markDesktopPrefillStarted,
+  markDesktopSendCommitted,
+  markDesktopSendInvoked,
+  reconcileDesktopSend,
+} = require(path.join(__dirname, '..', 'lib', 'codex-desktop-auto'));
+const {
+  AUTO_MODE,
   defaultStatusPreferencesPath,
   readStatusPreferences,
 } = require(path.join(__dirname, '..', 'lib', 'codex-status-preferences'));
@@ -71,6 +83,7 @@ const TURN_TIMEOUT_MS = 12 * 60 * 60 * 1000;
 const MAX_PROTOCOL_FRAME_BYTES = 4 * 1024 * 1024;
 const AUTO_PENDING_POLL_MS = 200;
 const notifySendBin = process.env.NOTIFY_SEND_BIN || 'notify-send';
+const desktopAtspiBin = process.env.CODEX_DESKTOP_ATSPI || path.join(os.homedir(), '.local', 'bin', 'codex-desktop-atspi');
 
 function readJson(filename, fallback = null) {
   try { return JSON.parse(fs.readFileSync(filename, 'utf8')); } catch { return fallback; }
@@ -195,10 +208,10 @@ function launchDesktopOnce(attempt) {
   return { pid: child.pid };
 }
 
-async function restoreClients(lease, { removeLease = true } = {}) {
+async function restoreClients(lease, { removeLease = true, forceDesktop = false } = {}) {
   signalExisting([...(lease.vscodePids || [])].reverse(), 'SIGCONT');
   let desktopRestore = null;
-  if (lease.desktopWasRunning) {
+  if (lease.desktopWasRunning || forceDesktop) {
     desktopRestore = await restoreDesktopWithRetry({
       runningPids: desktopRootPids,
       launch: launchDesktopOnce,
@@ -314,6 +327,28 @@ function assertObserverIdle(eventState, candidate) {
   if (Object.keys(eventState.activeTurns || {}).length > 0) throw new Error('CODEX_TURNS_STILL_ACTIVE');
   const persisted = eventState.interruptedTurns?.[candidateKey(candidate.threadId, candidate.turnId)];
   if (!persisted?.resumable || persisted.threadIdentityVerified !== true) throw new Error('CANDIDATE_NO_LONGER_RESUMABLE');
+  return persisted;
+}
+
+function assertDesktopCandidate(eventState, candidate, target) {
+  if (!observerHealth(eventState, Date.now()).healthy) throw new Error('TURN_OBSERVER_UNVERIFIED');
+  const key = candidateKey(candidate.threadId, candidate.turnId);
+  const persisted = eventState.interruptedTurns?.[key];
+  if (!persisted?.resumable || persisted.threadIdentityVerified !== true ||
+      persisted.classificationVerified !== true) throw new Error('CANDIDATE_NO_LONGER_RESUMABLE');
+  if (persisted.accountId !== candidate.accountId) throw new Error('CANDIDATE_ACCOUNT_CHANGED');
+  const expected = desktopPlan(candidate, target);
+  const actual = desktopPlan(persisted, target);
+  if (expected.inputHash !== actual.inputHash || expected.interruptionClass !== actual.interruptionClass) {
+    throw new Error('CANDIDATE_EVIDENCE_CHANGED');
+  }
+  if (Object.values(eventState.activeTurns || {}).some(turn => turn.threadId === candidate.threadId)) {
+    throw new Error('THREAD_STILL_ACTIVE');
+  }
+  const exhaustion = eventState.exhaustions?.[candidate.accountId];
+  if (exhaustion?.verified !== true || exhaustion?.errorKind !== 'usageLimitExceeded') {
+    throw new Error('SOURCE_EXHAUSTION_CHANGED');
+  }
   return persisted;
 }
 
@@ -447,6 +482,48 @@ class RpcConnection {
     for (const waiter of this.waiters) waiter.reject(error);
     this.pending.clear();
     this.waiters.clear();
+  }
+}
+
+class DesktopAtspiController {
+  constructor() {
+    this.child = spawn(desktopAtspiBin, [], { stdio: ['pipe', 'pipe', 'pipe'] });
+    this.lines = readline.createInterface({ input: this.child.stdout });
+    this.responses = [];
+    this.waiters = [];
+    this.failure = null;
+    this.child.stderr.on('data', () => {});
+    this.lines.on('line', line => {
+      let response;
+      try { response = JSON.parse(line); } catch { return this.fail(new Error('DESKTOP_ATSPI_PROTOCOL_MISMATCH')); }
+      const waiter = this.waiters.shift();
+      if (waiter) waiter.resolve(response);
+      else this.responses.push(response);
+    });
+    this.child.on('error', () => this.fail(new Error('DESKTOP_ATSPI_START_FAILED')));
+    this.child.on('exit', () => this.fail(new Error('DESKTOP_ATSPI_EXITED')));
+  }
+
+  fail(error) {
+    if (this.failure) return;
+    this.failure = error;
+    for (const waiter of this.waiters.splice(0)) waiter.reject(error);
+  }
+
+  async request(command, timeoutMs = 10_000) {
+    if (this.failure) throw this.failure;
+    const pending = this.responses.length > 0
+      ? Promise.resolve(this.responses.shift())
+      : new Promise((resolve, reject) => this.waiters.push({ resolve, reject }));
+    this.child.stdin.write(`${JSON.stringify(command)}\n`);
+    const response = await withTimeout(pending, timeoutMs);
+    if (response?.ok !== true) throw new Error(response?.errorKind || 'DESKTOP_ATSPI_FAILED');
+    return response;
+  }
+
+  async close() {
+    try { await this.request({ command: 'close' }, 1_000); } catch {}
+    await terminateChild(this.child);
   }
 }
 
@@ -678,7 +755,7 @@ async function waitForObserverIdleAfterTurn(timeoutMs = 15_000) {
   }, timeoutMs, 'TURN_OBSERVER_DID_NOT_SETTLE');
 }
 
-async function automaticMain() {
+async function automaticHeadlessMain() {
   const initial = autoDecisionSnapshot();
   if (initial.action !== 'resume') {
     const reconciled = reconcileSuppression(readAutoContinueState(), initial);
@@ -881,6 +958,284 @@ async function automaticMain() {
     }
     if (lock) releaseLock(lock);
   }
+}
+
+function launchDesktopDeepLink(url) {
+  const child = spawn(desktopBinary, [url], { detached: true, stdio: 'ignore' });
+  child.unref();
+  return child.pid;
+}
+
+function desktopLink(threadId, prompt = null) {
+  const url = new URL(`codex://threads/${encodeURIComponent(threadId)}`);
+  if (prompt !== null) url.searchParams.set('prompt', prompt);
+  return url.toString();
+}
+
+function desktopCapability(response) {
+  const entries = processEntries();
+  const roots = entries.filter(isDesktopRoot).map(entry => entry.pid);
+  const desktopTree = new Set(descendants(entries, roots));
+  const renderers = entries.filter(entry =>
+    desktopTree.has(entry.pid) && entry.args.some(argument => argument === '--type=renderer')
+  ).map(entry => entry.pid).sort((left, right) => left - right);
+  if (roots.length !== 1 || renderers.length === 0) throw new Error('DESKTOP_PROCESS_IDENTITY_UNVERIFIED');
+  const packageResult = spawnSync('dpkg-query', ['-W', '-f=${Version}', 'chatgpt'], {
+    encoding: 'utf8', timeout: 5_000,
+  });
+  if (packageResult.error || packageResult.status !== 0 || !packageResult.stdout.trim()) {
+    throw new Error('DESKTOP_VERSION_UNVERIFIED');
+  }
+  return {
+    verified: response?.verified === true,
+    desktopIdentity: {
+      ...(response?.desktopIdentity || {}),
+      packageVersion: packageResult.stdout.trim(),
+      rootPid: roots[0],
+    },
+    rendererIdentity: {
+      ...(response?.rendererIdentity || {}),
+      rendererPids: renderers,
+    },
+    atspiIdentity: response?.atspiIdentity || null,
+  };
+}
+
+async function reconcileOutstandingDesktopAttempts() {
+  let journal = normalizeResumeState(readJson(resumeStatePath, emptyResumeState()));
+  const attempts = committedDesktopAttempts(journal);
+  if (attempts.length === 0) return false;
+  const eventState = normalizeState(readJson(eventStatePath, {}), Date.now());
+  let pending = false;
+  for (const attempt of attempts) {
+    const candidate = { threadId: attempt.threadId, turnId: attempt.interruptedTurnId };
+    const result = reconcileDesktopSend(journal, candidate, eventState, Date.now());
+    journal = result.state;
+    if (result.outcome === 'pending') pending = true;
+  }
+  atomicWriteJson(resumeStatePath, journal);
+  if (pending) {
+    writeAutoContinueState({ status: 'reconciling', errorKind: null, actionRequired: false });
+  }
+  return pending;
+}
+
+async function awaitDesktopSendReconciliation(candidate) {
+  const deadline = Date.now() + DESKTOP_SEND_CONFIRM_TIMEOUT_MS;
+  while (true) {
+    const eventState = normalizeState(readJson(eventStatePath, {}), Date.now());
+    let journal = normalizeResumeState(readJson(resumeStatePath, emptyResumeState()));
+    const result = reconcileDesktopSend(journal, candidate, eventState, Date.now());
+    journal = result.state;
+    if (result.outcome !== 'pending') {
+      atomicWriteJson(resumeStatePath, journal);
+      return result;
+    }
+    if (Date.now() >= deadline) {
+      const finalResult = reconcileDesktopSend(journal, candidate, eventState,
+        Date.now() + DESKTOP_SEND_CONFIRM_TIMEOUT_MS);
+      atomicWriteJson(resumeStatePath, finalResult.state);
+      return finalResult;
+    }
+    await sleep(200);
+  }
+}
+
+async function automaticDesktopMain() {
+  const initial = autoDecisionSnapshot();
+  if (initial.action !== 'resume') {
+    const reconciled = reconcileSuppression(readAutoContinueState(), initial);
+    writeAutoContinueState({
+      ...reconciled,
+      status: initial.action,
+      lastAttemptAtMs: Date.now(),
+      errorKind: initial.action === 'blocked' ? initial.reason : null,
+      actionRequired: initial.actionRequired === true,
+      candidateThreadId: null,
+      candidateTurnId: null,
+      targetAccountId: null,
+      pending: null,
+    });
+    return 'done';
+  }
+
+  // A structured BEFORE_WORK input cannot be represented losslessly in the
+  // Desktop composer. This check happens before any navigation/prefill, so the
+  // existing headless controller is still a safe fallback.
+  try {
+    for (const candidate of initial.candidates) desktopPlan(candidate, initial.target);
+  } catch (error) {
+    if (error.safeHeadlessFallback) return 'fallback-headless';
+    throw error;
+  }
+
+  let lock = null;
+  let lease = null;
+  let currentCandidate = null;
+  let promptInjected = false;
+  let anyCommitted = false;
+  let safeFallback = false;
+  try {
+    lock = acquireLock();
+    const lockedPlan = autoDecisionSnapshot();
+    if (!sameDecisionPlan(initial, lockedPlan)) throw new Error('AUTO_PLAN_CHANGED_BEFORE_OWNERSHIP');
+    if (isAutoPlanSuppressed(readAutoContinueState(), lockedPlan)) {
+      writeAutoContinueState({ status: 'suppressed', pending: null, errorKind: null, actionRequired: false });
+      return 'done';
+    }
+    const processSnapshot = processEntries();
+    const autoBlocker = automaticClientBlocker(processSnapshot);
+    if (autoBlocker) throw Object.assign(new Error(autoBlocker.errorKind), { diagnostics: autoBlocker });
+    const desktopRunning = processSnapshot.some(isDesktopRoot);
+    if (requiresPendingCountdown(lockedPlan, desktopRunning)) {
+      const prepared = createOrResumePending(readAutoContinueState(), lockedPlan);
+      writeAutoContinueState(prepared.state);
+      if (prepared.notificationClaimed) sendPendingNotification(prepared.state.pending);
+      if (prepared.outcome === 'suppressed') return 'done';
+      const outcome = await awaitPendingCountdown(lockedPlan);
+      if (outcome === 'canceled') return 'done';
+      if (outcome !== 'execute') return 'done';
+      if (!sameDecisionPlan(lockedPlan, autoDecisionSnapshot())) return 'done';
+    }
+    writeAutoContinueState({
+      status: 'desktop-preparing', lastAttemptAtMs: Date.now(), errorKind: null,
+      actionRequired: false, candidateThreadId: lockedPlan.candidates[0]?.threadId || null,
+      candidateTurnId: lockedPlan.candidates[0]?.turnId || null,
+      targetAccountId: lockedPlan.target.accountId, pending: null,
+    });
+
+    lease = await acquireExclusiveClients({ autoMode: true });
+    assertAutomaticOwnership();
+    const ownedPlan = autoDecisionSnapshot();
+    if (!sameDecisionPlan(lockedPlan, ownedPlan)) throw new Error('AUTO_PLAN_CHANGED_BEFORE_SWITCH');
+    switchToTarget(ownedPlan.target);
+    refreshUsageNow();
+    const switchedPlan = autoDecisionSnapshot();
+    if (!sameDecisionPlan(ownedPlan, switchedPlan)) throw new Error('AUTO_PLAN_CHANGED_AFTER_SWITCH');
+
+    const restored = await restoreClients(lease, { forceDesktop: true });
+    lease = null;
+    writeAutoContinueState({
+      desktopRestore: restored.desktopRestore ? {
+        status: 'ready', completedAtMs: Date.now(), ...restored.desktopRestore,
+      } : null,
+    });
+
+    const plannedCandidates = [...switchedPlan.candidates];
+    for (let index = 0; index < plannedCandidates.length; index += 1) {
+      currentCandidate = plannedCandidates[index];
+      promptInjected = false;
+      const target = activeAccountState();
+      if (target.accountId !== switchedPlan.target.accountId || target.accountKey !== switchedPlan.target.accountKey) {
+        throw new Error('ACTIVE_ACCOUNT_CHANGED');
+      }
+      assertFreshUsableTarget(target.accountId);
+      let eventState = normalizeState(readJson(eventStatePath, {}), Date.now());
+      const persisted = assertDesktopCandidate(eventState, currentCandidate, target);
+      const plan = desktopPlan(persisted, target);
+
+      launchDesktopDeepLink(desktopLink(plan.threadId));
+      await sleep(500);
+      const atspi = new DesktopAtspiController();
+      try {
+        let capability;
+        try {
+          capability = desktopCapability(await atspi.request({
+            command: 'preflight', threadId: plan.threadId,
+          }));
+        } catch (error) {
+          if (desktopPrecommitFailureAction({ promptInjected, anyCommitted, candidateIndex: index }) === 'fallback-headless') {
+            safeFallback = true;
+            break;
+          }
+          throw error;
+        }
+
+        let journal = normalizeResumeState(readJson(resumeStatePath, emptyResumeState()));
+        journal = markDesktopPrefillStarted(journal, persisted, plan);
+        atomicWriteJson(resumeStatePath, journal);
+        launchDesktopDeepLink(desktopLink(plan.threadId, plan.prompt));
+        promptInjected = true;
+        const verified = await atspi.request({
+          command: 'verify-prefill', threadId: plan.threadId, text: plan.prompt,
+        });
+        capability = desktopCapability(verified);
+
+        refreshUsageNow();
+        const commitTarget = activeAccountState();
+        if (commitTarget.accountId !== target.accountId || commitTarget.accountKey !== target.accountKey) {
+          throw new Error('ACTIVE_ACCOUNT_CHANGED_BEFORE_COMMIT');
+        }
+        assertFreshUsableTarget(target.accountId);
+        eventState = normalizeState(readJson(eventStatePath, {}), Date.now());
+        const commitCandidate = assertDesktopCandidate(eventState, persisted, target);
+        const commitPlan = desktopPlan(commitCandidate, target);
+        if (commitPlan.fingerprint !== plan.fingerprint) throw new Error('DESKTOP_PLAN_CHANGED_BEFORE_COMMIT');
+
+        journal = normalizeResumeState(readJson(resumeStatePath, emptyResumeState()));
+        journal = markDesktopSendCommitted(journal, commitCandidate, commitPlan, capability, eventState);
+        atomicWriteJson(resumeStatePath, journal);
+        anyCommitted = true;
+
+        // Claim the one permitted action before writing to the long-lived
+        // helper. If either process dies now, reconciliation may only observe.
+        journal = markDesktopSendInvoked(journal, commitCandidate);
+        atomicWriteJson(resumeStatePath, journal);
+        let actionReliable = true;
+        try {
+          await atspi.request({ command: 'send' }, 5_000);
+        } catch {
+          actionReliable = false;
+        }
+        const reconciliation = await awaitDesktopSendReconciliation(commitCandidate);
+        if (reconciliation.outcome === 'conflict') throw new Error('DESKTOP_SEND_CONFLICT');
+        if (!desktopQueueMayContinue({ outcome: reconciliation.outcome, capabilityReliable: actionReliable })) {
+          throw new Error('DESKTOP_SEND_UNCONFIRMED_CAPABILITY_FAILED');
+        }
+      } finally {
+        await atspi.close();
+      }
+      if (safeFallback) break;
+    }
+
+    if (safeFallback) return 'fallback-headless';
+    writeAutoContinueState({
+      status: 'completed', lastSuccessAtMs: Date.now(), errorKind: null,
+      actionRequired: false, candidateThreadId: null, candidateTurnId: null,
+      targetAccountId: switchedPlan.target.accountId, pending: null,
+    });
+    return 'done';
+  } catch (error) {
+    const committedAttempt = currentCandidate
+      ? normalizeResumeState(readJson(resumeStatePath, emptyResumeState())).attempts[
+          candidateKey(currentCandidate.threadId, currentCandidate.turnId)
+        ]
+      : null;
+    const afterCommit = committedAttempt?.strategy === 'DESKTOP' && committedAttempt?.committedAtMs;
+    writeAutoContinueState({
+      status: 'blocked', lastAttemptAtMs: Date.now(),
+      errorKind: error?.message || 'AUTO_DESKTOP_FAILED', actionRequired: true,
+      candidateThreadId: currentCandidate?.threadId || initial.candidates[0]?.threadId || null,
+      candidateTurnId: currentCandidate?.turnId || initial.candidates[0]?.turnId || null,
+      targetAccountId: initial.target?.accountId || null, pending: null,
+    });
+    if (afterCommit || promptInjected) return 'done';
+    throw error;
+  } finally {
+    if (lease) {
+      try { await restoreClients(lease, { forceDesktop: true }); } catch {}
+    }
+    if (lock) releaseLock(lock);
+  }
+}
+
+async function automaticMain() {
+  if (await reconcileOutstandingDesktopAttempts()) return 'reconciling';
+  const preferences = readStatusPreferences(statusPreferencesPath);
+  if (preferences.autoMode !== AUTO_MODE.DESKTOP) return automaticHeadlessMain();
+  const outcome = await automaticDesktopMain();
+  if (outcome === 'fallback-headless') return automaticHeadlessMain();
+  return outcome;
 }
 
 async function main() {

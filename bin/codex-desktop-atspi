@@ -1,0 +1,299 @@
+#!/usr/bin/env python3
+"""Single-use semantic ChatGPT Desktop Send controller.
+
+The process keeps the exact verified AT-SPI Send object alive across the
+caller-owned crash-safe commit boundary. It accepts JSON lines on stdin and
+emits credential-free JSON lines on stdout. It never retries an action.
+"""
+
+import json
+import sys
+import time
+import urllib.parse
+
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gtk, Gdk  # noqa: E402
+import pyatspi  # noqa: E402
+
+
+class CapabilityError(RuntimeError):
+    pass
+
+
+def respond(**value):
+    sys.stdout.write(json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+
+def children(node):
+    try:
+        return [node.getChildAtIndex(index) for index in range(node.childCount)]
+    except Exception:
+        return []
+
+
+def walk(node, depth=0, limit=12):
+    if depth > limit:
+        return
+    yield node
+    for child in children(node):
+        yield from walk(child, depth + 1, limit)
+
+
+def state(node, wanted):
+    try:
+        return node.getState().contains(wanted)
+    except Exception:
+        return False
+
+
+def visible(node):
+    return state(node, pyatspi.STATE_VISIBLE) and state(node, pyatspi.STATE_SHOWING)
+
+
+def enabled(node):
+    return state(node, pyatspi.STATE_ENABLED) and state(node, pyatspi.STATE_SENSITIVE)
+
+
+def node_name(node):
+    try:
+        return (node.name or "").strip()
+    except Exception:
+        return ""
+
+
+def role_name(node):
+    try:
+        return node.getRoleName()
+    except Exception:
+        return "unknown"
+
+
+def attributes(node):
+    try:
+        return sorted(node.getAttributes() or [])
+    except Exception:
+        return []
+
+
+def node_identity(node):
+    try:
+        app = node.getApplication()
+        process_id = int(app.get_process_id()) if hasattr(app, "get_process_id") else None
+    except Exception:
+        process_id = None
+    return {
+        "processId": process_id,
+        "role": role_name(node),
+        "name": node_name(node),
+        "attributes": attributes(node),
+        "object": str(node),
+    }
+
+
+def desktop_roots():
+    desktop = pyatspi.Registry.getDesktop(0)
+    result = []
+    for app in children(desktop):
+        name = node_name(app).casefold()
+        if "chatgpt" in name:
+            result.append(app)
+    return result
+
+
+def unique_root():
+    roots = desktop_roots()
+    if len(roots) != 1:
+        raise CapabilityError(f"DESKTOP_ATSPI_ROOT_COUNT_{len(roots)}")
+    return roots[0]
+
+
+def action_names(node):
+    try:
+        action = node.queryAction()
+        return [action.getName(index) for index in range(action.nActions)]
+    except Exception:
+        return []
+
+
+def invoke_action(node):
+    action = node.queryAction()
+    if action.nActions != 1:
+        raise CapabilityError("AT_SPI_ACTION_COUNT_INVALID")
+    if not action.doAction(0):
+        raise CapabilityError("AT_SPI_ACTION_REJECTED")
+
+
+def visible_named(root, names):
+    folded = {name.casefold() for name in names}
+    return [node for node in walk(root) if visible(node) and node_name(node).casefold() in folded]
+
+
+def clipboard_text():
+    clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+    return clipboard, clipboard.wait_for_text()
+
+
+def restore_clipboard(clipboard, original):
+    if original is None:
+        clipboard.clear()
+    else:
+        clipboard.set_text(original, -1)
+        clipboard.store()
+
+
+def verify_thread(root, expected_thread_id):
+    actions = visible_named(root, ["Chat actions"])
+    if len(actions) != 1:
+        raise CapabilityError(f"CHAT_ACTIONS_COUNT_{len(actions)}")
+    clipboard, original = clipboard_text()
+    marker = f"codex-atspi-{time.monotonic_ns()}"
+    clipboard.set_text(marker, -1)
+    clipboard.store()
+    try:
+        invoke_action(actions[0])
+        deadline = time.monotonic() + 3.0
+        copy_items = []
+        while time.monotonic() < deadline:
+            copy_items = visible_named(root, ["Copy deeplink"])
+            if len(copy_items) == 1:
+                break
+            time.sleep(0.05)
+        if len(copy_items) != 1:
+            raise CapabilityError(f"COPY_DEEPLINK_COUNT_{len(copy_items)}")
+        invoke_action(copy_items[0])
+        copied = None
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            copied = clipboard.wait_for_text()
+            if copied and copied != marker:
+                break
+            time.sleep(0.05)
+        parsed = urllib.parse.urlparse(copied or "")
+        actual = urllib.parse.unquote(parsed.path.strip("/").split("/")[-1])
+        if parsed.scheme != "codex" or parsed.netloc != "threads" or actual != expected_thread_id:
+            raise CapabilityError("THREAD_DEEPLINK_MISMATCH")
+        return copied
+    finally:
+        restore_clipboard(clipboard, original)
+
+
+def editable_nodes(root):
+    result = []
+    for node in walk(root):
+        if not visible(node) or not state(node, pyatspi.STATE_EDITABLE):
+            continue
+        try:
+            node.queryEditableText()
+            node.queryText()
+            result.append(node)
+        except Exception:
+            continue
+    return result
+
+
+def text_value(node):
+    text = node.queryText()
+    return text.getText(0, text.characterCount)
+
+
+def composer(root):
+    nodes = editable_nodes(root)
+    if len(nodes) != 1:
+        raise CapabilityError(f"COMPOSER_COUNT_{len(nodes)}")
+    return nodes[0]
+
+
+def send_controls(root, require_enabled):
+    candidates = []
+    for node in walk(root):
+        if not visible(node):
+            continue
+        if node_name(node).casefold() not in {"send", "send message"}:
+            continue
+        if not action_names(node):
+            continue
+        if require_enabled and not enabled(node):
+            continue
+        candidates.append(node)
+    return candidates
+
+
+def snapshot(expected_thread_id, expected_text=None, require_enabled=False):
+    root = unique_root()
+    verify_thread(root, expected_thread_id)
+    editor = composer(root)
+    value = text_value(editor)
+    if expected_text is not None and value != expected_text:
+        raise CapabilityError("COMPOSER_TEXT_MISMATCH")
+    sends = send_controls(root, require_enabled)
+    if len(sends) != 1:
+        raise CapabilityError(f"SEND_CONTROL_COUNT_{len(sends)}")
+    return {
+        "root": root,
+        "composer": editor,
+        "send": sends[0],
+        "desktopIdentity": node_identity(root),
+        "rendererIdentity": node_identity(editor),
+        "atspiIdentity": node_identity(sends[0]),
+    }
+
+
+def same_identity(left, right):
+    return (
+        left["desktopIdentity"] == right["desktopIdentity"]
+        and left["rendererIdentity"] == right["rendererIdentity"]
+        and left["atspiIdentity"] == right["atspiIdentity"]
+    )
+
+
+def main():
+    expected_thread_id = None
+    expected_text = None
+    verified_send = None
+    send_invoked = False
+    for raw in sys.stdin:
+        try:
+            request = json.loads(raw)
+            command = request.get("command")
+            if command == "preflight":
+                expected_thread_id = request["threadId"]
+                first = snapshot(expected_thread_id, require_enabled=False)
+                time.sleep(0.25)
+                second = snapshot(expected_thread_id, require_enabled=False)
+                if not same_identity(first, second):
+                    raise CapabilityError("AT_SPI_IDENTITY_UNSTABLE")
+                respond(ok=True, verified=True, **{
+                    key: second[key] for key in ("desktopIdentity", "rendererIdentity", "atspiIdentity")
+                })
+            elif command == "verify-prefill":
+                expected_thread_id = request["threadId"]
+                expected_text = request["text"]
+                first = snapshot(expected_thread_id, expected_text, require_enabled=True)
+                time.sleep(0.25)
+                second = snapshot(expected_thread_id, expected_text, require_enabled=True)
+                if not same_identity(first, second):
+                    raise CapabilityError("AT_SPI_IDENTITY_UNSTABLE")
+                verified_send = second["send"]
+                respond(ok=True, verified=True, **{
+                    key: second[key] for key in ("desktopIdentity", "rendererIdentity", "atspiIdentity")
+                })
+            elif command == "send":
+                if verified_send is None or send_invoked:
+                    raise CapabilityError("SEND_OBJECT_NOT_AVAILABLE")
+                send_invoked = True
+                invoke_action(verified_send)
+                respond(ok=True, invoked=True)
+            elif command == "close":
+                respond(ok=True)
+                return
+            else:
+                raise CapabilityError("AT_SPI_COMMAND_UNSUPPORTED")
+        except Exception as error:
+            respond(ok=False, errorKind=str(error) or error.__class__.__name__)
+
+
+if __name__ == "__main__":
+    main()

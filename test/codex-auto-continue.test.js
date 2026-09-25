@@ -112,7 +112,7 @@ function decide(overrides = {}) {
 
 test('OFF never acts even when an older resumable candidate exists', () => {
   assert.deepEqual(decide({ preferences: { version: 1, autoContinue: false } }), {
-    action: 'disabled', reason: 'auto-off',
+    action: 'disabled', reason: 'auto-off', strategy: 'OFF',
   });
 });
 
@@ -290,8 +290,8 @@ test('pending countdown persists the exact plan and claims one notification acro
   assert.equal(restarted.notificationClaimed, true);
   assert.equal(restarted.state.pending.notificationReplaceId, created.state.pending.notificationReplaceId);
   assert.equal(restarted.state.pending.deadlineAtMs, NOW + 10_000);
-  assert.equal(autoContinueStatusLine({ autoContinue: true }, restarted.state, NOW + 3_100),
-    'AUTO-CONTINUE: ON · Restart om 7s [X] Avbryt');
+  assert.equal(autoContinueStatusLine({ autoMode: 'HEADLESS' }, restarted.state, NOW + 3_100),
+    'AUTO: HEADLESS · Restart om 7s [X] Avbryt');
   assert.equal(pendingAttentionDecision(restarted.state, true, NOW + 3_100).situationClass,
     'auto-continue-pending');
 });

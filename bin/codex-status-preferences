@@ -9,6 +9,7 @@ const {
   defaultStatusPreferencesPath,
   readStatusPreferences,
   toggleAutoContinue,
+  writeStatusPreferences,
 } = require(path.join(__dirname, '..', 'lib', 'codex-status-preferences'));
 const {
   cancelPendingAction,
@@ -38,11 +39,13 @@ try {
   let preferences;
   if (command === 'show') {
     preferences = readStatusPreferences(statePath);
+  } else if (command === 'migrate') {
+    preferences = writeStatusPreferences(statePath, readStatusPreferences(statePath));
   } else if (command === 'toggle-auto-continue') {
     preferences = toggleAutoContinue(statePath);
     writeAutoContinueStateFile(
       autoStatePath,
-      resetAutoContinueForToggle(readAutoState(), preferences.autoContinue)
+      resetAutoContinueForToggle(readAutoState(), preferences.autoMode)
     );
   } else if (command === 'cancel-auto-pending') {
     preferences = readStatusPreferences(statePath);
@@ -51,9 +54,9 @@ try {
     fs.writeSync(1, `${result.canceled ? 'canceled' : 'none'}\n`);
     process.exit(0);
   } else {
-    throw new Error('USAGE: codex-status-preferences [show|toggle-auto-continue|cancel-auto-pending]');
+    throw new Error('USAGE: codex-status-preferences [show|migrate|toggle-auto-continue|cancel-auto-pending]');
   }
-  process.stdout.write(`${preferences.autoContinue ? 'on' : 'off'}\n`);
+  process.stdout.write(`${preferences.autoMode.toLocaleLowerCase('en-US')}\n`);
 } catch (error) {
   process.stderr.write(`${error?.message || 'STATUS_PREFERENCES_FAILED'}\n`);
   process.exitCode = 1;
