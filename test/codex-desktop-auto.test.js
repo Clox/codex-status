@@ -7,12 +7,14 @@ const test = require('node:test');
 const {
   committedDesktopAttempts,
   desktopPlan,
+  desktopPreflightFallbackRecord,
   desktopPrecommitFailureAction,
   desktopQueueMayContinue,
   markDesktopSendCommitted,
   markDesktopSendInvoked,
   markDesktopPrefillStarted,
   reconcileDesktopSend,
+  waitForDesktopReadiness,
 } = require('../lib/codex-desktop-auto');
 const { candidateKey, pendingInterruptedTurns } = require('../lib/codex-manual-resume');
 const { INTERRUPTION_CLASS, inputHash } = require('../lib/codex-turn-continuation');
@@ -31,6 +33,58 @@ test('AT-SPI helper protocol can start and close without touching Desktop', () =
   const result = spawnSync(helper, [], { input: '{"command":"close"}\n', encoding: 'utf8' });
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(JSON.parse(result.stdout.trim()), { ok: true });
+});
+
+test('AT-SPI helper binds roots to the verified Desktop PID and diagnoses missing renderer trees', () => {
+  const helper = path.join(__dirname, '..', 'bin', 'codex-desktop-atspi');
+  const source = String.raw`
+import importlib.machinery
+import importlib.util
+
+loader = importlib.machinery.SourceFileLoader('codex_desktop_atspi', ${JSON.stringify(helper)})
+spec = importlib.util.spec_from_loader(loader.name, loader)
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+
+class Node:
+    def __init__(self, pid=None, role='application', name='', children=None):
+        self.pid = pid
+        self.role = role
+        self.name = name
+        self._children = children or []
+        self.childCount = len(self._children)
+    def get_process_id(self): return self.pid
+    def getRoleName(self): return self.role
+    def getChildAtIndex(self, index): return self._children[index]
+
+good = Node(41, 'application', 'Codex', [Node(41, 'frame', 'ChatGPT', [Node(42, 'panel', 'content')])])
+wrong = Node(99, 'application', 'ChatGPT')
+assert module.unique_root(41, [wrong, good]) is good
+
+for pid, apps, expected in [
+    (42, [good], 'DESKTOP_ATSPI_PID_ROOT_COUNT_0'),
+    (41, [good, Node(41, 'application', 'Codex')], 'DESKTOP_ATSPI_PID_ROOT_COUNT_2'),
+]:
+    try:
+        module.unique_root(pid, apps)
+        raise AssertionError('expected failure')
+    except module.CapabilityError as error:
+        assert str(error) == expected
+
+shell_only = Node(41, 'application', 'Codex', [Node(41, 'frame', 'ChatGPT', [Node(None, 'unknown', '')])])
+try:
+    module.require_renderer_tree(shell_only)
+    raise AssertionError('expected renderer failure')
+except module.CapabilityError as error:
+    assert str(error) == 'DESKTOP_ATSPI_RENDERER_TREE_MISSING'
+
+module.require_renderer_tree(good)
+`;
+  const result = spawnSync('python3', ['-c', source], {
+    encoding: 'utf8',
+    env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' },
+  });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
 });
 
 function candidate(overrides = {}) {
@@ -175,6 +229,82 @@ test('safe HEADLESS fallback ends at prefill and capability failure mid-queue fa
   assert.equal(desktopPrecommitFailureAction({ candidateIndex: 0 }), 'fallback-headless');
   assert.equal(desktopPrecommitFailureAction({ candidateIndex: 0, promptInjected: true }), 'fail-closed');
   assert.equal(desktopPrecommitFailureAction({ candidateIndex: 1, anyCommitted: true }), 'fail-closed');
+});
+
+test('semantic Desktop readiness retries read-only snapshots until the view is stable', async () => {
+  let clock = NOW;
+  let attempts = 0;
+  const observations = [];
+  const result = await waitForDesktopReadiness({
+    attempt: async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error('CHAT_ACTIONS_COUNT_0');
+      if (attempts === 2) throw new Error('COMPOSER_COUNT_0');
+      return capability;
+    },
+    onObservation: value => observations.push(value),
+    sleep: async milliseconds => { clock += milliseconds; },
+    now: () => clock,
+    timeoutMs: 2_000,
+    backoffMs: [100],
+  });
+  assert.equal(result.capability, capability);
+  assert.equal(result.diagnostics.status, 'ready');
+  assert.equal(result.diagnostics.attempts, 3);
+  assert.equal(result.diagnostics.lastErrorKind, 'COMPOSER_COUNT_0');
+  assert.deepEqual(observations.map(value => value.status), ['waiting', 'waiting', 'ready']);
+});
+
+test('permanent semantic preflight failure times out with exact credential-free diagnostics', async () => {
+  let clock = NOW;
+  const observations = [];
+  await assert.rejects(waitForDesktopReadiness({
+    attempt: async () => { throw new Error('SEND_CONTROL_COUNT_0'); },
+    onObservation: value => observations.push(value),
+    sleep: async milliseconds => { clock += milliseconds; },
+    now: () => clock,
+    timeoutMs: 250,
+    backoffMs: [100],
+  }), error => {
+    assert.equal(error.message, 'SEND_CONTROL_COUNT_0');
+    assert.equal(error.desktopPreflight.status, 'failed');
+    assert.equal(error.desktopPreflight.lastErrorKind, 'SEND_CONTROL_COUNT_0');
+    assert.equal(error.desktopPreflight.attempts, 4);
+    return true;
+  });
+  assert.equal(observations.at(-1).status, 'failed');
+  assert.equal(desktopPrecommitFailureAction({ candidateIndex: 0 }), 'fallback-headless');
+});
+
+test('safe fallback persists the representative failure and exact plan identity', () => {
+  const error = new Error('CHAT_ACTIONS_COUNT_0');
+  error.desktopPreflight = {
+    phase: 'semantic-readiness', status: 'failed', startedAtMs: NOW - 500,
+    completedAtMs: NOW, attempts: 3, lastErrorKind: 'CHAT_ACTIONS_COUNT_0',
+  };
+  const record = desktopPreflightFallbackRecord({ observedAtMs: NOW - 250 }, error, {
+    threadId: 'thread-a', failedTurnId: 'failed-a', targetAccountId: 'account-b', desktopRootPid: 41,
+  }, NOW + 1);
+  assert.equal(record.status, 'fallback-headless');
+  assert.equal(record.phase, 'semantic-readiness');
+  assert.equal(record.lastErrorKind, 'CHAT_ACTIONS_COUNT_0');
+  assert.equal(record.attempts, 3);
+  assert.equal(record.threadId, 'thread-a');
+  assert.equal(record.failedTurnId, 'failed-a');
+  assert.equal(record.targetAccountId, 'account-b');
+  assert.equal(record.desktopRootPid, 41);
+});
+
+test('unexpected preflight exception text is not persisted as credential-bearing diagnostics', async () => {
+  let clock = NOW;
+  await assert.rejects(waitForDesktopReadiness({
+    attempt: async () => { throw new Error('token=do-not-persist'); },
+    sleep: async milliseconds => { clock += milliseconds; },
+    now: () => clock,
+    timeoutMs: 0,
+    backoffMs: [1],
+  }), error => error.message === 'DESKTOP_PREFLIGHT_FAILED' &&
+    error.desktopPreflight.lastErrorKind === 'DESKTOP_PREFLIGHT_FAILED');
 });
 
 test('plan-specific unconfirmed may continue only while capability remains reliable', () => {

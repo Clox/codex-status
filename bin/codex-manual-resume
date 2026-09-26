@@ -47,6 +47,7 @@ const {
 const {
   DESKTOP_SEND_CONFIRM_TIMEOUT_MS,
   committedDesktopAttempts,
+  desktopPreflightFallbackRecord,
   desktopPlan,
   desktopPrecommitFailureAction,
   desktopQueueMayContinue,
@@ -54,6 +55,7 @@ const {
   markDesktopSendCommitted,
   markDesktopSendInvoked,
   reconcileDesktopSend,
+  waitForDesktopReadiness,
 } = require(path.join(__dirname, '..', 'lib', 'codex-desktop-auto'));
 const {
   AUTO_MODE,
@@ -196,25 +198,30 @@ function desktopRootPids() {
   return processEntries().filter(isDesktopRoot).map(entry => entry.pid);
 }
 
-function launchDesktopOnce(attempt) {
+function launchDesktopOnce(attempt, { forceRendererAccessibility = false } = {}) {
   const spec = desktopRestoreLaunchSpec({
     systemdRunBin,
     desktopLauncher,
     controllerPid: process.pid,
     attempt,
+    desktopArgs: forceRendererAccessibility ? ['--force-renderer-accessibility'] : [],
   });
   const child = spawn(spec.command, spec.args, { detached: true, stdio: 'ignore' });
   child.unref();
   return { pid: child.pid };
 }
 
-async function restoreClients(lease, { removeLease = true, forceDesktop = false } = {}) {
+async function restoreClients(lease, {
+  removeLease = true,
+  forceDesktop = false,
+  forceRendererAccessibility = false,
+} = {}) {
   signalExisting([...(lease.vscodePids || [])].reverse(), 'SIGCONT');
   let desktopRestore = null;
   if (lease.desktopWasRunning || forceDesktop) {
     desktopRestore = await restoreDesktopWithRetry({
       runningPids: desktopRootPids,
-      launch: launchDesktopOnce,
+      launch: attempt => launchDesktopOnce(attempt, { forceRendererAccessibility }),
       sleep,
     });
   }
@@ -1113,8 +1120,15 @@ async function automaticDesktopMain() {
     const switchedPlan = autoDecisionSnapshot();
     if (!sameDecisionPlan(ownedPlan, switchedPlan)) throw new Error('AUTO_PLAN_CHANGED_AFTER_SWITCH');
 
-    const restored = await restoreClients(lease, { forceDesktop: true });
+    const restored = await restoreClients(lease, {
+      forceDesktop: true,
+      forceRendererAccessibility: true,
+    });
     lease = null;
+    const desktopRootPid = Number(restored.desktopRestore?.desktopPid);
+    if (!Number.isInteger(desktopRootPid) || desktopRootPid <= 0) {
+      throw new Error('DESKTOP_ROOT_PID_UNVERIFIED');
+    }
     writeAutoContinueState({
       desktopRestore: restored.desktopRestore ? {
         status: 'ready', completedAtMs: Date.now(), ...restored.desktopRestore,
@@ -1135,16 +1149,48 @@ async function automaticDesktopMain() {
       const plan = desktopPlan(persisted, target);
 
       launchDesktopDeepLink(desktopLink(plan.threadId));
-      await sleep(500);
       const atspi = new DesktopAtspiController();
       try {
         let capability;
         try {
-          capability = desktopCapability(await atspi.request({
-            command: 'preflight', threadId: plan.threadId,
-          }));
+          const readiness = await waitForDesktopReadiness({
+            attempt: async () => desktopCapability(await atspi.request({
+              command: 'preflight', threadId: plan.threadId, desktopPid: desktopRootPid,
+            })),
+            onObservation: desktopPreflight => writeAutoContinueState({
+              status: desktopPreflight.status === 'ready' ? 'desktop-ready' : 'desktop-preflight',
+              errorKind: null,
+              actionRequired: false,
+              candidateThreadId: persisted.threadId,
+              candidateTurnId: persisted.turnId,
+              targetAccountId: target.accountId,
+              desktopPreflight: {
+                ...desktopPreflight,
+                threadId: persisted.threadId,
+                failedTurnId: persisted.turnId,
+                targetAccountId: target.accountId,
+                desktopRootPid,
+              },
+            }),
+          });
+          capability = readiness.capability;
         } catch (error) {
           if (desktopPrecommitFailureAction({ promptInjected, anyCommitted, candidateIndex: index }) === 'fallback-headless') {
+            const previous = readAutoContinueState().desktopPreflight || {};
+            writeAutoContinueState({
+              status: 'desktop-fallback-headless',
+              errorKind: null,
+              actionRequired: false,
+              candidateThreadId: persisted.threadId,
+              candidateTurnId: persisted.turnId,
+              targetAccountId: target.accountId,
+              desktopPreflight: desktopPreflightFallbackRecord(previous, error, {
+                threadId: persisted.threadId,
+                failedTurnId: persisted.turnId,
+                targetAccountId: target.accountId,
+                desktopRootPid,
+              }),
+            });
             safeFallback = true;
             break;
           }
@@ -1158,6 +1204,7 @@ async function automaticDesktopMain() {
         promptInjected = true;
         const verified = await atspi.request({
           command: 'verify-prefill', threadId: plan.threadId, text: plan.prompt,
+          desktopPid: desktopRootPid,
         });
         capability = desktopCapability(verified);
 
@@ -1223,7 +1270,12 @@ async function automaticDesktopMain() {
     throw error;
   } finally {
     if (lease) {
-      try { await restoreClients(lease, { forceDesktop: true }); } catch {}
+      try {
+        await restoreClients(lease, {
+          forceDesktop: true,
+          forceRendererAccessibility: true,
+        });
+      } catch {}
     }
     if (lock) releaseLock(lock);
   }

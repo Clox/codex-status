@@ -260,3 +260,17 @@ test('Desktop restore launch uses a transient user service instead of controller
     '/usr/bin/chatgpt',
   ]);
 });
+
+test('AUTO Desktop restore can force renderer accessibility without changing the default launch', () => {
+  const spec = desktopRestoreLaunchSpec({
+    systemdRunBin: '/usr/bin/systemd-run',
+    desktopLauncher: '/usr/bin/chatgpt',
+    controllerPid: 1234,
+    attempt: 1,
+    desktopArgs: ['--force-renderer-accessibility'],
+  });
+  assert.deepEqual(spec.args.slice(-2), [
+    '/usr/bin/chatgpt',
+    '--force-renderer-accessibility',
+  ]);
+});

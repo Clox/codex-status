@@ -93,21 +93,34 @@ def node_identity(node):
     }
 
 
-def desktop_roots():
-    desktop = pyatspi.Registry.getDesktop(0)
-    result = []
-    for app in children(desktop):
-        name = node_name(app).casefold()
-        if "chatgpt" in name:
-            result.append(app)
-    return result
+def process_id(node):
+    try:
+        return int(node.get_process_id())
+    except Exception:
+        return None
 
 
-def unique_root():
-    roots = desktop_roots()
+def application_roots_for_pid(apps, expected_process_id):
+    return [app for app in apps if process_id(app) == expected_process_id]
+
+
+def unique_root(expected_process_id, apps=None):
+    if not isinstance(expected_process_id, int) or expected_process_id <= 0:
+        raise CapabilityError("DESKTOP_ATSPI_PID_INVALID")
+    if apps is None:
+        desktop = pyatspi.Registry.getDesktop(0)
+        apps = children(desktop)
+    roots = application_roots_for_pid(apps, expected_process_id)
     if len(roots) != 1:
-        raise CapabilityError(f"DESKTOP_ATSPI_ROOT_COUNT_{len(roots)}")
+        raise CapabilityError(f"DESKTOP_ATSPI_PID_ROOT_COUNT_{len(roots)}")
     return roots[0]
+
+
+def require_renderer_tree(root):
+    shell_roles = {"application", "frame", "unknown", "invalid"}
+    descendants = list(walk(root))[1:]
+    if not any(role_name(node).casefold() not in shell_roles for node in descendants):
+        raise CapabilityError("DESKTOP_ATSPI_RENDERER_TREE_MISSING")
 
 
 def action_names(node):
@@ -221,8 +234,9 @@ def send_controls(root, require_enabled):
     return candidates
 
 
-def snapshot(expected_thread_id, expected_text=None, require_enabled=False):
-    root = unique_root()
+def snapshot(expected_thread_id, expected_process_id, expected_text=None, require_enabled=False):
+    root = unique_root(expected_process_id)
+    require_renderer_tree(root)
     verify_thread(root, expected_thread_id)
     editor = composer(root)
     value = text_value(editor)
@@ -251,6 +265,7 @@ def same_identity(left, right):
 
 def main():
     expected_thread_id = None
+    expected_process_id = None
     expected_text = None
     verified_send = None
     send_invoked = False
@@ -260,9 +275,10 @@ def main():
             command = request.get("command")
             if command == "preflight":
                 expected_thread_id = request["threadId"]
-                first = snapshot(expected_thread_id, require_enabled=False)
+                expected_process_id = request["desktopPid"]
+                first = snapshot(expected_thread_id, expected_process_id, require_enabled=False)
                 time.sleep(0.25)
-                second = snapshot(expected_thread_id, require_enabled=False)
+                second = snapshot(expected_thread_id, expected_process_id, require_enabled=False)
                 if not same_identity(first, second):
                     raise CapabilityError("AT_SPI_IDENTITY_UNSTABLE")
                 respond(ok=True, verified=True, **{
@@ -270,10 +286,12 @@ def main():
                 })
             elif command == "verify-prefill":
                 expected_thread_id = request["threadId"]
+                if request["desktopPid"] != expected_process_id:
+                    raise CapabilityError("DESKTOP_ATSPI_PID_CHANGED")
                 expected_text = request["text"]
-                first = snapshot(expected_thread_id, expected_text, require_enabled=True)
+                first = snapshot(expected_thread_id, expected_process_id, expected_text, require_enabled=True)
                 time.sleep(0.25)
-                second = snapshot(expected_thread_id, expected_text, require_enabled=True)
+                second = snapshot(expected_thread_id, expected_process_id, expected_text, require_enabled=True)
                 if not same_identity(first, second):
                     raise CapabilityError("AT_SPI_IDENTITY_UNSTABLE")
                 verified_send = second["send"]
