@@ -190,6 +190,20 @@ test('an active or unclassifiable VS Code Codex client is a blocker without a pr
   assert.equal(automaticClientBlocker(entries).errorKind, 'VSCODE_EXTENSION_HOST_UNVERIFIED');
 });
 
+test('post-restore Desktop navigation failure is visible without changing continuation state', () => {
+  assert.equal(autoContinueProblemLine({
+    status: 'completed',
+    actionRequired: false,
+    errorKind: null,
+    desktopNavigation: {
+      status: 'failed',
+      threadId: 'thread-a',
+      errorKind: 'DESKTOP_DEEPLINK_LAUNCH_FAILED',
+    },
+  }, true),
+  'AUTO-CONTINUE / ACTION REQUIRED: continuation completed, but Desktop navigation failed (DESKTOP_DEEPLINK_LAUNCH_FAILED).');
+});
+
 test('already committed candidates are excluded after crash/restart and can never be sent twice', () => {
   const state = eventState();
   const candidate = state.interruptedTurns.first;

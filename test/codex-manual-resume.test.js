@@ -13,6 +13,8 @@ const {
   pendingInterruptedTurns,
   resumeProtocolRequests,
   desktopRestoreLaunchSpec,
+  desktopThreadLink,
+  headlessPostRestoreNavigationPlan,
   restoreDesktopWithRetry,
   splitJsonLines,
   validateThreadMetadataForResume,
@@ -273,4 +275,37 @@ test('AUTO Desktop restore can force renderer accessibility without changing the
     '/usr/bin/chatgpt',
     '--force-renderer-accessibility',
   ]);
+});
+
+test('HEADLESS post-restore navigation targets only the last terminal continuation without a prompt', () => {
+  const plan = headlessPostRestoreNavigationPlan({
+    desktopRestore: { launched: true, desktopPid: 4321, attempts: 1 },
+    lastTerminalThreadId: 'thread-second/value',
+  });
+  assert.deepEqual(plan, {
+    threadId: 'thread-second/value',
+    url: 'codex://threads/thread-second%2Fvalue',
+    desktopPid: 4321,
+  });
+  assert.equal(new URL(plan.url).search, '');
+  assert.equal(desktopThreadLink('thread-final'), 'codex://threads/thread-final');
+});
+
+test('HEADLESS post-restore navigation is skipped unless Desktop was restored and a turn became terminal', () => {
+  assert.equal(headlessPostRestoreNavigationPlan({
+    desktopRestore: null,
+    lastTerminalThreadId: 'thread-a',
+  }), null);
+  assert.equal(headlessPostRestoreNavigationPlan({
+    desktopRestore: { desktopPid: 123 },
+    lastTerminalThreadId: 'thread-a',
+  }), null);
+  assert.equal(headlessPostRestoreNavigationPlan({
+    desktopRestore: { launched: true, desktopPid: 123 },
+    lastTerminalThreadId: null,
+  }), null);
+  assert.equal(headlessPostRestoreNavigationPlan({
+    desktopRestore: { launched: true, desktopPid: null },
+    lastTerminalThreadId: 'thread-a',
+  }), null);
 });

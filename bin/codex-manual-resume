@@ -24,6 +24,8 @@ const {
   pendingInterruptedTurns,
   resumeProtocolRequests,
   desktopRestoreLaunchSpec,
+  desktopThreadLink,
+  headlessPostRestoreNavigationPlan,
   restoreDesktopWithRetry,
   splitJsonLines,
   validateThreadMetadataForResume,
@@ -784,6 +786,7 @@ async function automaticHeadlessMain() {
   let lease = null;
   let currentCandidate = null;
   let committed = false;
+  let lastTerminalThreadId = null;
   try {
     lock = acquireLock();
     const lockedPlan = autoDecisionSnapshot();
@@ -844,6 +847,7 @@ async function automaticHeadlessMain() {
       candidateTurnId: lockedPlan.candidates[0]?.turnId || null,
       targetAccountId: lockedPlan.target.accountId,
       pending: null,
+      desktopNavigation: null,
     });
 
     lease = await acquireExclusiveClients({ autoMode: true });
@@ -897,6 +901,7 @@ async function automaticHeadlessMain() {
       let journal = normalizeResumeState(readJson(resumeStatePath, emptyResumeState()));
       journal = markResumeTerminal(journal, persisted, result);
       atomicWriteJson(resumeStatePath, journal);
+      lastTerminalThreadId = persisted.threadId;
       await waitForObserverIdleAfterTurn();
       if (result.status !== 'completed') throw new Error('AUTO_RESUME_TERMINAL_FAILED');
     }
@@ -936,6 +941,10 @@ async function automaticHeadlessMain() {
     if (lease) {
       try {
         const restored = await restoreClients(lease);
+        const navigation = headlessPostRestoreNavigationPlan({
+          desktopRestore: restored.desktopRestore,
+          lastTerminalThreadId,
+        });
         writeAutoContinueState({
           desktopRestore: restored.desktopRestore ? {
             status: 'ready',
@@ -943,6 +952,32 @@ async function automaticHeadlessMain() {
             ...restored.desktopRestore,
           } : null,
         });
+        if (navigation) {
+          try {
+            const launcherPid = await launchDesktopDeepLinkObserved(navigation.url);
+            writeAutoContinueState({
+              desktopNavigation: {
+                status: 'requested',
+                requestedAtMs: Date.now(),
+                threadId: navigation.threadId,
+                desktopPid: navigation.desktopPid,
+                launcherPid,
+                errorKind: null,
+              },
+            });
+          } catch (error) {
+            writeAutoContinueState({
+              desktopNavigation: {
+                status: 'failed',
+                failedAtMs: Date.now(),
+                threadId: navigation.threadId,
+                desktopPid: navigation.desktopPid,
+                errorKind: error?.message || 'DESKTOP_DEEPLINK_FAILED',
+                diagnostics: error?.diagnostics || null,
+              },
+            });
+          }
+        }
       } catch (error) {
         writeAutoContinueState({
           status: 'blocked',
@@ -973,8 +1008,21 @@ function launchDesktopDeepLink(url) {
   return child.pid;
 }
 
+function launchDesktopDeepLinkObserved(url) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(desktopBinary, [url], { detached: true, stdio: 'ignore' });
+    child.once('error', error => reject(Object.assign(new Error('DESKTOP_DEEPLINK_LAUNCH_FAILED'), {
+      diagnostics: { code: error?.code || null },
+    })));
+    child.once('spawn', () => {
+      child.unref();
+      resolve(child.pid);
+    });
+  });
+}
+
 function desktopLink(threadId, prompt = null) {
-  const url = new URL(`codex://threads/${encodeURIComponent(threadId)}`);
+  const url = new URL(desktopThreadLink(threadId));
   if (prompt !== null) url.searchParams.set('prompt', prompt);
   return url.toString();
 }
