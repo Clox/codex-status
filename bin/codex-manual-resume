@@ -22,6 +22,7 @@ const {
   markResumeTerminal,
   normalizeResumeState,
   pendingInterruptedTurns,
+  pollAppServerExclusivity,
   resumeProtocolRequests,
   desktopRestoreLaunchSpec,
   desktopDeepLinkLaunchSpec,
@@ -39,9 +40,11 @@ const { verifyActiveAccountState } = require(path.join(__dirname, '..', 'lib', '
 const {
   AUTO_CONTINUE_STATE_VERSION,
   automationDecision,
+  beginExclusivityAttempt,
   createOrResumePending,
   clearExclusivityBlock,
   emptyAutoContinueState,
+  hasMatchingExclusivityBlock,
   isAutoPlanSuppressed,
   normalizeAutoContinueState,
   pendingCountdownDecision,
@@ -109,9 +112,12 @@ function processEntries() {
     try {
       const args = fs.readFileSync(`/proc/${pid}/cmdline`).toString().split('\0').filter(Boolean);
       const status = fs.readFileSync(`/proc/${pid}/status`, 'utf8');
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+      const statFields = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/);
       const ppid = Number(status.match(/^PPid:\s+(\d+)/m)?.[1]);
       const state = status.match(/^State:\s+(\S)/m)?.[1] || '?';
-      entries.push({ pid, ppid, state, args });
+      const startTicks = Number(statFields[19]);
+      entries.push({ pid, ppid, state, args, startTicks: Number.isFinite(startTicks) ? startTicks : null });
     } catch {}
   }
   return entries;
@@ -181,25 +187,21 @@ function blockerSummary(blockers) {
   ).join('; ');
 }
 
-async function waitForAppServerExclusivity(desktopPids, timeoutMs = 5_000) {
-  const deadline = Date.now() + timeoutMs;
-  let report = appServerExclusivityReport(processEntries(), {
-    desktopPids,
-    ignoredPids: [process.pid],
-  });
-  while (!report.exclusive && Date.now() < deadline) {
-    await sleep(100);
-    report = appServerExclusivityReport(processEntries(), {
+async function waitForAppServerExclusivity(desktopPids, timeoutMs = 15_000) {
+  const result = await pollAppServerExclusivity({
+    readReport: () => appServerExclusivityReport(processEntries(), {
       desktopPids,
       ignoredPids: [process.pid],
-    });
-  }
-  if (report.exclusive) return;
+    }),
+    sleep,
+    timeoutMs,
+  });
+  if (result.outcome === 'exclusive') return;
   const error = new Error('APP_SERVER_EXCLUSIVITY_FAILED');
   error.diagnostics = {
     phase: 'acquire-app-server-exclusivity',
     failureReason: 'APP_SERVER_EXCLUSIVITY_FAILED',
-    blockers: report.blockers,
+    blockers: result.report.blockers,
   };
   throw error;
 }
@@ -819,7 +821,13 @@ async function automaticHeadlessMain() {
       throw blockerError;
     }
     const desktopRunning = processSnapshot.some(isDesktopRoot);
-    if (requiresPendingCountdown(lockedPlan, desktopRunning)) {
+    const exclusivityContext = {
+      threadId: lockedPlan.candidates[0]?.threadId || null,
+      failedTurnId: lockedPlan.candidates[0]?.turnId || null,
+      targetAccountId: lockedPlan.target.accountId,
+    };
+    const retryingExclusivity = hasMatchingExclusivityBlock(readAutoContinueState(), exclusivityContext);
+    if (!retryingExclusivity && requiresPendingCountdown(lockedPlan, desktopRunning)) {
       const prepared = createOrResumePending(readAutoContinueState(), lockedPlan);
       writeAutoContinueState(prepared.state);
       if (prepared.notificationClaimed) sendPendingNotification(prepared.state.pending);
@@ -846,7 +854,7 @@ async function automaticHeadlessMain() {
         return;
       }
     }
-    writeAutoContinueState({
+    writeAutoContinueState(beginExclusivityAttempt(readAutoContinueState(), exclusivityContext, {
       status: 'running',
       lastAttemptAtMs: Date.now(),
       errorKind: null,
@@ -856,7 +864,7 @@ async function automaticHeadlessMain() {
       targetAccountId: lockedPlan.target.accountId,
       pending: null,
       desktopNavigation: null,
-    });
+    }));
 
     lease = await acquireExclusiveClients({ autoMode: true });
     writeAutoContinueState(clearExclusivityBlock(readAutoContinueState()));
@@ -1182,7 +1190,13 @@ async function automaticDesktopMain() {
     const autoBlocker = automaticClientBlocker(processSnapshot);
     if (autoBlocker) throw Object.assign(new Error(autoBlocker.errorKind), { diagnostics: autoBlocker });
     const desktopRunning = processSnapshot.some(isDesktopRoot);
-    if (requiresPendingCountdown(lockedPlan, desktopRunning)) {
+    const exclusivityContext = {
+      threadId: lockedPlan.candidates[0]?.threadId || null,
+      failedTurnId: lockedPlan.candidates[0]?.turnId || null,
+      targetAccountId: lockedPlan.target.accountId,
+    };
+    const retryingExclusivity = hasMatchingExclusivityBlock(readAutoContinueState(), exclusivityContext);
+    if (!retryingExclusivity && requiresPendingCountdown(lockedPlan, desktopRunning)) {
       const prepared = createOrResumePending(readAutoContinueState(), lockedPlan);
       writeAutoContinueState(prepared.state);
       if (prepared.notificationClaimed) sendPendingNotification(prepared.state.pending);
@@ -1192,12 +1206,12 @@ async function automaticDesktopMain() {
       if (outcome !== 'execute') return 'done';
       if (!sameDecisionPlan(lockedPlan, autoDecisionSnapshot())) return 'done';
     }
-    writeAutoContinueState({
+    writeAutoContinueState(beginExclusivityAttempt(readAutoContinueState(), exclusivityContext, {
       status: 'desktop-preparing', lastAttemptAtMs: Date.now(), errorKind: null,
       actionRequired: false, candidateThreadId: lockedPlan.candidates[0]?.threadId || null,
       candidateTurnId: lockedPlan.candidates[0]?.turnId || null,
       targetAccountId: lockedPlan.target.accountId, pending: null,
-    });
+    }));
 
     lease = await acquireExclusiveClients({ autoMode: true });
     writeAutoContinueState(clearExclusivityBlock(readAutoContinueState()));

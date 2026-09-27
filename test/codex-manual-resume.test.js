@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 const {
   appServerExclusivityReport,
+  appServerDrainDecision,
   candidateKey,
   currentResumeProblemLines,
   emptyResumeState,
@@ -11,6 +12,7 @@ const {
   markResumeFailure,
   markResumeTerminal,
   pendingInterruptedTurns,
+  pollAppServerExclusivity,
   resumeProtocolRequests,
   desktopDeepLinkLaunchSpec,
   desktopRestoreLaunchSpec,
@@ -158,6 +160,60 @@ test('exclusivity allows only quiescent VS Code App Servers and reports concrete
   assert.equal(appServerExclusivityReport([
     { pid: 10, ppid: 1, state: 'T', args: [vscodeExecutable, 'app-server'] },
   ]).exclusive, true);
+});
+
+test('Desktop App Server drain waits boundedly and succeeds immediately when exclusive', () => {
+  const desktopBlock = {
+    exclusive: false,
+    blockers: [{ pid: 20, ppid: 2, state: 'S', role: 'desktop-app-server' }],
+  };
+  assert.equal(appServerDrainDecision(desktopBlock, 5_001, 15_000), 'wait');
+  assert.equal(appServerDrainDecision(desktopBlock, 14_999, 15_000), 'wait');
+  assert.equal(appServerDrainDecision(desktopBlock, 15_000, 15_000), 'fail');
+  assert.equal(appServerDrainDecision({ exclusive: true, blockers: [] }, 5_100, 15_000), 'exclusive');
+});
+
+test('slow normal Desktop App Server drain self-heals without a fixed remaining wait', async () => {
+  let nowMs = 0;
+  let reads = 0;
+  const desktopBlock = {
+    exclusive: false,
+    blockers: [{ pid: 20, ppid: 2, state: 'S', role: 'desktop-app-server' }],
+  };
+  const reports = [desktopBlock, desktopBlock, { exclusive: true, blockers: [] }];
+  const result = await pollAppServerExclusivity({
+    readReport: () => reports[Math.min(reads++, reports.length - 1)],
+    sleep: async delay => { nowMs += delay; },
+    now: () => nowMs,
+    timeoutMs: 15_000,
+    pollMs: 100,
+  });
+  assert.equal(result.outcome, 'exclusive');
+  assert.equal(result.elapsedMs, 200);
+  assert.equal(reads, 3);
+});
+
+test('strict blocker fails immediately without polling', async () => {
+  let sleeps = 0;
+  const result = await pollAppServerExclusivity({
+    readReport: () => ({
+      exclusive: false,
+      blockers: [{ pid: 30, ppid: 3, state: 'S', role: 'other-app-server' }],
+    }),
+    sleep: async () => { sleeps += 1; },
+    now: () => 0,
+  });
+  assert.equal(result.outcome, 'fail');
+  assert.equal(sleeps, 0);
+});
+
+test('foreign, VS Code and ambiguous App Servers fail strict without a drain wait', () => {
+  for (const role of ['other-app-server', 'vscode-app-server-not-quiescent', 'unknown-app-server']) {
+    assert.equal(appServerDrainDecision({
+      exclusive: false,
+      blockers: [{ pid: 30, ppid: 3, state: 'S', role }],
+    }, 0, 15_000), 'fail');
+  }
 });
 
 test('pre-commit exclusivity diagnostics do not consume or hide the retry-safe candidate', () => {

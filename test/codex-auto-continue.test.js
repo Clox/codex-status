@@ -10,8 +10,10 @@ const {
   autoContinueProblemLine,
   autoPlanFingerprint,
   automationDecision,
+  beginExclusivityAttempt,
   cancelPendingAction,
   createOrResumePending,
+  hasMatchingExclusivityBlock,
   isAutoPlanSuppressed,
   normalizeAutoContinueState,
   pendingAttentionDecision,
@@ -217,19 +219,22 @@ test('temporary pre-commit exclusivity blocking waits and self-heals without act
   }, NOW);
   assert.equal(first.status, 'waiting');
   assert.equal(first.actionRequired, false);
-  assert.equal(first.exclusivityBlock.consecutiveFailures, 1);
+  assert.equal(first.exclusivityBlock.attempts, 1);
   assert.deepEqual(first.exclusivityBlock.blockers, [
     { pid: 20, ppid: 2, state: 'S', role: 'desktop-app-server' },
   ]);
   assert.equal(autoContinueStatusLine({ autoMode: 'HEADLESS' }, first, NOW),
     'AUTO: HEADLESS · WAIT/BLOCKED');
-  assert.equal(clearExclusivityBlock(first).exclusivityBlock, null);
+  const recovered = clearExclusivityBlock(first, NOW + 2_000);
+  assert.equal(recovered.exclusivityBlock, null);
+  assert.equal(recovered.exclusivityHistory.length, 1);
+  assert.equal(recovered.exclusivityHistory[0].resolvedAtMs, NOW + 2_000);
 });
 
-test('persistent exclusivity blocking escalates only after bounded repeated failures', () => {
+test('stable exclusivity blocker escalates by actual duration, not retry count', () => {
   const diagnostics = { blockers: [{ pid: 20, ppid: 2, state: 'S', role: 'desktop-app-server' }] };
   let state = {};
-  for (let attempt = 0; attempt < 9; attempt += 1) {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
     state = recordExclusivityBlock(state, diagnostics, {
       threadId: 'thread-first', failedTurnId: 'turn-first', targetAccountId: 'account-b',
     }, NOW + attempt * 1_000);
@@ -237,15 +242,59 @@ test('persistent exclusivity blocking escalates only after bounded repeated fail
   }
   state = recordExclusivityBlock(state, diagnostics, {
     threadId: 'thread-first', failedTurnId: 'turn-first', targetAccountId: 'account-b',
-  }, NOW + 9_000);
+  }, NOW + 5 * 60_000);
   assert.equal(state.status, 'blocked');
   assert.equal(state.actionRequired, true);
-  assert.equal(state.exclusivityBlock.consecutiveFailures, 10);
+  assert.equal(state.exclusivityBlock.attempts, 21);
 
   const manual = recordExclusivityBlock({}, {
     blockers: [{ pid: 30, ppid: 3, state: 'S', role: 'other-app-server' }],
   }, { threadId: 'thread-first' }, NOW);
   assert.equal(manual.actionRequired, true);
+});
+
+test('restored Desktop blockers with new process identities do not inherit stuck evidence', () => {
+  const context = { threadId: 'thread-first', failedTurnId: 'turn-first', targetAccountId: 'account-b' };
+  let state = {};
+  for (let pid = 20; pid < 32; pid += 1) {
+    state = recordExclusivityBlock(state, {
+      blockers: [{ pid, ppid: 2, state: 'S', role: 'desktop-app-server' }],
+    }, context, NOW + (pid - 20) * 30_000);
+    assert.equal(state.actionRequired, false);
+    assert.equal(state.exclusivityBlock.attempts, 1);
+  }
+  assert.equal(state.exclusivityHistory.length, 11);
+  assert.equal(new Set(state.exclusivityHistory.map(entry => entry.fingerprint)).size, 11);
+});
+
+test('PID reuse with a new process start identity begins a new blocker observation', () => {
+  const context = { threadId: 'thread-first', failedTurnId: 'turn-first', targetAccountId: 'account-b' };
+  const first = recordExclusivityBlock({}, {
+    blockers: [{ pid: 20, ppid: 2, startTicks: 100, state: 'S', role: 'desktop-app-server' }],
+  }, context, NOW);
+  const reused = recordExclusivityBlock(first, {
+    blockers: [{ pid: 20, ppid: 2, startTicks: 200, state: 'S', role: 'desktop-app-server' }],
+  }, context, NOW + 5 * 60_000);
+  assert.equal(reused.actionRequired, false);
+  assert.equal(reused.exclusivityBlock.attempts, 1);
+  assert.equal(reused.exclusivityHistory.length, 1);
+});
+
+test('new exclusivity attempt retains WAIT problem until ownership is actually acquired', () => {
+  const context = { threadId: 'thread-first', failedTurnId: 'turn-first', targetAccountId: 'account-b' };
+  const blocked = recordExclusivityBlock({}, {
+    blockers: [{ pid: 20, ppid: 2, state: 'S', role: 'desktop-app-server' }],
+  }, context, NOW);
+  const retrying = beginExclusivityAttempt(blocked, context, {
+    status: 'running', errorKind: null, actionRequired: false, lastAttemptAtMs: NOW + 30_000,
+  });
+  assert.equal(retrying.status, 'waiting');
+  assert.equal(retrying.errorKind, 'APP_SERVER_EXCLUSIVITY_FAILED');
+  assert.equal(retrying.actionRequired, false);
+  assert.equal(autoContinueStatusLine({ autoMode: 'HEADLESS' }, retrying, NOW + 30_000),
+    'AUTO: HEADLESS · WAIT/BLOCKED');
+  assert.equal(hasMatchingExclusivityBlock(retrying, context), true);
+  assert.equal(hasMatchingExclusivityBlock(retrying, { ...context, targetAccountId: 'account-c' }), false);
 });
 
 test('already committed candidates are excluded after crash/restart and can never be sent twice', () => {
