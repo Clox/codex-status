@@ -6,3 +6,7 @@ registry.json
 *.sqlite
 *.sqlite-*
 rollout-*.jsonl
+
+# Python bytecode generated while loading helper scripts in tests.
+__pycache__/
+*.py[cod]
