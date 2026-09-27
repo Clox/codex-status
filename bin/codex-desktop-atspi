@@ -255,6 +255,20 @@ def snapshot(expected_thread_id, expected_process_id, expected_text=None, requir
     }
 
 
+def route_ready_snapshot(expected_process_id):
+    root = unique_root(expected_process_id)
+    require_renderer_tree(root)
+    editor = composer(root)
+    sends = send_controls(root, False)
+    if len(sends) != 1:
+        raise CapabilityError(f"SEND_CONTROL_COUNT_{len(sends)}")
+    return {
+        "desktopIdentity": node_identity(root),
+        "rendererIdentity": node_identity(editor),
+        "atspiIdentity": node_identity(sends[0]),
+    }
+
+
 def same_identity(left, right):
     return (
         left["desktopIdentity"] == right["desktopIdentity"]
@@ -273,7 +287,15 @@ def main():
         try:
             request = json.loads(raw)
             command = request.get("command")
-            if command == "preflight":
+            if command == "route-ready":
+                expected_process_id = request["desktopPid"]
+                first = route_ready_snapshot(expected_process_id)
+                time.sleep(0.25)
+                second = route_ready_snapshot(expected_process_id)
+                if not same_identity(first, second):
+                    raise CapabilityError("AT_SPI_IDENTITY_UNSTABLE")
+                respond(ok=True, verified=True, **second)
+            elif command == "preflight":
                 expected_thread_id = request["threadId"]
                 expected_process_id = request["desktopPid"]
                 first = snapshot(expected_thread_id, expected_process_id, require_enabled=False)

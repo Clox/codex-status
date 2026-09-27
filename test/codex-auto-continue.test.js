@@ -16,6 +16,8 @@ const {
   normalizeAutoContinueState,
   pendingAttentionDecision,
   pendingCountdownDecision,
+  recordExclusivityBlock,
+  clearExclusivityBlock,
   reconcileSuppression,
   requiresPendingCountdown,
   resetAutoContinueForToggle,
@@ -202,6 +204,48 @@ test('post-restore Desktop navigation failure is visible without changing contin
     },
   }, true),
   'AUTO-CONTINUE / ACTION REQUIRED: continuation completed, but Desktop navigation failed (DESKTOP_DEEPLINK_LAUNCH_FAILED).');
+});
+
+test('temporary pre-commit exclusivity blocking waits and self-heals without action required', () => {
+  const diagnostics = {
+    phase: 'acquire-app-server-exclusivity',
+    failureReason: 'APP_SERVER_EXCLUSIVITY_FAILED',
+    blockers: [{ pid: 20, ppid: 2, state: 'S', role: 'desktop-app-server', secret: 'omit' }],
+  };
+  const first = recordExclusivityBlock({}, diagnostics, {
+    threadId: 'thread-first', failedTurnId: 'turn-first', targetAccountId: 'account-b',
+  }, NOW);
+  assert.equal(first.status, 'waiting');
+  assert.equal(first.actionRequired, false);
+  assert.equal(first.exclusivityBlock.consecutiveFailures, 1);
+  assert.deepEqual(first.exclusivityBlock.blockers, [
+    { pid: 20, ppid: 2, state: 'S', role: 'desktop-app-server' },
+  ]);
+  assert.equal(autoContinueStatusLine({ autoMode: 'HEADLESS' }, first, NOW),
+    'AUTO: HEADLESS · WAIT/BLOCKED');
+  assert.equal(clearExclusivityBlock(first).exclusivityBlock, null);
+});
+
+test('persistent exclusivity blocking escalates only after bounded repeated failures', () => {
+  const diagnostics = { blockers: [{ pid: 20, ppid: 2, state: 'S', role: 'desktop-app-server' }] };
+  let state = {};
+  for (let attempt = 0; attempt < 9; attempt += 1) {
+    state = recordExclusivityBlock(state, diagnostics, {
+      threadId: 'thread-first', failedTurnId: 'turn-first', targetAccountId: 'account-b',
+    }, NOW + attempt * 1_000);
+    assert.equal(state.actionRequired, false);
+  }
+  state = recordExclusivityBlock(state, diagnostics, {
+    threadId: 'thread-first', failedTurnId: 'turn-first', targetAccountId: 'account-b',
+  }, NOW + 9_000);
+  assert.equal(state.status, 'blocked');
+  assert.equal(state.actionRequired, true);
+  assert.equal(state.exclusivityBlock.consecutiveFailures, 10);
+
+  const manual = recordExclusivityBlock({}, {
+    blockers: [{ pid: 30, ppid: 3, state: 'S', role: 'other-app-server' }],
+  }, { threadId: 'thread-first' }, NOW);
+  assert.equal(manual.actionRequired, true);
 });
 
 test('already committed candidates are excluded after crash/restart and can never be sent twice', () => {

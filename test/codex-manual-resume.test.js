@@ -12,9 +12,11 @@ const {
   markResumeTerminal,
   pendingInterruptedTurns,
   resumeProtocolRequests,
+  desktopDeepLinkLaunchSpec,
   desktopRestoreLaunchSpec,
   desktopThreadLink,
   headlessPostRestoreNavigationPlan,
+  runHeadlessPostRestoreNavigation,
   restoreDesktopWithRetry,
   splitJsonLines,
   validateThreadMetadataForResume,
@@ -308,4 +310,64 @@ test('HEADLESS post-restore navigation is skipped unless Desktop was restored an
     desktopRestore: { launched: true, desktopPid: null },
     lastTerminalThreadId: 'thread-a',
   }), null);
+});
+
+test('HEADLESS deeplink handoff uses an independent waited transient service', () => {
+  const spec = desktopDeepLinkLaunchSpec({
+    systemdRunBin: '/usr/bin/systemd-run',
+    desktopBinary: '/usr/lib/chatgpt/ChatGPT',
+    controllerPid: 1234,
+    sequence: 7,
+    url: 'codex://threads/thread-a',
+  });
+  assert.deepEqual(spec, {
+    command: '/usr/bin/systemd-run',
+    args: [
+      '--user', '--quiet', '--collect', '--wait',
+      '--unit=codex-desktop-navigation-1234-7',
+      '--', '/usr/lib/chatgpt/ChatGPT', 'codex://threads/thread-a',
+    ],
+  });
+});
+
+test('HEADLESS navigation waits for renderer route readiness and confirms the exact thread', async () => {
+  const events = [];
+  let ready = false;
+  const result = await runHeadlessPostRestoreNavigation({
+    plan: { threadId: 'thread-final', desktopPid: 4321, url: 'codex://threads/thread-final' },
+    waitForRouteReady: async () => { ready = true; return { attempts: 3, status: 'ready' }; },
+    dispatch: async url => {
+      assert.equal(ready, true);
+      assert.equal(url, 'codex://threads/thread-final');
+      return { pid: 55, unit: 'navigation-unit' };
+    },
+    confirm: async () => ({ attempts: 2, threadId: 'thread-final' }),
+    onState: state => events.push(state),
+    now: (() => { let value = 100; return () => value++; })(),
+  });
+  assert.equal(result.status, 'confirmed');
+  assert.deepEqual(events.map(event => event.status), [
+    'waiting-readiness', 'dispatched', 'confirmed',
+  ]);
+  assert.equal(events[1].launcherPid, 55);
+  assert.equal(result.threadId, 'thread-final');
+});
+
+test('HEADLESS navigation timeout is UX-only and leaves completed continuation state untouched', async () => {
+  const continuation = { status: 'COMPLETED', committedAtMs: 10, continuationTurnId: 'turn-next' };
+  const events = [];
+  const result = await runHeadlessPostRestoreNavigation({
+    plan: { threadId: 'thread-final', desktopPid: 4321, url: 'codex://threads/thread-final' },
+    waitForRouteReady: async () => { throw new Error('DESKTOP_ROUTE_READINESS_TIMEOUT'); },
+    dispatch: async () => { throw new Error('must-not-dispatch'); },
+    confirm: async () => { throw new Error('must-not-confirm'); },
+    onState: state => events.push(state),
+    now: () => 200,
+  });
+  assert.equal(result.status, 'failed');
+  assert.equal(result.errorKind, 'DESKTOP_ROUTE_READINESS_TIMEOUT');
+  assert.equal(events.at(-1).status, 'failed');
+  assert.deepEqual(continuation, {
+    status: 'COMPLETED', committedAtMs: 10, continuationTurnId: 'turn-next',
+  });
 });
