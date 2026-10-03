@@ -95,7 +95,9 @@ The scripts here terminate Codex Desktop politely and wait up to 15 seconds. The
 
 Open **Codex - Konto 1**, **Codex - Konto 2**, or **Codex - Konto 3** from the application menu. If Desktop is running, the launcher sends it `TERM`, waits for a clean exit, switches with `codex-auth`, and starts Desktop again. Closing an Electron window with its X may leave the process alive; Ctrl+Q normally exits the whole app, but the launcher handles the running process itself.
 
-Open **Codex-kontostatus** for the compact status window. It renders immediately from its last credential-free local frame cache (or an explicit loading state on the first run), then collects the local `codex-auth list --skip-api` view asynchronously. A cheap 200 ms UI tick animates a pending switch without triggering extra account, usage, reset, or server requests; the local account snapshot is collected about every two seconds, while usage/reset background refresh launch remains throttled to the existing ten-second cadence and server usage retains its one-minute cache policy. Accounts are automatically ranked by weekly urgency, with 5H availability breaking near-ties. The active account is identified by `*` and a bold row without an active-specific color; quota and status foreground colors retain their own meaning. The centered `ACCOUNT` heading uses all width left after the fixed metadata columns. The fixed five-cell `STATU` column shows fresh VERIFIED usable accounts as green left-aligned `OK`, verified account-level exhaustion as red `EXHAU`, and no success marker for stale or unverified state; a selected switch target cycles through yellow `WAIT/`, `WAIT-`, `WAIT\`, and `WAIT|` at five frames per second until the postcondition verifies the new active account. Pressing `1`, `2`, or `3` selects the account at that current rank. Selecting the already-active account opens ChatGPT or asks its existing single-instance process to show the app. The cursor, menu bar, and unnecessary scrollbar are hidden.
+Open **Codex-kontostatus** for the compact status window. It renders immediately from its last credential-free local frame cache (or an explicit loading state on the first run), then collects the local `codex-auth list --skip-api` view asynchronously. A cheap 200 ms UI tick animates a pending switch without triggering extra account, usage, reset, or server requests; the local account snapshot is collected about every two seconds, while usage/reset background refresh launch remains throttled to the existing ten-second cadence and server usage retains its one-minute cache policy. Accounts are automatically ranked by weekly urgency, with 5H availability breaking near-ties. The active account is identified by `*` and a bold row without an active-specific color; quota and status foreground colors retain their own meaning. The centered `ACCOUNT` heading uses all width left after the fixed metadata columns. The fixed five-cell `STATU` column shows fresh VERIFIED usable accounts as green left-aligned `OK`, verified account-level exhaustion as red `EXHAU`, and no success marker for stale or unverified state; a selected switch target cycles through yellow `WAIT/`, `WAIT-`, `WAIT\`, and `WAIT|` at five frames per second until the postcondition verifies the new active account. Pressing `1`–`9` selects the account at that current rank. Press `K` to open account management: `L` adds an account through a fresh isolated browser login, `T` removes a saved inactive account after confirmation, and `B` selects any account, including ranks above nine. The active account cannot be removed; switch first. New accounts appear automatically and participate in ranking and the existing opt-in automation without editing `accounts.conf`. The three desktop launchers retain their configured selectors; a removed launcher target fails closed. Selecting the already-active account opens ChatGPT or asks its existing single-instance process to show the app. The cursor, menu bar, and unnecessary scrollbar are hidden.
+
+Account management keeps the active global authentication unchanged. Fresh credentials are staged in a private temporary directory and imported through `codex-auth`; duplicate identities are rejected instead of overwriting saved credentials. Removal uses the upstream command and retains conversation history. Management, local list collection, account switching, and AUTO share the exclusive operation lock; removal also takes the selected account’s activation lock. Status shortcuts carry stable account keys, which are revalidated and translated to a unique upstream selector immediately before switching. Ambiguous display names have no shortcut target. Adding or removing an account does not restart Desktop; the menu’s switch action uses the ordinary restart workflow.
 
 The status window and ChatGPT have independent lifetimes. Account switches and ChatGPT launches started from the status window run in a detached session, so closing the terminal does not terminate Desktop. Opening the status window by itself does not open ChatGPT.
 
@@ -201,6 +203,7 @@ Conversation visibility comes from the shared local state, not from copying auth
 - `$HOME/.local/bin/codex-auto-continue`
 - `$HOME/.local/bin/codex-continuation-drafts`
 - `$HOME/.local/bin/codex-desktop-atspi`
+- `$HOME/.local/bin/codex-account-manager`
 - `$HOME/.local/bin/codex-auth-repair`
 - `$HOME/.local/bin/codex-usage-launch`
 - `$HOME/.local/bin/codex-usage-watch`
@@ -221,6 +224,7 @@ Conversation visibility comes from the shared local state, not from copying auth
 - `$HOME/.local/lib/codex-auto-continue.js`
 - `$HOME/.local/lib/codex-continuation-drafts.js`
 - `$HOME/.local/lib/codex-desktop-auto.js`
+- `$HOME/.local/lib/codex-account-manager.js`
 - `$HOME/.local/lib/codex-auth-repair.js`
 - `$HOME/.local/lib/codex-reset-credits.js`
 - `$HOME/.local/lib/codex-status-render.js`
@@ -257,3 +261,5 @@ Conversation visibility comes from the shared local state, not from copying auth
 - user unit `codex-turn-observer.service`
 
 Backups created by the installer are local-only under `$HOME/.local/state/codex-auth-setup-backups/`.
+
+Account-management regression checks: `node --test tools/workstation/codex-auth/test/codex-account-manager.test.js` and `python3 tools/workstation/codex-auth/test/codex-account-manager.integration.py`. The integration check uses the installed `codex-auth` with synthetic credentials, a fake login executable, and temporary homes; it never signs in to a real account.
