@@ -10,6 +10,9 @@ const { once } = require('node:events');
 const { spawn, spawnSync } = require('node:child_process');
 const {
   appServerExclusivityReport,
+  captureDesktopLineage,
+  isDesktopRootProcess,
+  isDesktopRestoreError,
   atomicWriteJson,
   automaticClientBlocker,
   candidateKey,
@@ -35,6 +38,8 @@ const {
   validateThreadForResume,
 } = require(path.join(__dirname, '..', 'lib', 'codex-manual-resume'));
 const { continuationForCandidate } = require(path.join(__dirname, '..', 'lib', 'codex-turn-continuation'));
+const { headlessStoragePreflight, acquireHeadlessClientsAfterStoragePreflight } =
+  require(path.join(__dirname, '..', 'lib', 'codex-headless-storage-preflight'));
 const { normalizeState, observerHealth } = require(path.join(__dirname, '..', 'lib', 'codex-turn-observer'));
 const { verifyActiveAccountState } = require(path.join(__dirname, '..', 'lib', 'codex-account-state'));
 const {
@@ -49,9 +54,14 @@ const {
   normalizeAutoContinueState,
   pendingCountdownDecision,
   recordExclusivityBlock,
+  resolveDesktopRestoreFailure,
+  armAutomaticAttemptRetryHalt,
+  reconcileFailedAutomaticAttempt,
+  restoreFailureBlocksAuto,
   reconcileSuppression,
   requiresPendingCountdown,
   sameDecisionPlan,
+  unresolvedExclusivityBlockerPresent,
 } = require(path.join(__dirname, '..', 'lib', 'codex-auto-continue'));
 const {
   DESKTOP_SEND_CONFIRM_TIMEOUT_MS,
@@ -78,6 +88,7 @@ const eventStatePath = process.env.CODEX_EVENT_STATE || path.join(cacheDirectory
 const usageCachePath = process.env.USAGE_CACHE || path.join(cacheDirectory, 'usage.json');
 const resumeStatePath = process.env.CODEX_RESUME_STATE || path.join(cacheDirectory, 'manual-resume.json');
 const autoContinueStatePath = process.env.CODEX_AUTO_CONTINUE_STATE || path.join(cacheDirectory, 'auto-continue.json');
+const draftJournalPath = process.env.CODEX_DRAFT_JOURNAL || path.join(cacheDirectory, 'continuation-drafts.json');
 const statusPreferencesPath = process.env.CODEX_STATUS_PREFERENCES || defaultStatusPreferencesPath();
 const leasePath = `${resumeStatePath}.client-lease.json`;
 const lockPath = path.join(cacheDirectory, 'exclusive-codex-operation.lock');
@@ -100,6 +111,16 @@ function readJson(filename, fallback = null) {
   try { return JSON.parse(fs.readFileSync(filename, 'utf8')); } catch { return fallback; }
 }
 
+function readDraftJournal() {
+  try {
+    const journal = JSON.parse(fs.readFileSync(draftJournalPath, 'utf8'));
+    return journal?.version === 1 && journal.claims && typeof journal.claims === 'object'
+      ? journal : { unverified: true };
+  } catch (error) {
+    return error?.code === 'ENOENT' ? { version: 1, claims: {} } : { unverified: true };
+  }
+}
+
 function sleep(milliseconds) {
   return new Promise(resolve => setTimeout(resolve, milliseconds));
 }
@@ -117,14 +138,20 @@ function processEntries() {
       const ppid = Number(status.match(/^PPid:\s+(\d+)/m)?.[1]);
       const state = status.match(/^State:\s+(\S)/m)?.[1] || '?';
       const startTicks = Number(statFields[19]);
-      entries.push({ pid, ppid, state, args, startTicks: Number.isFinite(startTicks) ? startTicks : null });
+      let exe = null;
+      let cgroup = null;
+      try { exe = fs.readlinkSync(`/proc/${pid}/exe`).replace(/ \(deleted\)$/, ''); } catch {}
+      try { cgroup = fs.readFileSync(`/proc/${pid}/cgroup`, 'utf8').split('\n')
+        .find(line => line.startsWith('0::'))?.slice(3) || null; } catch {}
+      entries.push({ pid, ppid, state, args, startTicks: Number.isFinite(startTicks) ? startTicks : null,
+        exe, cgroup });
     } catch {}
   }
   return entries;
 }
 
 function isDesktopRoot(entry) {
-  return entry.args[0] === desktopBinary && !entry.args.some(argument => argument.startsWith('--type='));
+  return isDesktopRootProcess(entry, desktopBinary);
 }
 
 function descendants(entries, roots) {
@@ -177,7 +204,7 @@ function discoverClientProcesses() {
     vscodeHosts,
     vscodePids: descendants(entries, vscodeHosts),
     desktopRoots: entries.filter(isDesktopRoot).map(entry => entry.pid),
-    desktopPids: descendants(entries, entries.filter(isDesktopRoot).map(entry => entry.pid)),
+    desktopLineage: captureDesktopLineage(entries, entries.filter(isDesktopRoot).map(entry => entry.pid)),
   };
 }
 
@@ -187,12 +214,17 @@ function blockerSummary(blockers) {
   ).join('; ');
 }
 
-async function waitForAppServerExclusivity(desktopPids, timeoutMs = 15_000) {
+async function waitForAppServerExclusivity(desktopLineage, timeoutMs = 15_000) {
+  let lineage = desktopLineage;
   const result = await pollAppServerExclusivity({
-    readReport: () => appServerExclusivityReport(processEntries(), {
-      desktopPids,
+    readReport: () => {
+      const entries = processEntries();
+      lineage = captureDesktopLineage(entries, [], lineage);
+      return appServerExclusivityReport(entries, {
+      desktopLineage: lineage,
       ignoredPids: [process.pid],
-    }),
+      });
+    },
     sleep,
     timeoutMs,
   });
@@ -206,8 +238,9 @@ async function waitForAppServerExclusivity(desktopPids, timeoutMs = 15_000) {
   throw error;
 }
 
-function desktopRootPids() {
-  return processEntries().filter(isDesktopRoot).map(entry => entry.pid);
+function desktopRootIdentities() {
+  return processEntries().filter(isDesktopRoot).map(({ pid, startTicks, cgroup }) =>
+    ({ pid, startTicks, cgroup }));
 }
 
 function launchDesktopOnce(attempt, { forceRendererAccessibility = false } = {}) {
@@ -220,7 +253,7 @@ function launchDesktopOnce(attempt, { forceRendererAccessibility = false } = {})
   });
   const child = spawn(spec.command, spec.args, { detached: true, stdio: 'ignore' });
   child.unref();
-  return { pid: child.pid };
+  return { pid: child.pid, unit: `codex-desktop-restore-${process.pid}-${attempt}.service` };
 }
 
 async function restoreClients(lease, {
@@ -232,7 +265,7 @@ async function restoreClients(lease, {
   let desktopRestore = null;
   if (lease.desktopWasRunning || forceDesktop) {
     desktopRestore = await restoreDesktopWithRetry({
-      runningPids: desktopRootPids,
+      readRoots: desktopRootIdentities,
       launch: attempt => launchDesktopOnce(attempt, { forceRendererAccessibility }),
       sleep,
     });
@@ -294,12 +327,17 @@ async function acquireExclusiveClients({ autoMode = false } = {}) {
     }), 5_000, 'VSCODE_CLIENT_NOT_QUIESCENT');
 
     signalExisting(discovered.desktopRoots, 'SIGTERM');
-    await waitUntil(() => !processEntries().some(isDesktopRoot), 15_000, 'DESKTOP_DID_NOT_STOP');
+    let desktopLineage = discovered.desktopLineage;
+    await waitUntil(() => {
+      const entries = processEntries();
+      desktopLineage = captureDesktopLineage(entries, [], desktopLineage);
+      return !entries.some(isDesktopRoot);
+    }, 15_000, 'DESKTOP_DID_NOT_STOP');
 
     // Electron's root can exit slightly before its App Server child. Wait for
     // that already identified Desktop tree to drain, while every unknown or
     // non-quiescent App Server remains a fail-closed blocker.
-    await waitForAppServerExclusivity(discovered.desktopPids);
+    await waitForAppServerExclusivity(desktopLineage);
     return lease;
   } catch (error) {
     await restoreClients(lease);
@@ -416,7 +454,12 @@ class RpcConnection {
       if (!pending) return;
       this.recordMessage({ kind: 'response', method: pending.method, ok: !message.error });
       this.pending.delete(message.id);
-      message.error ? pending.reject(new Error('APP_SERVER_REQUEST_FAILED')) : pending.resolve(message.result);
+      if (message.error) {
+        const error = new Error('APP_SERVER_REQUEST_FAILED');
+        error.diagnostics = { phase: this.phase, method: pending.method,
+          errorCode: Number.isFinite(Number(message.error.code)) ? Number(message.error.code) : null };
+        pending.reject(error);
+      } else pending.resolve(message.result);
       return;
     }
     if (message.id !== undefined && message.method) {
@@ -659,8 +702,10 @@ function releaseLock() {
 }
 
 function autoSelectors() {
-  const selectors = [process.env.ACCOUNT_1, process.env.ACCOUNT_2, process.env.ACCOUNT_3];
-  if (selectors.some(selector => !selector)) throw new Error('AUTO_ACCOUNT_SELECTORS_MISSING');
+  const current = readJson(registryPath);
+  const accounts = Array.isArray(current?.accounts) ? current.accounts : Object.values(current?.accounts || {});
+  const selectors = accounts.map(account => account.account_key);
+  if (!selectors.length || selectors.some(selector => !selector)) throw new Error('AUTO_ACCOUNT_SELECTORS_MISSING');
   return selectors;
 }
 
@@ -671,6 +716,7 @@ function autoDecisionSnapshot(nowMs = Date.now()) {
   const usageCache = readJson(usageCachePath);
   const eventState = normalizeState(readJson(eventStatePath, {}), nowMs);
   const resumeState = normalizeResumeState(readJson(resumeStatePath, emptyResumeState()));
+  const manualDraftJournal = readDraftJournal();
   if (!registry || !globalAuth || !usageCache) throw new Error('AUTO_STATE_MISSING');
   return automationDecision({
     preferences,
@@ -679,6 +725,7 @@ function autoDecisionSnapshot(nowMs = Date.now()) {
     usageCache,
     eventState,
     resumeState,
+    manualDraftJournal,
     selectors: autoSelectors(),
     nowMs,
   });
@@ -686,10 +733,19 @@ function autoDecisionSnapshot(nowMs = Date.now()) {
 
 function writeAutoContinueState(patch) {
   const previous = normalizeAutoContinueState(readJson(autoContinueStatePath, emptyAutoContinueState()));
+  const resolved = patch.desktopRestore?.status === 'ready'
+    ? resolveDesktopRestoreFailure(previous, {
+      pid: patch.desktopRestore.desktopPid,
+      startTicks: patch.desktopRestore.desktopStartTicks,
+      cgroup: patch.desktopRestore.desktopCgroup,
+    }) : previous;
   atomicWriteJson(autoContinueStatePath, {
     ...emptyAutoContinueState(),
-    ...previous,
+    ...resolved,
     ...patch,
+    ...((patch.desktopRestore?.status === 'failed' ||
+      (previous.desktopRestore?.status === 'failed' && patch.desktopRestore?.status === 'ready'))
+      ? { restoreRetryHalt: true } : {}),
     version: AUTO_CONTINUE_STATE_VERSION,
     heartbeatAtMs: Date.now(),
   });
@@ -739,7 +795,7 @@ function refreshUsageNow() {
 function switchToTarget(target) {
   const before = activeAccountState();
   if (before.accountId === target.accountId && before.accountKey === target.accountKey) return false;
-  const result = spawnSync(codexAuthBin, ['switch', target.selector], {
+  const result = spawnSync(codexAuthBin, ['switch', require('../lib/codex-account-state').upstreamSelector(readJson(registryPath), target.accountKey)], {
     stdio: 'ignore',
     timeout: 60_000,
   });
@@ -777,7 +833,9 @@ async function waitForObserverIdleAfterTurn(timeoutMs = 15_000) {
 async function automaticHeadlessMain() {
   const initial = autoDecisionSnapshot();
   if (initial.action !== 'resume') {
-    const reconciled = clearExclusivityBlock(reconcileSuppression(readAutoContinueState(), initial));
+    const previous = reconcileSuppression(readAutoContinueState(), initial);
+    const reconciled = initial.reason === 'no-candidates' || initial.reason === 'disabled'
+      ? clearExclusivityBlock(previous) : previous;
     writeAutoContinueState({
       ...reconciled,
       status: initial.action,
@@ -789,6 +847,27 @@ async function automaticHeadlessMain() {
       targetAccountId: null,
       pending: null,
     });
+    return;
+  }
+
+  if (restoreFailureBlocksAuto(readAutoContinueState(), initial)) {
+    const blocked = readAutoContinueState();
+    writeAutoContinueState({ status: 'blocked', errorKind: blocked.errorKind ||
+      blocked.desktopRestore?.errorKind || 'AUTO_ATTEMPT_RETRY_HALTED', actionRequired: true,
+      candidateThreadId: initial.candidates[0]?.threadId || null,
+      candidateTurnId: initial.candidates[0]?.turnId || null,
+      targetAccountId: initial.target?.accountId || null, pending: null });
+    return;
+  }
+
+  // A failed pre-commit attempt must not restore Desktop and immediately
+  // quiesce it again while the exact same blocking process is still alive.
+  if (hasMatchingExclusivityBlock(readAutoContinueState(), {
+    threadId: initial.candidates[0]?.threadId || null,
+    failedTurnId: initial.candidates[0]?.turnId || null,
+    targetAccountId: initial.target?.accountId || null,
+  }) && unresolvedExclusivityBlockerPresent(readAutoContinueState(), processEntries())) {
+    writeAutoContinueState({ lastAttemptAtMs: Date.now() });
     return;
   }
 
@@ -811,6 +890,24 @@ async function automaticHeadlessMain() {
         candidateTurnId: lockedPlan.candidates[0]?.turnId || null,
         targetAccountId: lockedPlan.target.accountId,
       });
+      return;
+    }
+    const storage = await headlessStoragePreflight(codexHome, lockedPlan.candidates);
+    if (!storage.ok) {
+      writeAutoContinueState(armAutomaticAttemptRetryHalt({
+        ...readAutoContinueState(),
+        status: 'blocked',
+        lastAttemptAtMs: Date.now(),
+        errorKind: 'CANDIDATE_UNAVAILABLE_IN_ACTIVE_CODEX_HOME',
+        actionRequired: true,
+        candidateThreadId: storage.threadId,
+        candidateTurnId: storage.failedTurnId,
+        targetAccountId: lockedPlan.target.accountId,
+        pending: null,
+        diagnostics: { phase: 'local-storage-preflight', reason: storage.reason,
+          threadId: storage.threadId, failedTurnId: storage.failedTurnId },
+      }, lockedPlan));
+      process.exitCode = 1;
       return;
     }
     const processSnapshot = processEntries();
@@ -854,7 +951,7 @@ async function automaticHeadlessMain() {
         return;
       }
     }
-    writeAutoContinueState(beginExclusivityAttempt(readAutoContinueState(), exclusivityContext, {
+    const attemptState = beginExclusivityAttempt(readAutoContinueState(), exclusivityContext, {
       status: 'running',
       lastAttemptAtMs: Date.now(),
       errorKind: null,
@@ -864,9 +961,11 @@ async function automaticHeadlessMain() {
       targetAccountId: lockedPlan.target.accountId,
       pending: null,
       desktopNavigation: null,
-    }));
+    });
+    writeAutoContinueState(armAutomaticAttemptRetryHalt(attemptState, lockedPlan));
 
-    lease = await acquireExclusiveClients({ autoMode: true });
+    lease = await acquireHeadlessClientsAfterStoragePreflight(codexHome, lockedPlan.candidates,
+      () => acquireExclusiveClients({ autoMode: true }));
     writeAutoContinueState(clearExclusivityBlock(readAutoContinueState()));
     assertAutomaticOwnership();
     const ownedPlan = autoDecisionSnapshot();
@@ -932,6 +1031,8 @@ async function automaticHeadlessMain() {
       candidateTurnId: null,
       targetAccountId: switchedPlan.target.accountId,
       pending: null,
+      restoreRetryHalt: false,
+      restoreRetryHaltGeneration: null,
     });
   } catch (error) {
     if (committed && currentCandidate) {
@@ -957,11 +1058,16 @@ async function automaticHeadlessMain() {
         status: transient ? 'waiting' : 'blocked',
         lastAttemptAtMs: Date.now(),
         errorKind: transient ? null : error?.message || 'AUTO_RESUME_FAILED',
+        diagnostics: error?.diagnostics || null,
         actionRequired: !transient,
         candidateThreadId: currentCandidate?.threadId || initial.candidates[0]?.threadId || null,
         candidateTurnId: currentCandidate?.turnId || initial.candidates[0]?.turnId || null,
         targetAccountId: initial.target?.accountId || null,
         pending: null,
+        ...(isDesktopRestoreError(error) ? { desktopRestore: {
+          status: 'failed', completedAtMs: Date.now(), errorKind: error.message,
+          diagnostics: error.diagnostics || null,
+        } } : {}),
       });
       if (!transient) process.exitCode = 1;
     }
@@ -1147,7 +1253,9 @@ async function awaitDesktopSendReconciliation(candidate) {
 async function automaticDesktopMain() {
   const initial = autoDecisionSnapshot();
   if (initial.action !== 'resume') {
-    const reconciled = clearExclusivityBlock(reconcileSuppression(readAutoContinueState(), initial));
+    const previous = reconcileSuppression(readAutoContinueState(), initial);
+    const reconciled = initial.reason === 'no-candidates' || initial.reason === 'disabled'
+      ? clearExclusivityBlock(previous) : previous;
     writeAutoContinueState({
       ...reconciled,
       status: initial.action,
@@ -1159,6 +1267,25 @@ async function automaticDesktopMain() {
       targetAccountId: null,
       pending: null,
     });
+    return 'done';
+  }
+
+  if (restoreFailureBlocksAuto(readAutoContinueState(), initial)) {
+    const blocked = readAutoContinueState();
+    writeAutoContinueState({ status: 'blocked', errorKind: blocked.errorKind ||
+      blocked.desktopRestore?.errorKind || 'AUTO_ATTEMPT_RETRY_HALTED', actionRequired: true,
+      candidateThreadId: initial.candidates[0]?.threadId || null,
+      candidateTurnId: initial.candidates[0]?.turnId || null,
+      targetAccountId: initial.target?.accountId || null, pending: null });
+    return 'done';
+  }
+
+  if (hasMatchingExclusivityBlock(readAutoContinueState(), {
+    threadId: initial.candidates[0]?.threadId || null,
+    failedTurnId: initial.candidates[0]?.turnId || null,
+    targetAccountId: initial.target?.accountId || null,
+  }) && unresolvedExclusivityBlockerPresent(readAutoContinueState(), processEntries())) {
+    writeAutoContinueState({ lastAttemptAtMs: Date.now() });
     return 'done';
   }
 
@@ -1206,12 +1333,13 @@ async function automaticDesktopMain() {
       if (outcome !== 'execute') return 'done';
       if (!sameDecisionPlan(lockedPlan, autoDecisionSnapshot())) return 'done';
     }
-    writeAutoContinueState(beginExclusivityAttempt(readAutoContinueState(), exclusivityContext, {
+    const attemptState = beginExclusivityAttempt(readAutoContinueState(), exclusivityContext, {
       status: 'desktop-preparing', lastAttemptAtMs: Date.now(), errorKind: null,
       actionRequired: false, candidateThreadId: lockedPlan.candidates[0]?.threadId || null,
       candidateTurnId: lockedPlan.candidates[0]?.turnId || null,
       targetAccountId: lockedPlan.target.accountId, pending: null,
-    }));
+    });
+    writeAutoContinueState(armAutomaticAttemptRetryHalt(attemptState, lockedPlan));
 
     lease = await acquireExclusiveClients({ autoMode: true });
     writeAutoContinueState(clearExclusivityBlock(readAutoContinueState()));
@@ -1348,11 +1476,15 @@ async function automaticDesktopMain() {
       if (safeFallback) break;
     }
 
-    if (safeFallback) return 'fallback-headless';
+    if (safeFallback) {
+      writeAutoContinueState({ restoreRetryHalt: false, restoreRetryHaltGeneration: null });
+      return 'fallback-headless';
+    }
     writeAutoContinueState({
       status: 'completed', lastSuccessAtMs: Date.now(), errorKind: null,
       actionRequired: false, candidateThreadId: null, candidateTurnId: null,
       targetAccountId: switchedPlan.target.accountId, pending: null,
+      restoreRetryHalt: false, restoreRetryHaltGeneration: null,
     });
     return 'done';
   } catch (error) {
@@ -1375,9 +1507,14 @@ async function automaticDesktopMain() {
     writeAutoContinueState({
       status: 'blocked', lastAttemptAtMs: Date.now(),
       errorKind: error?.message || 'AUTO_DESKTOP_FAILED', actionRequired: true,
+      diagnostics: error?.diagnostics || null,
       candidateThreadId: currentCandidate?.threadId || initial.candidates[0]?.threadId || null,
       candidateTurnId: currentCandidate?.turnId || initial.candidates[0]?.turnId || null,
       targetAccountId: initial.target?.accountId || null, pending: null,
+      ...(isDesktopRestoreError(error) ? { desktopRestore: {
+        status: 'failed', completedAtMs: Date.now(), errorKind: error.message,
+        diagnostics: error.diagnostics || null,
+      } } : {}),
     });
     if (afterCommit || promptInjected) return 'done';
     throw error;
@@ -1388,14 +1525,50 @@ async function automaticDesktopMain() {
           forceDesktop: true,
           forceRendererAccessibility: true,
         });
-      } catch {}
+      } catch (error) {
+        writeAutoContinueState({
+          status: 'blocked', errorKind: error?.message || 'AUTO_CLIENT_RESTORE_FAILED',
+          actionRequired: true,
+          desktopRestore: { status: 'failed', completedAtMs: Date.now(),
+            errorKind: error?.message || 'AUTO_CLIENT_RESTORE_FAILED',
+            diagnostics: error?.diagnostics || null },
+        });
+        process.exitCode = 1;
+      }
     }
     if (lock) releaseLock(lock);
   }
 }
 
 async function automaticMain() {
+  const diagnosticState = readAutoContinueState();
+  if (diagnosticState.desktopRestore?.status === 'failed' &&
+      diagnosticState.desktopRestore.errorKind !== 'DESKTOP_ROOT_AMBIGUOUS') {
+    const roots = desktopRootIdentities();
+    if (roots.length === 1 && Number.isFinite(roots[0].startTicks) && roots[0].startTicks > 0) {
+      await sleep(1_000);
+      const verified = desktopRootIdentities();
+      if (verified.length === 1 && verified[0].pid === roots[0].pid &&
+          verified[0].startTicks === roots[0].startTicks) {
+        writeAutoContinueState({ desktopRestore: { status: 'ready',
+          desktopPid: roots[0].pid, desktopStartTicks: roots[0].startTicks,
+          desktopCgroup: roots[0].cgroup, completedAtMs: Date.now() } });
+      }
+    }
+  }
+  if (readAutoContinueState().exclusivityBlock && appServerExclusivityReport(processEntries(), {
+    ignoredPids: [process.pid],
+  }).exclusive) writeAutoContinueState(clearExclusivityBlock(readAutoContinueState()));
   if (await reconcileOutstandingDesktopAttempts()) return 'reconciling';
+  const beforeRetry = readAutoContinueState();
+  const retryPlan = autoDecisionSnapshot();
+  const reconciledFailure = reconcileFailedAutomaticAttempt(beforeRetry, retryPlan);
+  if (reconciledFailure.restoreRetryHalt && !beforeRetry.restoreRetryHalt) {
+    writeAutoContinueState({ ...reconciledFailure, status: 'blocked', actionRequired: true });
+    return 'restore-blocked';
+  }
+  // A restore failure belongs to the whole controller plan. Repeating the
+  // timer run must not quiesce the Desktop it just launched and restore again.
   const preferences = readStatusPreferences(statusPreferencesPath);
   if (preferences.autoMode !== AUTO_MODE.DESKTOP) return automaticHeadlessMain();
   const outcome = await automaticDesktopMain();

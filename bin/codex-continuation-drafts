@@ -14,6 +14,8 @@ const {
 const { normalizeResumeState } = require(path.join(__dirname, '..', 'lib', 'codex-manual-resume'));
 const { normalizeState } = require(path.join(__dirname, '..', 'lib', 'codex-turn-observer'));
 const { verifyActiveAccountState } = require(path.join(__dirname, '..', 'lib', 'codex-account-state'));
+const { defaultStatusPreferencesPath, readStatusPreferences } = require(path.join(__dirname, '..', 'lib', 'codex-status-preferences'));
+const { OWNER, candidateIdentity } = require(path.join(__dirname, '..', 'lib', 'codex-continuation-ownership'));
 
 const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
 const cacheHome = process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache');
@@ -21,6 +23,8 @@ const eventStatePath = process.env.CODEX_EVENT_STATE || path.join(cacheHome, 'co
 const resumeStatePath = process.env.CODEX_RESUME_STATE || path.join(cacheHome, 'codex-account-switcher', 'manual-resume.json');
 const usageCachePath = process.env.USAGE_CACHE || path.join(cacheHome, 'codex-account-switcher', 'usage.json');
 const desktopBinary = process.env.CHATGPT_BINARY_PATTERN || '/usr/lib/chatgpt/ChatGPT';
+const preferencesPath = process.env.CODEX_STATUS_PREFERENCES || defaultStatusPreferencesPath();
+const draftJournalPath = process.env.CODEX_DRAFT_JOURNAL || path.join(cacheHome, 'codex-account-switcher', 'continuation-drafts.json');
 
 function fail(message, code = 3) {
   process.stderr.write(`${message}\n`);
@@ -50,7 +54,23 @@ function stateSnapshot() {
     eventState: normalizeState(readJson(eventStatePath)),
     resumeState: normalizeResumeState(readJson(resumeStatePath, {})),
     usageCache: readJson(usageCachePath),
+    preferences: readStatusPreferences(preferencesPath),
   };
+}
+
+function journalCandidate(candidate, phase, result) {
+  const previous = readJson(draftJournalPath, { version: 1, events: [], claims: {} });
+  const events = Array.isArray(previous.events) ? previous.events.slice(-199) : [];
+  const claims = previous.claims && typeof previous.claims === 'object' ? previous.claims : {};
+  if (phase === 'apply' && (result === 'dispatch-attempted' || result === 'dispatched')) {
+    claims[candidateIdentity(candidate)] = { threadId: candidate.threadId, failedTurnId: candidate.turnId,
+      owner: OWNER.MANUAL_DRAFT, claimedAtMs: claims[candidateIdentity(candidate)]?.claimedAtMs || Date.now(),
+      status: result };
+  }
+  events.push({ atMs: Date.now(), phase, threadId: candidate.threadId, failedTurnId: candidate.turnId,
+    owner: candidate.owner, mode: candidate.mode, eligible: candidate.owner === OWNER.MANUAL_DRAFT &&
+      candidate.mode !== 'skip', result });
+  atomicWriteJson(draftJournalPath, { version: 1, events, claims });
 }
 
 function prepare(args) {
@@ -67,6 +87,8 @@ function prepare(args) {
     ...state,
   });
   atomicWriteJson(planPath, plan);
+  for (const candidate of plan.candidates) journalCandidate(candidate, 'prepare',
+    candidate.mode === 'skip' ? 'skipped' : 'eligible');
   process.stdout.write(`${plan.action}${plan.reason ? `:${plan.reason}` : ''}\n`);
 }
 
@@ -92,31 +114,51 @@ function apply(args) {
   if (!planPath) fail('Usage: codex-continuation-drafts apply <plan-file>', 64);
   const plan = readJson(planPath);
   if (plan.action !== 'prefill') {
+    for (const candidate of plan.candidates || []) journalCandidate(candidate, 'apply', 'skipped');
     process.stdout.write('skipped\n');
     return;
   }
   const active = verifiedActiveTarget(plan);
-  if (!active.ok) fail(`CONTINUATION_DRAFT_BLOCKED:target-auth-unverified:${active.errors.join(',')}`);
+  if (!active.ok) {
+    for (const candidate of plan.candidates) journalCandidate(candidate, 'apply', 'target-auth-unverified');
+    fail(`CONTINUATION_DRAFT_BLOCKED:target-auth-unverified:${active.errors.join(',')}`);
+  }
   const validation = validateContinuationPlan({
     plan,
     ...stateSnapshot(),
     activeAccountId: active.accountId,
     activeAccountKey: active.accountKey,
   });
-  if (!validation.ok) fail(`CONTINUATION_DRAFT_BLOCKED:${validation.reason}`);
+  if (!validation.ok) {
+    for (const candidate of plan.candidates) journalCandidate(candidate, 'apply', `skipped:${validation.reason}`);
+    fail(`CONTINUATION_DRAFT_BLOCKED:${validation.reason}`);
+  }
 
-  const links = continuationDeepLinks(validation.candidates);
-  for (const link of links) {
+  const candidates = validation.candidates.filter(candidate => candidate.owner === OWNER.MANUAL_DRAFT &&
+    candidate.mode !== 'skip');
+  for (const candidate of validation.candidates.filter(candidate => candidate.mode === 'skip')) {
+    journalCandidate(candidate, 'apply', 'skipped');
+  }
+  for (const candidate of candidates) {
+    // AUTO mode may change while several deep links are being dispatched.
+    if (readStatusPreferences(preferencesPath).autoMode !== 'OFF') {
+      journalCandidate(candidate, 'apply', 'skipped:ownership-changed');
+      fail('CONTINUATION_DRAFT_BLOCKED:ownership-changed');
+    }
+    const [link] = continuationDeepLinks([candidate]);
+    journalCandidate(candidate, 'apply', 'dispatch-attempted');
     const result = childProcess.spawnSync(desktopBinary, [link], {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 15_000,
     });
     if (result.error || result.status !== 0) {
+      journalCandidate(candidate, 'apply', 'dispatch-failed');
       fail(`CONTINUATION_DRAFT_DEEPLINK_FAILED:${result.error?.code || result.status || 'unknown'}`);
     }
+    journalCandidate(candidate, 'apply', 'dispatched');
   }
-  process.stdout.write(`prefilled:${links.length}\n`);
+  process.stdout.write(`prefilled:${candidates.length}\n`);
 }
 
 try {

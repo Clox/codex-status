@@ -18,6 +18,7 @@ USAGE_REFRESHER=${USAGE_REFRESHER:-"$HOME/.local/bin/codex-usage-refresh"}
 USAGE_CACHE=${USAGE_CACHE:-"${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/usage.json"}
 AUTH_REPAIRER=${AUTH_REPAIRER:-"$HOME/.local/bin/codex-auth-repair"}
 CODEX_LOGIN_BIN=${CODEX_LOGIN_BIN:-/usr/lib/chatgpt/resources/codex}
+export ACCOUNT_SWITCHER
 export CODEX_AUTH_BIN USAGE_REFRESHER USAGE_CACHE AUTH_REPAIRER CODEX_LOGIN_BIN
 FIVE_HOUR_ACTIVATION_STATE=${FIVE_HOUR_ACTIVATION_STATE:-"${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/five-hour-activation.json"}
 export FIVE_HOUR_ACTIVATION_STATE
@@ -140,7 +141,7 @@ draw_frame() {
     printf '\033[1;33mPAUSED — tryck [P] för att återuppta och uppdatera vyn.\033[0m\n'
   fi
   printf '\n\033[2mPRIOR = weekly %% remaining per hour until reset × 100. Higher means more urgent.\033[0m\n'
-  printf '\033[2mPress 1–3 for account, A for auto-continue or P to pause. Ctrl+C closes.\033[0m\n'
+  printf '\033[2mPress 1–9 for account, K to manage accounts, A for auto-continue or P to pause. Ctrl+C closes.\033[0m\n'
   tput ed 2>/dev/null || printf '\033[J'
   tput smam 2>/dev/null || printf '\033[?7h'
 }
@@ -168,6 +169,10 @@ start_local_collection() {
   collector_tmp=$(mktemp "$status_runtime_dir/status-raw-frame.XXXXXX")
   chmod 600 "$collector_tmp"
   (
+    collection_lock="${CODEX_OPERATION_LOCK_DIR:-$status_runtime_dir/exclusive-codex-operation.lock}"
+    mkdir -m 700 "$collection_lock" 2>/dev/null || { rm -f -- "$collector_tmp"; exit 1; }
+    printf '%s\n' "$BASHPID" >"$collection_lock/owner"
+    trap 'rm -f -- "$collection_lock/owner"; rmdir -- "$collection_lock" 2>/dev/null || true' EXIT
     if script -qefc "stty cols $columns; exec \"$CODEX_AUTH_BIN\" list --skip-api" /dev/null </dev/null >"$collector_tmp"; then
       mv -f -- "$collector_tmp" "$status_raw_frame_cache"
       chmod 600 "$status_raw_frame_cache"
@@ -197,7 +202,7 @@ process_snapshot() {
     ) &&
     key_map_next=$(
       printf '%s\n' "$raw_frame" |
-        CODEX_STATUS_RANKING=1 CODEX_STATUS_COLUMNS="$columns" CODEX_STATUS_NOW_MS="$status_now_ms" "$USAGE_ANNOTATOR" --key-map
+        CODEX_STATUS_RANKING=1 CODEX_STATUS_COLUMNS="$columns" CODEX_STATUS_NOW_MS="$status_now_ms" "$USAGE_ANNOTATOR" --switch-map
     ) &&
     attention_next=$(
       printf '%s\n' "$raw_frame" |
@@ -218,7 +223,7 @@ process_snapshot() {
       frame=$(printf '%s\n' "$raw_frame" |
         CODEX_STATUS_RANKING=1 CODEX_STATUS_COLUMNS="$columns" CODEX_STATUS_NOW_MS="$status_now_ms" "$USAGE_ANNOTATOR")
     elif [[ -n $pending_source_row && $((SECONDS - pending_since)) -ge 2 ]] &&
-        ! pgrep -f "^${ACCOUNT_SWITCHER} [123] --desktop( |$)" >/dev/null 2>&1; then
+        ! pgrep -f "^${ACCOUNT_SWITCHER} ([123]|--key [A-Za-z0-9_-]+) --desktop( |$)" >/dev/null 2>&1; then
       pending_source_row=''
       pending_since=0
       pending_spinner_index=0
@@ -306,18 +311,18 @@ while true; do
   key=''
   if IFS= read -rsn 1 -t 0.2 key </dev/tty; then
     case "$key" in
-      1|2|3)
-        if pgrep -f "^${ACCOUNT_SWITCHER} [123] --desktop( |$)" >/dev/null 2>&1; then
+      1|2|3|4|5|6|7|8|9)
+        if pgrep -f "^${ACCOUNT_SWITCHER} ([123]|--key [A-Za-z0-9_-]+) --desktop( |$)" >/dev/null 2>&1; then
           notify-send 'Codex-kontobyte pågår' 'Vänta tills det pågående kontobytet är klart.' 2>/dev/null || true
         else
           source_row=$(printf '%s\n' "$key_map" | awk -v rank="$key" '$1 == rank { print $2; exit }')
           launcher_account=$(printf '%s\n' "$key_map" | awk -v rank="$key" '$1 == rank { print $4; exit }')
-          if [[ ! $source_row =~ ^[123]$ ]]; then
+          if [[ ! $source_row =~ ^[1-9][0-9]*$ ]]; then
             notify-send 'Codex-kontobyte stoppat' 'Kunde inte koppla rankingen till ett konto. Vänta på nästa uppdatering.' 2>/dev/null || true
             continue
           fi
-          if [[ ! $launcher_account =~ ^[123]$ ]]; then
-            notify-send 'Codex-kontobyte stoppat' 'Kunde inte koppla kontot till rätt launcher. Kontrollera accounts.conf.' 2>/dev/null || true
+          if [[ ! $launcher_account =~ ^[A-Za-z0-9_-]+$ || $launcher_account == - ]]; then
+            notify-send 'Codex-kontobyte stoppat' 'Kunde inte entydigt identifiera kontot. Öppna kontomenyn med K.' 2>/dev/null || true
             continue
           fi
           if [[ $source_row == "$active_source_row" ]]; then
@@ -334,8 +339,11 @@ while true; do
             draw_current_frame
             pending_spinner_index=$(((pending_spinner_index + 1) % ${#pending_spinner_frames[@]}))
           fi
-          launch_detached "$ACCOUNT_SWITCHER" "$launcher_account" --desktop
+          launch_detached "$ACCOUNT_SWITCHER" --key "$launcher_account" --desktop
         fi
+        ;;
+      k|K)
+        launch_detached "$(command -v gnome-terminal)" --hide-menubar --title='Codex-konton' -- "$HOME/.local/bin/codex-account-manager" --hold
         ;;
       r|R)
         if printf '%s\n' "$base_frame" | grep -Fq 'Press [R] to repair authentication'; then

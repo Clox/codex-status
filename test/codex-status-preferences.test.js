@@ -103,3 +103,22 @@ test('status control cancels only pending AUTO and OFF to ON clears suppression'
   assert.equal(autoState.suppression, null);
   assert.equal(autoState.status, 'idle');
 });
+
+test('AUTO mode toggle cannot race an account switch or continuation controller', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-status-lock-'));
+  const preferencesPath = path.join(root, 'preferences.json');
+  const autoStatePath = path.join(root, 'auto-state.json');
+  const operationLockPath = path.join(root, 'exclusive-codex-operation.lock');
+  fs.writeFileSync(preferencesPath, JSON.stringify({ version: 2, autoMode: 'OFF' }));
+  fs.mkdirSync(operationLockPath);
+  fs.writeFileSync(path.join(operationLockPath, 'owner'), `${process.pid}\n`);
+  const command = path.join(__dirname, '..', 'bin', 'codex-status-preferences');
+  const result = spawnSync(process.execPath, [command, 'toggle-auto-continue'], {
+    env: { ...process.env, CODEX_STATUS_PREFERENCES: preferencesPath,
+      CODEX_AUTO_CONTINUE_STATE: autoStatePath, CODEX_OPERATION_LOCK_DIR: operationLockPath },
+    encoding: 'utf8',
+  });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /AUTO_MODE_CHANGE_BUSY/);
+  assert.equal(JSON.parse(fs.readFileSync(preferencesPath)).autoMode, 'OFF');
+});

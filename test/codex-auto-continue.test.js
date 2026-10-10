@@ -6,20 +6,30 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 const {
+  headlessStoragePreflight,
+  acquireHeadlessClientsAfterStoragePreflight,
+} = require('../lib/codex-headless-storage-preflight');
+const {
   autoContinueStatusLine,
   autoContinueProblemLine,
+  autoContinueProblemLines,
   autoPlanFingerprint,
   automationDecision,
   beginExclusivityAttempt,
   cancelPendingAction,
   createOrResumePending,
   hasMatchingExclusivityBlock,
+  unresolvedExclusivityBlockerPresent,
   isAutoPlanSuppressed,
   normalizeAutoContinueState,
   pendingAttentionDecision,
   pendingCountdownDecision,
   recordExclusivityBlock,
   clearExclusivityBlock,
+  resolveDesktopRestoreFailure,
+  armAutomaticAttemptRetryHalt,
+  reconcileFailedAutomaticAttempt,
+  restoreFailureBlocksAuto,
   reconcileSuppression,
   requiresPendingCountdown,
   resetAutoContinueForToggle,
@@ -113,6 +123,59 @@ function decide(overrides = {}) {
     ...overrides,
   });
 }
+
+test('HEADLESS missing active-home rollout blocks before Desktop quiesce or restore', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-headless-storage-'));
+  try {
+    const decision = decide();
+    assert.equal(decision.action, 'resume');
+    assert.equal(decision.candidates[0].resumable, true);
+    assert.equal(decision.candidates[0].classificationVerified, true);
+    // The observer journal still has both candidates, but the active home has
+    // neither a thread row nor a rollout for either one.
+    let quiesces = 0;
+    const storage = await headlessStoragePreflight(home, decision.candidates);
+    assert.deepEqual(storage, { ok: false, threadId: 'thread-first',
+      failedTurnId: 'turn-first', reason: 'ROLLOUT_NOT_IN_ACTIVE_CODEX_HOME' });
+    await assert.rejects(acquireHeadlessClientsAfterStoragePreflight(home, decision.candidates,
+      () => { quiesces += 1; return { desktopRestore: true }; }), error =>
+      error.message === 'CANDIDATE_UNAVAILABLE_IN_ACTIVE_CODEX_HOME' &&
+      error.diagnostics.threadId === 'thread-first' &&
+      error.diagnostics.failedTurnId === 'turn-first');
+    assert.equal(quiesces, 0);
+    const halted = armAutomaticAttemptRetryHalt({ status: 'blocked', actionRequired: true,
+      errorKind: 'CANDIDATE_UNAVAILABLE_IN_ACTIVE_CODEX_HOME',
+      candidateThreadId: storage.threadId, candidateTurnId: storage.failedTurnId }, decision);
+    assert.equal(restoreFailureBlocksAuto(halted, decision), true);
+    assert.equal(decision.candidates.length, 2);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('HEADLESS storage preflight checks every exact candidate and failed turn', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-headless-storage-'));
+  try {
+    const directory = path.join(home, 'sessions', '2026', '10', '06');
+    fs.mkdirSync(directory, { recursive: true });
+    fs.writeFileSync(path.join(directory, 'rollout-2026-10-06T09-00-00-thread-first.jsonl'), [
+      JSON.stringify({ type: 'session_meta', payload: { id: 'thread-first' } }),
+      JSON.stringify({ type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-first' } }),
+      JSON.stringify({ type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn-first',
+        error: { codexErrorInfo: 'usageLimitExceeded' } } }),
+    ].join('\n') + '\n');
+    const candidates = decide().candidates;
+    assert.deepEqual(await headlessStoragePreflight(home, candidates), {
+      ok: false, threadId: 'thread-second', failedTurnId: 'turn-second',
+      reason: 'ROLLOUT_NOT_IN_ACTIVE_CODEX_HOME',
+    });
+    assert.deepEqual(await headlessStoragePreflight(home, [{ ...candidates[0], turnId: 'other-turn' }]), {
+      ok: false, threadId: 'thread-first', failedTurnId: 'other-turn', reason: 'FAILED_TURN_NOT_FOUND',
+    });
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
 
 test('OFF never acts even when an older resumable candidate exists', () => {
   assert.deepEqual(decide({ preferences: { version: 1, autoContinue: false } }), {
@@ -295,6 +358,132 @@ test('new exclusivity attempt retains WAIT problem until ownership is actually a
     'AUTO: HEADLESS · WAIT/BLOCKED');
   assert.equal(hasMatchingExclusivityBlock(retrying, context), true);
   assert.equal(hasMatchingExclusivityBlock(retrying, { ...context, targetAccountId: 'account-c' }), false);
+  assert.match(autoContinueProblemLine({ ...retrying, status: 'waiting', errorKind: null }, true), /APP_SERVER_EXCLUSIVITY_FAILED/);
+  assert.equal(unresolvedExclusivityBlockerPresent(retrying, [{ pid: 20, startTicks: 100 }]), false);
+});
+
+test('same live blocker suppresses a repeated quiesce and restore cycle', () => {
+  const blocked = recordExclusivityBlock({}, { blockers: [
+    { pid: 20, ppid: 2, startTicks: 100, state: 'S', role: 'other-app-server' },
+  ] }, { threadId: 'thread-a', failedTurnId: 'turn-a', targetAccountId: 'target' }, NOW);
+  assert.equal(unresolvedExclusivityBlockerPresent(blocked, [{ pid: 20, startTicks: 100 }]), true);
+  assert.equal(unresolvedExclusivityBlockerPresent(blocked, [{ pid: 20, startTicks: 101 }]), false);
+  assert.equal(unresolvedExclusivityBlockerPresent(blocked, []), false);
+});
+
+test('a prior manual draft claim blocks AUTO ownership transfer for the exact candidate', () => {
+  const journal = { version: 1, claims: {
+    '["thread-first","turn-first"]': { owner: 'manual-draft', status: 'dispatch-attempted' },
+  } };
+  assert.deepEqual(decide({ manualDraftJournal: journal }).candidates.map(candidate => candidate.threadId),
+    ['thread-second']);
+  assert.equal(decide({ manualDraftJournal: { unverified: true } }).reason,
+    'MANUAL_DRAFT_JOURNAL_UNVERIFIED');
+  const withoutClaimedCandidate = eventState();
+  delete withoutClaimedCandidate.interruptedTurns.first;
+  assert.equal(decide({ manualDraftJournal: journal, eventState: withoutClaimedCandidate }).action, 'resume');
+  const onlyClaimedCandidate = eventState();
+  delete onlyClaimedCandidate.interruptedTurns.second;
+  assert.deepEqual(decide({ manualDraftJournal: journal, eventState: onlyClaimedCandidate }), {
+    action: 'blocked', reason: 'MANUAL_DRAFT_OWNERSHIP_PENDING', actionRequired: true,
+    candidateThreadId: 'thread-first', candidateTurnId: 'turn-first',
+  });
+});
+
+test('unresolved failures survive waiting; successful resolution removes active problems', () => {
+  const blocked = recordExclusivityBlock({}, { blockers: [
+    { pid: 20, ppid: 2, startTicks: 100, state: 'S', role: 'other-app-server' },
+  ] }, { threadId: 'thread-a', failedTurnId: 'turn-a', targetAccountId: 'target' }, NOW);
+  const waiting = { ...blocked, status: 'waiting', errorKind: null, actionRequired: false,
+    desktopRestore: { status: 'failed', errorKind: 'DESKTOP_RESTORE_FAILED' } };
+  assert.equal(autoContinueProblemLines(waiting, true).length, 2);
+  const resolved = clearExclusivityBlock({ ...waiting, desktopRestore: { status: 'ready' } }, NOW + 1000);
+  assert.deepEqual(autoContinueProblemLines(resolved, true), []);
+  assert.equal(resolved.exclusivityHistory.length, 1);
+});
+
+test('late verified Desktop root resolves restore failure but retains bounded diagnostics', () => {
+  const blocked = recordExclusivityBlock({}, { blockers: [
+    { pid: 20, ppid: 2, startTicks: 100, state: 'S', role: 'desktop-app-server' },
+  ] }, { threadId: 'thread-a', failedTurnId: 'turn-a', targetAccountId: 'target' }, NOW);
+  const failed = { ...blocked, status: 'waiting', errorKind: 'DESKTOP_RESTORE_FAILED',
+    desktopRestore: { status: 'failed', errorKind: 'DESKTOP_RESTORE_FAILED',
+      completedAtMs: NOW + 1 } };
+  assert.equal(autoContinueProblemLines(failed, true).length, 2);
+  const restored = resolveDesktopRestoreFailure(failed,
+    { pid: 42, startTicks: 12345, cgroup: '/user.slice/codex-desktop-restore-9-1.service' }, NOW + 2);
+  assert.equal(restored.desktopRestore.status, 'ready');
+  assert.equal(restored.errorKind, null);
+  assert.equal(restored.desktopRestoreHistory[0].resolvedAtMs, NOW + 2);
+  assert.equal(restored.restoreRetryHalt, true);
+  assert.equal(autoContinueProblemLines(restored, true).length, 2);
+  const exclusive = clearExclusivityBlock(restored, NOW + 3);
+  assert.deepEqual(autoContinueProblemLines(exclusive, true), [
+    'AUTO-CONTINUE BLOCKED / ACTION REQUIRED: DESKTOP_RESTORE_RETRY_HALTED',
+  ]);
+  assert.equal(exclusive.exclusivityHistory[0].resolvedAtMs, NOW + 3);
+});
+
+test('failed restore blocks timer retries until explicit OFF acknowledgement', () => {
+  const failed = { status: 'blocked', errorKind: 'DESKTOP_ROOT_AMBIGUOUS', actionRequired: true,
+    desktopRestore: { status: 'failed', errorKind: 'DESKTOP_ROOT_AMBIGUOUS' } };
+  assert.equal(restoreFailureBlocksAuto(failed), true);
+  assert.deepEqual(autoContinueProblemLines(failed, true), [
+    'AUTO-CONTINUE BLOCKED / ACTION REQUIRED: DESKTOP_ROOT_AMBIGUOUS',
+  ]);
+  const waiting = { ...failed, status: 'waiting', errorKind: 'observer-unverified' };
+  assert.equal(restoreFailureBlocksAuto(waiting), true);
+  const acknowledged = resetAutoContinueForToggle(waiting, 'OFF', NOW);
+  assert.equal(restoreFailureBlocksAuto(acknowledged), false);
+  assert.equal(acknowledged.desktopRestoreHistory[0].acknowledgedAtMs, NOW);
+  assert.deepEqual(autoContinueProblemLines(acknowledged, true), []);
+});
+
+test('successful Desktop restore after pre-commit App Server error blocks the next same-turn attempt', () => {
+  const plan = decide();
+  const armed = armAutomaticAttemptRetryHalt({}, plan);
+  // Mirrors HEADLESS: a pre-commit App Server request fails, finally restores
+  // Desktop successfully, then the next timer activation sees the same plan.
+  const failedAttempt = { ...armed, status: 'blocked', errorKind: 'APP_SERVER_REQUEST_FAILED',
+    actionRequired: true, candidateThreadId: plan.candidates[0].threadId,
+    candidateTurnId: plan.candidates[0].turnId,
+    desktopRestore: { status: 'ready', desktopPid: 7001, desktopStartTicks: 9001 } };
+  let restoreUnitsStarted = 1;
+  let continuationControllersStarted = 1;
+  const nextPlan = decide();
+  if (!restoreFailureBlocksAuto(failedAttempt, nextPlan)) {
+    restoreUnitsStarted += 1;
+    continuationControllersStarted += 1;
+  }
+  assert.equal(failedAttempt.errorKind, 'APP_SERVER_REQUEST_FAILED');
+  assert.equal(restoreFailureBlocksAuto(failedAttempt, nextPlan), true);
+  assert.equal(restoreUnitsStarted, 1);
+  assert.equal(continuationControllersStarted, 1);
+  assert.equal(restoreFailureBlocksAuto(failedAttempt, decide({
+    preferences: { version: 2, autoMode: 'OFF', autoContinue: false },
+  })), false);
+});
+
+test('legacy APP_SERVER_REQUEST_FAILED plus ready Desktop is latched before another timer iteration', () => {
+  const plan = decide();
+  const stateFromFailedLiveRun = { status: 'blocked', errorKind: 'APP_SERVER_REQUEST_FAILED',
+    actionRequired: true, candidateThreadId: plan.candidates[0].threadId,
+    candidateTurnId: plan.candidates[0].turnId, targetAccountId: plan.target.accountId,
+    desktopRestore: { status: 'ready', desktopPid: 7001, desktopStartTicks: 9001 } };
+  const migrated = reconcileFailedAutomaticAttempt(stateFromFailedLiveRun, decide());
+  assert.equal(migrated.errorKind, 'APP_SERVER_REQUEST_FAILED');
+  assert.equal(migrated.restoreRetryHalt, true);
+
+  // This is the next systemd timer firing in the reproduced loop. Its entry
+  // gate sees the same (threadId, turnId, target) and never starts restore.
+  let restoreStarts = 1;
+  let resumeStarts = 1;
+  if (!restoreFailureBlocksAuto(migrated, decide())) {
+    restoreStarts += 1;
+    resumeStarts += 1;
+  }
+  assert.equal(restoreStarts, 1);
+  assert.equal(resumeStarts, 1);
 });
 
 test('already committed candidates are excluded after crash/restart and can never be sent twice', () => {

@@ -4,6 +4,9 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 const {
   appServerExclusivityReport,
+  captureDesktopLineage,
+  isDesktopRootProcess,
+  isDesktopRestoreError,
   appServerDrainDecision,
   candidateKey,
   currentResumeProblemLines,
@@ -173,6 +176,36 @@ test('Desktop App Server drain waits boundedly and succeeds immediately when exc
   assert.equal(appServerDrainDecision({ exclusive: true, blockers: [] }, 5_100, 15_000), 'exclusive');
 });
 
+test('Desktop descendant identity survives root exit and drains boundedly', async () => {
+  const root = { pid: 10, ppid: 1, startTicks: 100, state: 'S', args: ['/usr/lib/chatgpt/ChatGPT'] };
+  const child = { pid: 20, ppid: 10, startTicks: 200, state: 'S', args: ['/usr/lib/chatgpt/resources/codex', 'app-server'] };
+  let lineage = captureDesktopLineage([root, child], [10]);
+  assert.deepEqual(lineage, [{ pid: 10, startTicks: 100 }, { pid: 20, startTicks: 200 }]);
+  const orphan = { ...child, ppid: 1 };
+  lineage = captureDesktopLineage([orphan], [], lineage);
+  assert.deepEqual(lineage, [{ pid: 20, startTicks: 200 }]);
+  let reads = 0;
+  let elapsed = 0;
+  const result = await pollAppServerExclusivity({
+    readReport: () => appServerExclusivityReport(reads++ < 2 ? [orphan] : [], { desktopLineage: lineage }),
+    sleep: async delay => { elapsed += delay; }, now: () => elapsed, pollMs: 100,
+  });
+  assert.equal(result.outcome, 'exclusive');
+  assert.equal(result.elapsedMs, 200);
+});
+
+test('foreign and PID-reused App Servers remain strict blockers', () => {
+  const lineage = [{ pid: 20, startTicks: 200 }];
+  for (const server of [
+    { pid: 30, ppid: 1, startTicks: 300, state: 'S', args: ['/opt/codex', 'app-server'] },
+    { pid: 20, ppid: 1, startTicks: 201, state: 'S', args: ['/opt/codex', 'app-server'] },
+  ]) {
+    const report = appServerExclusivityReport([server], { desktopLineage: lineage });
+    assert.equal(report.blockers[0].role, 'other-app-server');
+    assert.equal(appServerDrainDecision(report, 0), 'fail');
+  }
+});
+
 test('slow normal Desktop App Server drain self-heals without a fixed remaining wait', async () => {
   let nowMs = 0;
   let reads = 0;
@@ -261,7 +294,7 @@ test('Desktop restore retries a startup that crashes after the former three-seco
   let pollsThisAttempt = 0;
   const sleeps = [];
   const result = await restoreDesktopWithRetry({
-    runningPids: () => pid == null ? [] : [pid],
+    readRoots: () => pid == null ? [] : [{ pid, startTicks: 1_000 + pid }],
     launch: () => {
       launches += 1;
       pollsThisAttempt = 0;
@@ -289,7 +322,7 @@ test('Desktop restore reports failure after bounded retries without touching res
   let launches = 0;
   let capturedError = null;
   await assert.rejects(() => restoreDesktopWithRetry({
-    runningPids: () => [],
+    readRoots: () => [],
     launch: () => { launches += 1; return { pid: 300 + launches }; },
     sleep: async () => {},
     startupTimeoutMs: 500,
@@ -301,6 +334,122 @@ test('Desktop restore reports failure after bounded retries without touching res
   assert.equal(launches, 2);
   assert.equal(capturedError.diagnostics.attempts.length, 2);
   assert.ok(capturedError.diagnostics.attempts.every(attempt => attempt.result === 'startup-timeout'));
+});
+
+test('restore rediscovers the stable Electron single-instance root after an initial discovery miss', async () => {
+  let launches = 0;
+  let observed = false;
+  const root = { pid: 4901, startTicks: 812345, cgroup: '/user.slice/codex-desktop-restore-900-1.service' };
+  const result = await restoreDesktopWithRetry({
+    readRoots: () => observed ? [root] : [],
+    launch: () => {
+      launches += 1;
+      if (launches === 2) observed = true; // Electron forwarded to the first instance.
+      return { pid: 6000 + launches, unit: `codex-desktop-restore-900-${launches}.service` };
+    },
+    sleep: async () => {},
+    startupTimeoutMs: 2,
+    stableMs: 2,
+    pollMs: 1,
+    retryDelayMs: 1,
+  });
+  assert.equal(launches, 2);
+  assert.equal(result.desktopPid, root.pid);
+  assert.equal(result.desktopStartTicks, root.startTicks);
+  assert.equal(result.desktopCgroup, root.cgroup);
+  assert.equal(result.history[0].result, 'startup-timeout');
+  assert.equal(result.history[1].result, 'ready');
+
+  const entries = [
+    { ...root, ppid: 1, state: 'S', args: ['/usr/lib/chatgpt/ChatGPT'] },
+    { pid: 4902, ppid: 1, startTicks: 812346, cgroup: root.cgroup,
+      state: 'S', args: ['/usr/bin/codex', 'app-server'] },
+    { pid: 4903, ppid: 1, startTicks: 812347, cgroup: '/user.slice/foreign.service',
+      state: 'S', args: ['/usr/bin/codex', 'app-server'] },
+  ];
+  const lineage = captureDesktopLineage(entries, [root.pid]);
+  const report = appServerExclusivityReport(entries, { desktopLineage: lineage });
+  assert.equal(report.blockers.find(item => item.pid === 4902).role, 'desktop-app-server');
+  assert.equal(report.blockers.find(item => item.pid === 4903).role, 'other-app-server');
+});
+
+test('Desktop root discovery uses executable identity and excludes renderer and zombie processes', () => {
+  const binary = '/usr/lib/chatgpt/ChatGPT';
+  assert.equal(isDesktopRootProcess({ exe: binary, args: ['chatgpt'], state: 'S' }, binary), true);
+  assert.equal(isDesktopRootProcess({ exe: binary, args: [binary, '--type=renderer'], state: 'S' }, binary), false);
+  assert.equal(isDesktopRootProcess({ exe: binary,
+    args: [`${binary} --type=renderer --crashpad-handler-pid=123`], state: 'S' }, binary), false);
+  assert.equal(isDesktopRootProcess({ exe: binary,
+    args: [`${binary} --type=utility --utility-sub-type=node.mojom.NodeService`], state: 'S' }, binary), false);
+  assert.equal(isDesktopRootProcess({ exe: binary,
+    args: [`${binary} --force-renderer-accessibility`], state: 'S' }, binary), true);
+  assert.equal(isDesktopRootProcess({ exe: binary, args: [], state: 'S' }, binary), false);
+  assert.equal(isDesktopRootProcess({ exe: binary, args: [binary], state: 'Z' }, binary), false);
+  assert.equal(isDesktopRootProcess({ exe: '/usr/bin/other', args: [binary], state: 'S' }, binary), false);
+});
+
+test('restore treats a Chromium root plus same-binary helpers in its unit as one Desktop', async () => {
+  const binary = '/usr/lib/chatgpt/ChatGPT';
+  const entries = [
+    { pid: 1425451, startTicks: 69097853, state: 'S', exe: binary,
+      args: [`${binary} --force-renderer-accessibility`], cgroup: '/app.slice/app-org.chromium.Chromium-1425451.scope' },
+    ...[1425461, 1425462, 1425464, 1425500, 1425502, 1425514, 1425812, 1425813]
+      .map((pid, index) => ({ pid, startTicks: 69097858 + index, state: 'S', exe: binary,
+        args: [`${binary} --type=${index % 2 ? 'renderer' : 'utility'} --no-sandbox`],
+        cgroup: '/app.slice/codex-desktop-restore-1424921-1.service' })),
+  ];
+  const roots = entries.filter(entry => isDesktopRootProcess(entry, binary));
+  assert.deepEqual(roots.map(entry => entry.pid), [1425451]);
+  const result = await restoreDesktopWithRetry({
+    readRoots: () => roots, launch: () => { throw new Error('unexpected launch'); },
+    sleep: async () => {}, stableMs: 2, pollMs: 1,
+  });
+  assert.equal(result.desktopPid, 1425451);
+  assert.equal(result.launched, false);
+});
+
+test('Desktop restore does not accept PID reuse as a stable root', async () => {
+  let startTicks = 100;
+  await assert.rejects(() => restoreDesktopWithRetry({
+    readRoots: () => [{ pid: 42, startTicks }],
+    launch: () => ({ pid: 99 }),
+    sleep: async () => { startTicks += 1; },
+    attempts: 1, stableMs: 2, pollMs: 1, startupTimeoutMs: 1,
+  }), /DESKTOP_RESTORE_FAILED/);
+});
+
+test('overlapping Desktop roots settle before restore accepts the surviving identity', async () => {
+  let ticks = 0;
+  let launches = 0;
+  const root = { pid: 52, startTicks: 500, cgroup: '/app.slice/new.scope' };
+  const restored = await restoreDesktopWithRetry({
+    readRoots: () => ticks < 2 ? [{ pid: 51, startTicks: 400 }, root] : [root],
+    launch: () => { launches += 1; },
+    sleep: async () => { ticks += 1; },
+    stableMs: 2, pollMs: 1, ambiguityTimeoutMs: 3,
+  });
+  assert.equal(restored.desktopPid, 52);
+  assert.equal(launches, 0);
+});
+
+test('persistent root ambiguity fails closed with process identities and no launch', async () => {
+  let launches = 0;
+  await assert.rejects(() => restoreDesktopWithRetry({
+    readRoots: () => [{ pid: 51, startTicks: 400, cgroup: '/a.scope' },
+      { pid: 52, startTicks: 500, cgroup: '/b.scope' }],
+    launch: () => { launches += 1; }, sleep: async () => {},
+    pollMs: 1, ambiguityTimeoutMs: 2,
+  }), error => error?.message === 'DESKTOP_ROOT_AMBIGUOUS' &&
+    error.diagnostics.roots.length === 2 && error.diagnostics.roots[0].startTicks === 400);
+  assert.equal(launches, 0);
+});
+
+test('restore errors from acquisition and finalization are classified for the retry latch', () => {
+  for (const kind of ['DESKTOP_ROOT_AMBIGUOUS', 'DESKTOP_RESTORE_FAILED',
+    'DESKTOP_ROOT_IDENTITY_UNVERIFIED', 'DESKTOP_ROOT_PID_UNVERIFIED']) {
+    assert.equal(isDesktopRestoreError(new Error(kind)), true);
+  }
+  assert.equal(isDesktopRestoreError(new Error('APP_SERVER_EXCLUSIVITY_FAILED')), false);
 });
 
 test('Desktop restore launch uses a transient user service instead of controller ownership', () => {

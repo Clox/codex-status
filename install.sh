@@ -12,11 +12,67 @@ config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/codex-account-switcher"
 config_file="$config_dir/accounts.conf"
 systemd_user_dir="$HOME/.config/systemd/user"
 backup_dir="$HOME/.local/state/codex-auth-setup-backups/$(date +%Y%m%d-%H%M%S)"
+mode=${1:---verify}
+
+case "$mode" in
+  --verify|--update|--fresh) ;;
+  *) printf 'Usage: %s [--verify|--update|--fresh]\n' "$0" >&2; exit 64 ;;
+esac
+(( $# <= 1 )) || { printf 'Unexpected arguments\n' >&2; exit 64; }
 
 fail() {
   printf 'Error: %s\n' "$*" >&2
   exit 1
 }
+
+# Existing installations keep their configuration, journals, preferences, and
+# systemd enabled/active states. Verification is the default operation.
+payload_files() {
+  local source_dir source_file destination_dir
+  for source_dir in "$bin_source" "$lib_source" "$systemd_source"; do
+    case "$source_dir" in
+      "$bin_source") destination_dir=$local_bin ;;
+      "$lib_source") destination_dir=$local_lib ;;
+      *) destination_dir=$systemd_user_dir ;;
+    esac
+    for source_file in "$source_dir"/*; do
+      [[ -f $source_file ]] || continue
+      printf '%s\t%s\n' "$source_file" "$destination_dir/${source_file##*/}"
+    done
+  done
+}
+
+if [[ $mode == --verify || $mode == --update ]]; then
+  [[ -r $config_file ]] || fail 'no existing accounts.conf; use --fresh for an explicit first installation'
+  changed=0
+  while IFS=$'\t' read -r source_file destination_file; do
+    if [[ -f $destination_file ]] && cmp -s -- "$source_file" "$destination_file"; then
+      continue
+    fi
+    changed=$((changed + 1))
+    printf '%s: %s\n' "${mode#--}" "$destination_file"
+    if [[ $mode == --update ]]; then
+      if [[ -e $destination_file ]]; then
+        backup_target="$backup_dir/${destination_file#"$HOME"/}"
+        mkdir -p -- "${backup_target%/*}"
+        cp -a -- "$destination_file" "$backup_target"
+      fi
+      mkdir -p -- "${destination_file%/*}"
+      temporary_file=$(mktemp "${destination_file}.install.XXXXXXXX")
+      if [[ $source_file == "$bin_source"/* ]]; then file_mode=0755; else file_mode=0644; fi
+      install -m "$file_mode" -- "$source_file" "$temporary_file"
+      mv -f -- "$temporary_file" "$destination_file"
+    fi
+  done < <(payload_files)
+  if [[ $mode == --verify && $changed -ne 0 ]]; then
+    printf '%s installed payload files differ from this checkout\n' "$changed" >&2
+    exit 1
+  fi
+  printf '%s: %s payload files differ\n' "${mode#--}" "$changed"
+  exit 0
+fi
+
+[[ ! -e $config_file ]] || fail 'accounts.conf already exists; use --verify or --update to preserve the installation'
 
 for command_name in node npm python3 gnome-terminal gsettings dconf script setsid pgrep pkill systemctl systemd-run busctl flock wmctrl xprop sqlite3; do
   command -v "$command_name" >/dev/null 2>&1 || fail "required command is missing: $command_name"
@@ -84,6 +140,8 @@ backup_if_present "$local_bin/codex-account-state"
 backup_if_present "$local_bin/codex-auto-continue"
 backup_if_present "$local_bin/codex-continuation-drafts"
 backup_if_present "$local_bin/codex-desktop-atspi"
+backup_if_present "$local_bin/codex-account-manager"
+backup_if_present "$local_lib/codex-account-manager.js"
 backup_if_present "$local_bin/codex-auth-repair"
 backup_if_present "$local_bin/codex-usage-launch"
 backup_if_present "$local_bin/codex-usage-watch"
@@ -103,7 +161,9 @@ backup_if_present "$local_lib/codex-account-ranking.js"
 backup_if_present "$local_lib/codex-attention-policy.js"
 backup_if_present "$local_lib/codex-account-state.js"
 backup_if_present "$local_lib/codex-auto-continue.js"
+backup_if_present "$local_lib/codex-headless-storage-preflight.js"
 backup_if_present "$local_lib/codex-continuation-drafts.js"
+backup_if_present "$local_lib/codex-continuation-ownership.js"
 backup_if_present "$local_lib/codex-desktop-auto.js"
 backup_if_present "$local_lib/codex-auth-repair.js"
 backup_if_present "$local_lib/codex-reset-credits.js"
@@ -137,6 +197,8 @@ install -m 0755 "$bin_source/codex-account-state" "$local_bin/codex-account-stat
 install -m 0755 "$bin_source/codex-auto-continue" "$local_bin/codex-auto-continue"
 install -m 0755 "$bin_source/codex-continuation-drafts" "$local_bin/codex-continuation-drafts"
 install -m 0755 "$bin_source/codex-desktop-atspi" "$local_bin/codex-desktop-atspi"
+install -m 0755 "$bin_source/codex-account-manager" "$local_bin/codex-account-manager"
+install -m 0644 "$lib_source/codex-account-manager.js" "$local_lib/codex-account-manager.js"
 install -m 0755 "$bin_source/codex-auth-repair" "$local_bin/codex-auth-repair"
 install -m 0755 "$bin_source/codex-usage-launch" "$local_bin/codex-usage-launch"
 install -m 0755 "$bin_source/codex-usage-watch" "$local_bin/codex-usage-watch"
@@ -156,7 +218,9 @@ install -m 0644 "$lib_source/codex-account-ranking.js" "$local_lib/codex-account
 install -m 0644 "$lib_source/codex-attention-policy.js" "$local_lib/codex-attention-policy.js"
 install -m 0644 "$lib_source/codex-account-state.js" "$local_lib/codex-account-state.js"
 install -m 0644 "$lib_source/codex-auto-continue.js" "$local_lib/codex-auto-continue.js"
+install -m 0644 "$lib_source/codex-headless-storage-preflight.js" "$local_lib/codex-headless-storage-preflight.js"
 install -m 0644 "$lib_source/codex-continuation-drafts.js" "$local_lib/codex-continuation-drafts.js"
+install -m 0644 "$lib_source/codex-continuation-ownership.js" "$local_lib/codex-continuation-ownership.js"
 install -m 0644 "$lib_source/codex-desktop-auto.js" "$local_lib/codex-desktop-auto.js"
 install -m 0644 "$lib_source/codex-auth-repair.js" "$local_lib/codex-auth-repair.js"
 install -m 0644 "$lib_source/codex-reset-credits.js" "$local_lib/codex-reset-credits.js"
@@ -186,7 +250,7 @@ escape_config_value() {
 }
 
 {
-  printf '# Generated locally by Spadrig tools/workstation/codex-auth/install.sh\n'
+  printf '# Generated locally by codex-status/install.sh\n'
   printf '# Contains account selectors; keep mode 0600 and never commit this file.\n'
   printf 'ACCOUNT_1=%s\n' "$(escape_config_value "$account_1")"
   printf 'ACCOUNT_2=%s\n' "$(escape_config_value "$account_2")"
@@ -224,9 +288,7 @@ CODEX_STATUS_PREFERENCES="$config_dir/status-preferences.json" \
   "$local_bin/codex-status-preferences" migrate >/dev/null
 
 systemctl --user daemon-reload
-systemctl --user enable --now codex-five-hour-activation.timer
-systemctl --user enable --now codex-auto-continue.timer
-systemctl --user enable --now codex-turn-observer.service
+printf 'Units installed but not enabled or started. Review them before enabling any timer or service.\n'
 
 for account_number in 1 2 3; do
   desktop_file="$applications_dir/codex-account${account_number}.desktop"

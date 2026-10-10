@@ -24,7 +24,38 @@ const cacheHome = process.env.XDG_CACHE_HOME || path.join(process.env.HOME || os
 const autoStatePath = process.env.CODEX_AUTO_CONTINUE_STATE || path.join(
   cacheHome, 'codex-account-switcher', 'auto-continue.json'
 );
+const operationLockPath = process.env.CODEX_OPERATION_LOCK_DIR || path.join(
+  path.dirname(autoStatePath), 'exclusive-codex-operation.lock'
+);
 const command = process.argv[2] || 'show';
+
+function withOperationLock(action) {
+  fs.mkdirSync(path.dirname(operationLockPath), { recursive: true, mode: 0o700 });
+  try {
+    fs.mkdirSync(operationLockPath, { mode: 0o700 });
+  } catch (error) {
+    if (error?.code !== 'EEXIST') throw error;
+    let owner;
+    let stale = false;
+    try { owner = Number(fs.readFileSync(path.join(operationLockPath, 'owner'), 'utf8').trim()); } catch {}
+    if (Number.isInteger(owner) && owner > 0) {
+      try { process.kill(owner, 0); } catch (failure) {
+        if (failure?.code === 'EPERM') throw new Error('AUTO_MODE_CHANGE_BUSY');
+        if (failure?.code !== 'ESRCH') throw failure;
+        stale = true;
+      }
+    }
+    if (!stale) throw new Error('AUTO_MODE_CHANGE_BUSY');
+    try { fs.unlinkSync(path.join(operationLockPath, 'owner')); } catch {}
+    fs.rmdirSync(operationLockPath);
+    fs.mkdirSync(operationLockPath, { mode: 0o700 });
+  }
+  fs.writeFileSync(path.join(operationLockPath, 'owner'), `${process.pid}\n`, { mode: 0o600 });
+  try { return action(); } finally {
+    try { fs.unlinkSync(path.join(operationLockPath, 'owner')); } catch {}
+    fs.rmdirSync(operationLockPath);
+  }
+}
 
 function readAutoState() {
   try {
@@ -42,11 +73,14 @@ try {
   } else if (command === 'migrate') {
     preferences = writeStatusPreferences(statePath, readStatusPreferences(statePath));
   } else if (command === 'toggle-auto-continue') {
-    preferences = toggleAutoContinue(statePath);
-    writeAutoContinueStateFile(
-      autoStatePath,
-      resetAutoContinueForToggle(readAutoState(), preferences.autoMode)
-    );
+    preferences = withOperationLock(() => {
+      const next = toggleAutoContinue(statePath);
+      writeAutoContinueStateFile(
+        autoStatePath,
+        resetAutoContinueForToggle(readAutoState(), next.autoMode)
+      );
+      return next;
+    });
   } else if (command === 'cancel-auto-pending') {
     preferences = readStatusPreferences(statePath);
     const result = cancelPendingAction(readAutoState());

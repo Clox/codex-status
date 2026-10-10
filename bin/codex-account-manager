@@ -1,0 +1,112 @@
+#!/usr/bin/env node
+'use strict';
+
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const readline = require('node:readline/promises');
+const { spawnSync, spawn } = require('node:child_process');
+const { accountsFromRegistry, accountId } = require('../lib/codex-auth-repair');
+const { resolveActiveAccount, upstreamSelector } = require('../lib/codex-account-state');
+const { acquireAccountActivationLock, releaseAccountActivationLock } = require('../lib/codex-activation-lock');
+const { acquireOperationLock, validateAddition, validateRemoval, verifyMutation, safeLabel } = require('../lib/codex-account-manager');
+
+const home = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+const cache = path.dirname(process.env.USAGE_CACHE || path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache'), 'codex-account-switcher', 'usage.json'));
+const registryFile = path.join(home, 'accounts', 'registry.json');
+const authFile = path.join(home, 'auth.json');
+const authBin = process.env.CODEX_AUTH_BIN || 'codex-auth';
+const readRegistry = () => JSON.parse(fs.readFileSync(registryFile, 'utf8'));
+const readAuth = () => fs.readFileSync(authFile);
+const commandEnv = { ...process.env, CODEX_HOME: home, CODEX_AUTH_SKIP_SERVICE_RECONCILE: '1', CODEX_AUTH_DISABLE_BACKGROUND_ACCOUNT_NAME_REFRESH: '1' };
+let terminal;
+let release;
+let staging;
+let activationLock;
+
+function cleanup() {
+  releaseAccountActivationLock(activationLock);
+  activationLock = null;
+  if (staging) fs.rmSync(staging, { recursive: true, force: true });
+  staging = null;
+  if (release) { release(); release = null; }
+}
+
+function run(args, env = commandEnv) {
+  // No credential-bearing child output is retained or logged.
+  const result = spawnSync(authBin, args, { env, stdio: args[0] === 'login' ? 'inherit' : 'ignore' });
+  if (result.error || result.status !== 0) throw new Error('codex-auth slutförde inte åtgärden. Kontrollera kontolistan innan du försöker igen.');
+}
+
+async function ask(prompt) {
+  terminal = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try { return (await terminal.question(prompt)).trim(); }
+  finally { terminal.close(); terminal = null; }
+}
+
+async function main() {
+  if (!process.stdin.isTTY) throw new Error('Kontohanteringen behöver en interaktiv terminal.');
+  release = acquireOperationLock(process.env.CODEX_OPERATION_LOCK_DIR || path.join(cache, 'exclusive-codex-operation.lock'));
+  const registry = readRegistry();
+  const accounts = accountsFromRegistry(registry);
+  process.stdout.write('Codex-konton\n\n');
+  accounts.forEach((a, i) => process.stdout.write(`${i + 1}. ${safeLabel(a)}${a.account_key === registry.active_account_key ? ' (aktivt)' : ''}\n`));
+  const action = (await ask('\n[L] Lägg till  [T] Ta bort  [B] Byt konto  [Enter] Avbryt: ')).toLowerCase();
+  if (!['l', 't', 'b'].includes(action)) return;
+  if (action === 'l') {
+    resolveActiveAccount(registry, JSON.parse(readAuth()));
+    staging = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-account-login-'));
+    fs.chmodSync(staging, 0o700);
+    fs.writeFileSync(path.join(staging, 'config.toml'), 'cli_auth_credentials_store = "file"\nforced_login_method = "chatgpt"\n', { mode: 0o600 });
+    process.stdout.write('\nLogga in med kontot du vill lägga till. Det aktiva kontot behålls.\n');
+    const loginBin = process.env.CODEX_LOGIN_BIN || '/usr/lib/chatgpt/resources/codex';
+    const loginEnv = { ...commandEnv, CODEX_HOME: staging, PATH: `${path.dirname(loginBin)}:${process.env.PATH}` };
+    run(['config', 'api', 'disable'], loginEnv);
+    run(['login'], loginEnv);
+    const before = readRegistry();
+    const globalBefore = readAuth();
+    resolveActiveAccount(before, JSON.parse(globalBefore));
+    const target = validateAddition(before,
+      JSON.parse(fs.readFileSync(path.join(staging, 'accounts', 'registry.json'), 'utf8')),
+      JSON.parse(fs.readFileSync(path.join(staging, 'auth.json'), 'utf8')));
+    if ((await ask(`Lägg till \x1b[1m${safeLabel(target)}\x1b[0m? [j/N]: `)).toLowerCase() !== 'j') return;
+    // Revalidate after the confirmation, immediately before handing off to upstream.
+    if (!readAuth().equals(globalBefore) || JSON.stringify(readRegistry()) !== JSON.stringify(before)) throw new Error('Kontoläget ändrades. Försök igen.');
+    run(['import', path.join(staging, 'auth.json')]);
+    verifyMutation(before, readRegistry(), target.account_key, 'add', globalBefore, readAuth());
+    process.stdout.write('\nKontot har lagts till. Statuslistan uppdateras automatiskt.\n');
+  } else {
+    const choice = await ask('Kontonummer (Enter avbryter): ');
+    if (!choice) return;
+    const target = /^\d+$/.test(choice) ? accounts[Number(choice) - 1] : null;
+    if (!target) throw new Error('Ogiltigt kontonummer.');
+    if (action === 'b') {
+      const key = Buffer.from(target.account_key).toString('base64url');
+      cleanup();
+      const child = spawn(process.env.ACCOUNT_SWITCHER || path.join(os.homedir(), '.local/bin/codex-account'), ['--key', key, '--desktop'], { detached: true, stdio: 'ignore', env: process.env });
+      child.on('error', () => process.stderr.write('Kontobytet kunde inte startas.\n'));
+      child.unref();
+      return;
+    }
+    validateRemoval(readRegistry(), JSON.parse(readAuth()), target.account_key);
+    if ((await ask(`Ta bort \x1b[1m${safeLabel(target)}\x1b[0m från sparade konton? [j/N]: `)).toLowerCase() !== 'j') return;
+    activationLock = acquireAccountActivationLock(path.join(cache, 'activation-locks'), accountId(target));
+    const before = readRegistry();
+    const globalBefore = readAuth();
+    validateRemoval(before, JSON.parse(globalBefore), target.account_key);
+    run(['remove', upstreamSelector(before, target.account_key)]);
+    verifyMutation(before, readRegistry(), target.account_key, 'remove', globalBefore, readAuth());
+    process.stdout.write('\nKontot har tagits bort från listan. Samtalshistoriken finns kvar.\n');
+  }
+}
+
+process.once('SIGTERM', () => { cleanup(); process.exit(143); });
+process.once('SIGHUP', () => { cleanup(); process.exit(129); });
+process.once('SIGINT', () => { cleanup(); process.exit(130); });
+main().catch(error => {
+  process.stderr.write(`\n${error.message}\n`);
+  process.exitCode = 1;
+}).finally(async () => {
+  cleanup();
+  if (process.argv.includes('--hold') && process.stdin.isTTY) await ask('\nTryck Enter för att stänga.');
+});

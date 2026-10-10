@@ -49,7 +49,7 @@ const {
 } = require(path.join(__dirname, '..', 'lib', 'codex-status-preferences'));
 const {
   autoContinueStatusLine,
-  autoContinueProblemLine,
+  autoContinueProblemLines,
   emptyAutoContinueState,
   normalizeAutoContinueState,
   pendingAttentionDecision,
@@ -96,13 +96,14 @@ const autoContinueStatePath = process.env.CODEX_AUTO_CONTINUE_STATE || path.join
   'auto-continue.json'
 );
 const input = fs.readFileSync(0, 'utf8').replace(/\r/g, '');
-const mappingOnly = process.argv.includes('--key-map');
+const stableMapping = process.argv.includes('--switch-map');
+const mappingOnly = stableMapping || process.argv.includes('--key-map');
 const resumeMappingOnly = process.argv.includes('--resume-map');
 const attentionOnly = process.argv.includes('--attention-state');
 const availabilityOnly = process.argv.includes('--availability-state');
 const rankingEnabled = mappingOnly || resumeMappingOnly || attentionOnly || availabilityOnly || process.env.CODEX_STATUS_RANKING === '1';
 const pendingSourceCandidate = process.env.CODEX_PENDING_SOURCE_ROW || process.env.CODEX_PENDING_ROW || '';
-const pendingSourceRow = /^(1|2|3)$/.test(pendingSourceCandidate)
+const pendingSourceRow = /^[1-9][0-9]*$/.test(pendingSourceCandidate)
   ? pendingSourceCandidate
   : null;
 const pendingStatusCandidate = process.env.CODEX_PENDING_STATUS || 'WAIT/';
@@ -266,7 +267,7 @@ if (availabilityOnly) {
 
 if (mappingOnly) {
   process.stdout.write(rankedRows
-    .map(row => `${row.rank}\t${row.sourceRow}\t${row.active ? 'active' : '-'}\t${row.accountNumber}`)
+    .map(row => `${row.rank}\t${row.sourceRow}\t${row.active ? 'active' : '-'}\t${stableMapping ? (row.accountKey ? Buffer.from(row.accountKey).toString('base64url') : '-') : row.accountNumber}`)
     .join('\n'));
   process.exit(0);
 }
@@ -374,7 +375,7 @@ const problems = [
   statusPreferencesError
     ? `AUTO-CONTINUE CONFIG ERROR / ACTION REQUIRED: ${statusPreferencesError}; AUTO-CONTINUE är fail-closed OFF.`
     : null,
-  autoContinueProblemLine(autoContinueState, statusPreferences.autoContinue === true),
+  ...(autoContinueProblemLines(autoContinueState, statusPreferences.autoContinue === true) || []),
   ...interruptedCandidateProblemLines(eventState, resumeState, {
     autoContinue: statusPreferences.autoContinue === true,
   }),

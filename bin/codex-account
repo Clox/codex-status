@@ -54,7 +54,7 @@ release_operation_lock() {
 }
 
 usage() {
-  printf 'Usage: codex-account <1|2|3> [--desktop] [desktop arguments...]\n' >&2
+  printf 'Usage: codex-account <1|2|3|--key BASE64URL> [--desktop] [desktop arguments...]\n' >&2
   exit 64
 }
 
@@ -62,6 +62,12 @@ usage() {
 acquire_operation_lock
 account_number=$1
 case "$account_number" in
+  --key)
+    [[ ${2:-} =~ ^[A-Za-z0-9_-]+$ ]] || usage
+    account_selector=$(node -e 'process.stdout.write(Buffer.from(process.argv[1], "base64url").toString("utf8"))' "$2")
+    [[ -n $account_selector ]] || usage
+    shift
+    ;;
   1) account_selector=${ACCOUNT_1:?ACCOUNT_1 is not configured} ;;
   2) account_selector=${ACCOUNT_2:?ACCOUNT_2 is not configured} ;;
   3) account_selector=${ACCOUNT_3:?ACCOUNT_3 is not configured} ;;
@@ -69,13 +75,15 @@ case "$account_number" in
 esac
 shift
 
-expected_state=$("$ACCOUNT_STATE_CHECKER" resolve "$CODEX_HOME" "$account_selector") || {
+resolve_mode=resolve
+[[ $account_number != --key ]] || resolve_mode=resolve-key
+expected_state=$("$ACCOUNT_STATE_CHECKER" "$resolve_mode" "$CODEX_HOME" "$account_selector") || {
   message='Kunde inte entydigt koppla launchern till sparad account-state. Kontobytet avbröts.'
   notify-send 'Codex-kontobyte stoppat' "$message" 2>/dev/null || true
   printf '%s\n' "$message" >&2
   exit 3
 }
-IFS=$'\t' read -r expected_account_id expected_account_key <<<"$expected_state"
+IFS=$'\t' read -r expected_account_id expected_account_key upstream_selector <<<"$expected_state"
 [[ -n $expected_account_id && -n $expected_account_key ]] || usage
 
 launch_desktop=false
@@ -129,7 +137,7 @@ if [[ $launch_desktop == true ]] && desktop_running; then
   fi
 fi
 
-if ! "$CODEX_AUTH_BIN" switch "$account_selector"; then
+if ! "$CODEX_AUTH_BIN" switch "${upstream_selector:-$account_selector}"; then
   message='codex-auth kunde inte byta konto. Kör codex-auth list i en terminal för detaljer.'
   notify-send 'Codex-kontobyte misslyckades' "$message" 2>/dev/null || true
   printf '%s\n' "$message" >&2
@@ -167,4 +175,4 @@ if [[ $launch_desktop == true ]]; then
   exit 0
 fi
 
-printf 'Konto %s är nu valt. Starta om Codex Desktop eller kör "Developer: Reload Window" i VS Code.\n' "$account_number"
+printf 'Kontot är nu valt. Starta om Codex Desktop eller kör "Developer: Reload Window" i VS Code.\n'

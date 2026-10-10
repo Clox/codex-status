@@ -86,10 +86,10 @@ The scripts here terminate Codex Desktop politely and wait up to 15 seconds. The
 7. Run the repository installer. It asks for the exact unique selector of each account in the same top-to-bottom order shown by `codex-auth list`:
 
    ```bash
-   tools/workstation/codex-auth/install.sh
+   ./install.sh --fresh
    ```
 
-   The installer only writes user-local utilities, launchers, a private selector config, and a dedicated GNOME Terminal profile. It first backs up files it will replace under `$HOME/.local/state/codex-auth-setup-backups/`. It does not copy or modify conversation files.
+   Fresh installation writes user-local utilities, launchers, a private selector config, and a dedicated GNOME Terminal profile. It first backs up files it will replace under `$HOME/.local/state/codex-auth-setup-backups/`. It does not copy or modify conversation files. It installs systemd units without enabling or starting them. Review each unit before enabling it. On an existing installation, use `./install.sh --verify` for a read-only comparison or `./install.sh --update` to update only changed installed program/library/unit files while preserving configuration, journals, preferences, and unit states.
 
 ## Daily workflow
 
@@ -125,7 +125,7 @@ The status window retains quota-interrupted thread identity as diagnostics but n
 
 The installed Desktop accepts `codex://threads/<threadId>?prompt=...` and populates an unsent composer draft. A no-send live test on this installed version verified per-thread persistence across the sequence A-with-draft, B-with-draft, reopen A, reopen B: both distinct drafts remained intact and no turn was created. The direct `/usr/lib/chatgpt/ChatGPT <deeplink>` invocation reaches the already running Codex profile; the generic desktop URI launchers did not reliably reach that instance. This remains locally verified behavior rather than a documented public OpenAI contract.
 
-For a manual `1`–`3` switch launched from the status window, the switcher now takes a credential-free preflight snapshot before leaving the active account. It prepares continuation drafts only when the source account has fresh VERIFIED usage, persistent verified terminal exhaustion, a healthy turn observer, and one or more current quota-interrupted main-thread candidates. Guardian/subagent candidates and already committed controller resumes are excluded. After the ordinary codex-auth switch and its existing auth postcondition, the switcher refreshes server usage, starts Desktop, and revalidates the target auth, fresh VERIFIED target usability, source exhaustion, observer health, and the exact unchanged candidate set. `INTERRUPTED_AFTER_WORK` receives the fixed continuation text as an unsent `prompt=` draft. A text-only `REJECTED_BEFORE_WORK` receives the exact original text instead; structured input that cannot be represented losslessly by the Desktop deep link opens the correct thread without injecting a prompt and is marked for manual resend. `UNKNOWN` never receives a draft. Candidates are opened oldest-to-newest so the newest relevant thread remains visible. No `turn/start`, Send action, keyboard event, AT-SPI action, or banked reset is involved. The user has explicitly accepted that a verified continuation prefill may replace an existing draft in those quota-interrupted threads. Ordinary account switches never inject drafts; any stale, ambiguous, or changed state skips draft injection while leaving the verified account switch intact.
+For a manual `1`–`3` switch launched from the status window, the switcher now takes a credential-free preflight snapshot before leaving the active account. With `AUTO: OFF`, it prepares continuation drafts only when the source account has fresh VERIFIED usage, persistent verified terminal exhaustion, a healthy turn observer, and one or more current quota-interrupted main-thread candidates. Guardian/subagent candidates and already committed controller resumes are excluded. After the ordinary codex-auth switch and its existing auth postcondition, the switcher refreshes server usage, starts Desktop, and revalidates the target auth, fresh VERIFIED target usability, source exhaustion, observer health, and the exact unchanged candidate set. `INTERRUPTED_AFTER_WORK` receives the fixed continuation text as an unsent `prompt=` draft. A text-only `REJECTED_BEFORE_WORK` receives the exact original text instead; structured input that cannot be represented losslessly by the Desktop deep link opens the correct thread without injecting a prompt and is marked for manual resend. `UNKNOWN` never receives a draft. Candidates are opened oldest-to-newest so the newest relevant thread remains visible. No `turn/start`, Send action, keyboard event, AT-SPI action, or banked reset is involved. The user has explicitly accepted that a verified continuation prefill may replace an existing draft in those quota-interrupted threads. Ordinary account switches never inject drafts; any stale, ambiguous, or changed state skips draft injection while leaving the verified account switch intact.
 
 The status window cycles `AUTO: OFF`, `AUTO: DESKTOP`, and `AUTO: HEADLESS` with `A`. The private mode-0600 preference under `$XDG_CONFIG_HOME/codex-account-switcher/` survives status-window restarts. A legacy enabled boolean migrates only to `HEADLESS`; `DESKTOP` is never enabled implicitly. `OFF` is the fail-closed default and never initiates an automatic switch or turn; manual `1`–`3` switching keeps the unsent Desktop-draft workflow described above. Either enabled strategy lets `codex-auto-continue.timer` inspect the persistent conservative interrupted-thread journal every 30 seconds, including candidates that predate the mode selection. Both wait without error while every VERIFIED account lacks usable quota and act only after the existing ranking selects a fresh VERIFIED usable account. Saved resets are never read as an action source and are never redeemed automatically.
 
@@ -185,6 +185,8 @@ AUTO-CONTINUE therefore treats any running VS Code Codex App Server, or an uncla
 
 ## Verification
 
+Continuation ownership is selected for each exact `(threadId, failedTurnId)` from the persisted AUTO mode. `HEADLESS` and `DESKTOP` reserve eligible candidates for their respective AUTO controllers, so a manual account switch still changes accounts and restarts Desktop but does not prefill those candidates. `OFF` retains the manual continuation-draft behavior. The switcher checks ownership again before each deep-link dispatch. Its credential-free `continuation-drafts.json` journal keeps bounded event history and a persistent claim for each dispatched manual draft without prompt text. If AUTO is enabled while such a candidate remains pending, AUTO stops with `MANUAL_DRAFT_OWNERSHIP_PENDING` rather than sending a competing continuation. An unresolved exclusivity block or Desktop restore failure remains in `ACCOUNT PROBLEMS` while the top-level AUTO state waits; a block moves to bounded history only after exclusivity is acquired or its candidate is no longer pending.
+
 Verify without reading or logging any auth file:
 
 1. Open an existing task under account 1 and add a harmless message.
@@ -222,6 +224,7 @@ Conversation visibility comes from the shared local state, not from copying auth
 - `$HOME/.local/lib/codex-attention-policy.js`
 - `$HOME/.local/lib/codex-account-state.js`
 - `$HOME/.local/lib/codex-auto-continue.js`
+- `$HOME/.local/lib/codex-continuation-ownership.js`
 - `$HOME/.local/lib/codex-continuation-drafts.js`
 - `$HOME/.local/lib/codex-desktop-auto.js`
 - `$HOME/.local/lib/codex-account-manager.js`
@@ -248,6 +251,7 @@ Conversation visibility comes from the shared local state, not from copying auth
 - `$HOME/.cache/codex-account-switcher/status-window-v2.lock` — singleton lock for the status window; detached Desktop/switch/refresh children explicitly close its descriptor
 - `$HOME/.cache/codex-account-switcher/turn-events.json` — mode `0600`, credential-free active-turn, terminal-exhaustion, interrupted-candidate, checkpoint, and observer-health state
 - `$HOME/.cache/codex-account-switcher/manual-resume.json` — mode `0600`, crash-safe `RESUME_COMMITTED`/terminal state; contains IDs and error kinds but no credentials
+- `$HOME/.cache/codex-account-switcher/continuation-drafts.json` — mode `0600`, bounded manual draft eligibility and deep-link dispatch diagnostics without credentials or prompt text
 - `$HOME/.cache/codex-account-switcher/auto-continue.json` — mode `0600`, credential-free AUTO heartbeat, waiting/blocker, pending countdown/suppression fingerprints, and last-success state
 - `$HOME/.cache/codex-account-switcher/vscode-normalize-result.json` — mode `0600`, credential-free VS Code normalization result and diagnostics
 - `$HOME/.cache/codex-account-switcher/quota-transition.json` — mode `0600`, credential-free total-exhaustion/recovery notification state
@@ -262,4 +266,4 @@ Conversation visibility comes from the shared local state, not from copying auth
 
 Backups created by the installer are local-only under `$HOME/.local/state/codex-auth-setup-backups/`.
 
-Account-management regression checks: `node --test tools/workstation/codex-auth/test/codex-account-manager.test.js` and `python3 tools/workstation/codex-auth/test/codex-account-manager.integration.py`. The integration check uses the installed `codex-auth` with synthetic credentials, a fake login executable, and temporary homes; it never signs in to a real account.
+Account-management regression checks: `node --test test/codex-account-manager.test.js` and `python3 test/codex-account-manager.integration.py`. The integration check uses the installed `codex-auth` with synthetic credentials, a fake login executable, and temporary homes; it never signs in to a real account.

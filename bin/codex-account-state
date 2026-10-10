@@ -5,6 +5,7 @@
 const fs = require('fs');
 const path = require('path');
 const {
+  upstreamSelector,
   resolveActiveAccount,
   resolveExpectedAccount,
   verifyActiveAccountState,
@@ -16,7 +17,7 @@ function fail(message, code = 1) {
 }
 
 const [command, codexHome, ...args] = process.argv.slice(2);
-if (!['active', 'resolve', 'verify'].includes(command) || !codexHome) {
+if (!['active', 'resolve', 'resolve-key', 'verify'].includes(command) || !codexHome) {
   fail('Usage: codex-account-state active <CODEX_HOME> | resolve <CODEX_HOME> <selector> | verify <CODEX_HOME> <account-id> <account-key>', 64);
 }
 
@@ -30,11 +31,15 @@ try {
     const globalAuth = readJson(path.join(codexHome, 'auth.json'));
     const active = resolveActiveAccount(registry, globalAuth);
     process.stdout.write(`${active.accountId}\t${active.accountKey}\n`);
-  } else if (command === 'resolve') {
+  } else if (command === 'resolve' || command === 'resolve-key') {
     const [selector] = args;
     if (!selector) fail('Missing account selector', 64);
+    if (command === 'resolve-key') {
+      const accounts = Array.isArray(registry.accounts) ? registry.accounts : Object.values(registry.accounts || {});
+      if (accounts.filter(account => account.account_key === selector).length !== 1) fail('Account key no longer exists', 3);
+    }
     const expected = resolveExpectedAccount(registry, selector);
-    process.stdout.write(`${expected.accountId}\t${expected.accountKey}\n`);
+    process.stdout.write(`${expected.accountId}\t${expected.accountKey}\t${upstreamSelector(registry, expected.accountKey)}\n`);
   } else {
     const [expectedAccountId, expectedAccountKey] = args;
     if (!expectedAccountId || !expectedAccountKey) fail('Missing expected account state', 64);
