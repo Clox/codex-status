@@ -16,6 +16,7 @@ export PATH="$NODE_BIN_DIR:${PATH:-/usr/local/bin:/usr/bin:/bin}"
 export RESET_CREDITS_CACHE
 USAGE_REFRESHER=${USAGE_REFRESHER:-"$HOME/.local/bin/codex-usage-refresh"}
 USAGE_CACHE=${USAGE_CACHE:-"${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/usage.json"}
+STATUS_VIEWPORT_BIN=${CODEX_STATUS_VIEWPORT_BIN:-"$(dirname "$0")/codex-status-viewport"}
 AUTH_REPAIRER=${AUTH_REPAIRER:-"$HOME/.local/bin/codex-auth-repair"}
 CODEX_LOGIN_BIN=${CODEX_LOGIN_BIN:-/usr/lib/chatgpt/resources/codex}
 export ACCOUNT_SWITCHER
@@ -108,6 +109,10 @@ key_map=''
 last_background_refresh=-10
 paused_rendering=0
 last_drawn_frame=''
+last_drawn_input=''
+last_drawn_rows=''
+last_drawn_scroll_offset=''
+scroll_offset=0
 base_frame=''
 raw_frame=''
 attention_json='{"worthy":false,"observationKey":null}'
@@ -133,27 +138,35 @@ launch_usage_refresh() {
 
 draw_frame() {
   local frame_to_draw=$1
+  local rows layout_result rendered_frame
+  rows=$(tput lines 2>/dev/null || printf '24')
+  [[ $rows =~ ^[1-9][0-9]*$ ]] || rows=24
+  layout_result=$(printf '%s' "$frame_to_draw" |
+    CODEX_STATUS_LINES="$rows" CODEX_STATUS_SCROLL_OFFSET="$scroll_offset" \
+      CODEX_STATUS_PAUSED="$paused_rendering" "$STATUS_VIEWPORT_BIN") || return 1
+  scroll_offset=${layout_result%%$'\n'*}
+  rendered_frame=${layout_result#*$'\n'}
   tput rmam 2>/dev/null || printf '\033[?7l'
   tput cup 0 0 2>/dev/null || printf '\033[H'
   tput ed 2>/dev/null || printf '\033[J'
-  printf '%s\n' "$frame_to_draw"
-  if ((paused_rendering)); then
-    printf '\033[1;33mPAUSED — tryck [P] för att återuppta och uppdatera vyn.\033[0m\n'
-  fi
-  printf '\n\033[2mPRIOR = weekly %% remaining per hour until reset × 100. Higher means more urgent.\033[0m\n'
-  printf '\033[2mPress 1–9 for account, K to manage accounts, A for auto-continue or P to pause. Ctrl+C closes.\033[0m\n'
+  printf '%s' "$rendered_frame"
   tput ed 2>/dev/null || printf '\033[J'
   tput smam 2>/dev/null || printf '\033[?7h'
+  last_drawn_frame=$rendered_frame
+  last_drawn_input=$frame_to_draw
+  last_drawn_rows=$rows
+  last_drawn_scroll_offset=$scroll_offset
 }
 
 draw_current_frame() {
-  local display_frame=$base_frame
+  local display_frame=$base_frame rows
   if [[ -n $pending_source_row ]]; then
     display_frame=${display_frame//WAIT\//${pending_spinner_frames[$pending_spinner_index]}}
   fi
-  if ((!paused_rendering)) && [[ $display_frame != "$last_drawn_frame" ]]; then
+  rows=$(tput lines 2>/dev/null || printf '24')
+  if ((!paused_rendering)) && { [[ $display_frame != "$last_drawn_input" ]] ||
+      [[ $rows != "$last_drawn_rows" ]] || [[ $scroll_offset != "$last_drawn_scroll_offset" ]]; }; then
     draw_frame "$display_frame"
-    last_drawn_frame=$display_frame
   fi
 }
 
@@ -335,7 +348,7 @@ while true; do
           base_frame=$(printf '%s\n' "$raw_frame" |
             CODEX_STATUS_RANKING=1 CODEX_STATUS_COLUMNS="$columns" CODEX_PENDING_SOURCE_ROW="$pending_source_row" CODEX_PENDING_STATUS='WAIT/' CODEX_STATUS_NOW_MS="$status_now_ms" "$USAGE_ANNOTATOR")
           if ((!paused_rendering)); then
-            last_drawn_frame=''
+            last_drawn_input=''
             draw_current_frame
             pending_spinner_index=$(((pending_spinner_index + 1) % ${#pending_spinner_frames[@]}))
           fi
@@ -375,7 +388,7 @@ while true; do
       p|P)
         if ((paused_rendering)); then
           paused_rendering=0
-          last_drawn_frame=''
+          last_drawn_input=''
           force_render=1
           [[ -z $raw_frame ]] || process_snapshot
           force_render=0
@@ -387,7 +400,35 @@ while true; do
             frozen_frame=${frozen_frame//WAIT\//${pending_spinner_frames[$pending_spinner_index]}}
           fi
           draw_frame "$frozen_frame"
-          last_drawn_frame=$frozen_frame
+        fi
+        ;;
+      '['|']'|$'\e')
+        scroll_direction=0
+        scroll_page=0
+        case "$key" in
+          '[') scroll_direction=-1 ;;
+          ']') scroll_direction=1 ;;
+          $'\e')
+            escape_sequence=''
+            IFS= read -rsn 3 -t 0.03 escape_sequence </dev/tty || true
+            case "$escape_sequence" in
+              '[A') scroll_direction=-1 ;;
+              '[B') scroll_direction=1 ;;
+              '[5~') scroll_direction=-1; scroll_page=1 ;;
+              '[6~') scroll_direction=1; scroll_page=1 ;;
+            esac
+            ;;
+        esac
+        if ((!paused_rendering)) && ((scroll_direction != 0)); then
+          scroll_step=1
+          if ((scroll_page)); then
+            rows=$(tput lines 2>/dev/null || printf '24')
+            [[ $rows =~ ^[1-9][0-9]*$ ]] || rows=24
+            scroll_step=$((rows > 12 ? rows - 10 : 3))
+          fi
+          scroll_offset=$((scroll_offset + scroll_direction * scroll_step))
+          ((scroll_offset >= 0)) || scroll_offset=0
+          draw_current_frame
         fi
         ;;
     esac

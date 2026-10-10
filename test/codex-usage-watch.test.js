@@ -9,10 +9,9 @@ const source = fs.readFileSync(path.join(__dirname, '..', 'bin', 'codex-usage-wa
 const annotateSource = fs.readFileSync(path.join(__dirname, '..', 'bin', 'codex-usage-annotate'), 'utf8');
 
 test('status watch avoids unchanged redraws and exposes a render-only pause toggle', () => {
-  assert.match(source, /\[\[ \$display_frame != "\$last_drawn_frame" \]\]/);
+  assert.match(source, /\[\[ \$display_frame != "\$last_drawn_input" \]\]/);
   assert.match(source, /p\|P\)/);
-  assert.match(source, /PAUSED .*tryck \[P\]/);
-  assert.match(source, /P to pause/);
+  assert.match(source, /CODEX_STATUS_PAUSED="\$paused_rendering"/);
   assert.match(source, /if \(\(paused_rendering\)\); then\s+paused_rendering=0/);
 });
 
