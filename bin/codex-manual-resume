@@ -50,9 +50,11 @@ const {
   clearExclusivityBlock,
   emptyAutoContinueState,
   hasMatchingExclusivityBlock,
+  headlessDiagnosticCandidates,
   isAutoPlanSuppressed,
   normalizeAutoContinueState,
   pendingCountdownDecision,
+  partitionHeadlessCandidates,
   recordExclusivityBlock,
   resolveDesktopRestoreFailure,
   armAutomaticAttemptRetryHalt,
@@ -61,6 +63,8 @@ const {
   reconcileSuppression,
   requiresPendingCountdown,
   sameDecisionPlan,
+  sameHeadlessDecisionPlan,
+  selectHeadlessPlan,
   unresolvedExclusivityBlockerPresent,
 } = require(path.join(__dirname, '..', 'lib', 'codex-auto-continue'));
 const {
@@ -773,11 +777,12 @@ function sendPendingNotification(pending) {
   });
 }
 
-async function awaitPendingCountdown(expectedPlan) {
+async function awaitPendingCountdown(expectedPlan, blocked = []) {
   while (true) {
     const currentPlan = autoDecisionSnapshot();
-    if (!sameDecisionPlan(expectedPlan, currentPlan)) return 'changed';
-    const gate = pendingCountdownDecision(readAutoContinueState(), currentPlan, Date.now());
+    if (!sameHeadlessDecisionPlan(expectedPlan, currentPlan, blocked)) return 'changed';
+    const gate = pendingCountdownDecision(readAutoContinueState(),
+      selectHeadlessPlan(currentPlan, blocked), Date.now());
     if (gate.action !== 'wait') return gate.action;
     await sleep(Math.min(AUTO_PENDING_POLL_MS, gate.remainingMs));
   }
@@ -836,9 +841,22 @@ async function automaticHeadlessMain() {
     const previous = reconcileSuppression(readAutoContinueState(), initial);
     const reconciled = initial.reason === 'no-candidates' || initial.reason === 'disabled'
       ? clearExclusivityBlock(previous) : previous;
+    let candidateBlocks = reconciled.candidateBlocks;
+    if (initial.action === 'waiting' && initial.reason === 'active-turns') {
+      const manualDraftJournal = readDraftJournal();
+      if (manualDraftJournal.unverified !== true) {
+        const eventState = normalizeState(readJson(eventStatePath, {}), Date.now());
+        const resumeState = normalizeResumeState(readJson(resumeStatePath, emptyResumeState()));
+        const candidates = headlessDiagnosticCandidates(eventState, resumeState, manualDraftJournal);
+        const diagnostics = await partitionHeadlessCandidates({ candidates },
+          candidate => headlessStoragePreflight(codexHome, [candidate]), candidateBlocks);
+        candidateBlocks = diagnostics.candidateBlocks;
+      }
+    }
     writeAutoContinueState({
       ...reconciled,
       status: initial.action,
+      waitingReason: initial.action === 'waiting' ? initial.reason : null,
       lastAttemptAtMs: Date.now(),
       errorKind: initial.action === 'blocked' ? initial.reason : null,
       actionRequired: initial.actionRequired === true,
@@ -846,28 +864,8 @@ async function automaticHeadlessMain() {
       candidateTurnId: null,
       targetAccountId: null,
       pending: null,
+      candidateBlocks: initial.reason === 'no-candidates' ? {} : candidateBlocks,
     });
-    return;
-  }
-
-  if (restoreFailureBlocksAuto(readAutoContinueState(), initial)) {
-    const blocked = readAutoContinueState();
-    writeAutoContinueState({ status: 'blocked', errorKind: blocked.errorKind ||
-      blocked.desktopRestore?.errorKind || 'AUTO_ATTEMPT_RETRY_HALTED', actionRequired: true,
-      candidateThreadId: initial.candidates[0]?.threadId || null,
-      candidateTurnId: initial.candidates[0]?.turnId || null,
-      targetAccountId: initial.target?.accountId || null, pending: null });
-    return;
-  }
-
-  // A failed pre-commit attempt must not restore Desktop and immediately
-  // quiesce it again while the exact same blocking process is still alive.
-  if (hasMatchingExclusivityBlock(readAutoContinueState(), {
-    threadId: initial.candidates[0]?.threadId || null,
-    failedTurnId: initial.candidates[0]?.turnId || null,
-    targetAccountId: initial.target?.accountId || null,
-  }) && unresolvedExclusivityBlockerPresent(readAutoContinueState(), processEntries())) {
-    writeAutoContinueState({ lastAttemptAtMs: Date.now() });
     return;
   }
 
@@ -876,10 +874,50 @@ async function automaticHeadlessMain() {
   let currentCandidate = null;
   let committed = false;
   let lastTerminalThreadId = null;
+  let lockedPlan = initial;
+  let blockedCandidates = [];
   try {
     lock = acquireLock();
-    const lockedPlan = autoDecisionSnapshot();
-    if (!sameDecisionPlan(initial, lockedPlan)) throw new Error('AUTO_PLAN_CHANGED_BEFORE_OWNERSHIP');
+    const fullPlan = autoDecisionSnapshot();
+    if (!sameDecisionPlan(initial, fullPlan)) throw new Error('AUTO_PLAN_CHANGED_BEFORE_OWNERSHIP');
+    const partition = await partitionHeadlessCandidates(fullPlan,
+      candidate => headlessStoragePreflight(codexHome, [candidate]),
+      readAutoContinueState().candidateBlocks);
+    lockedPlan = partition.plan;
+    blockedCandidates = partition.blocked;
+    writeAutoContinueState({ candidateBlocks: partition.candidateBlocks });
+    if (lockedPlan.candidates.length === 0) {
+      writeAutoContinueState({ status: 'blocked', waitingReason: null,
+        errorKind: null, actionRequired: false, pending: null,
+        candidateThreadId: blockedCandidates[0]?.threadId || null,
+        candidateTurnId: blockedCandidates[0]?.turnId || null,
+        targetAccountId: fullPlan.target.accountId });
+      return;
+    }
+    const beforeRetry = readAutoContinueState();
+    const reconciledFailure = reconcileFailedAutomaticAttempt(beforeRetry, lockedPlan);
+    if (reconciledFailure.restoreRetryHalt && !beforeRetry.restoreRetryHalt) {
+      writeAutoContinueState({ ...reconciledFailure, status: 'blocked', actionRequired: true });
+      return;
+    }
+    if (restoreFailureBlocksAuto(readAutoContinueState(), lockedPlan)) {
+      const blocked = readAutoContinueState();
+      writeAutoContinueState({ status: 'blocked', errorKind: blocked.errorKind ||
+        blocked.desktopRestore?.errorKind || 'AUTO_ATTEMPT_RETRY_HALTED', actionRequired: true,
+        candidateThreadId: lockedPlan.candidates[0].threadId,
+        candidateTurnId: lockedPlan.candidates[0].turnId,
+        targetAccountId: lockedPlan.target.accountId, pending: null });
+      return;
+    }
+    // Do not quiesce and restore Desktop again while the same blocker is alive.
+    if (hasMatchingExclusivityBlock(readAutoContinueState(), {
+      threadId: lockedPlan.candidates[0].threadId,
+      failedTurnId: lockedPlan.candidates[0].turnId,
+      targetAccountId: lockedPlan.target.accountId,
+    }) && unresolvedExclusivityBlockerPresent(readAutoContinueState(), processEntries())) {
+      writeAutoContinueState({ lastAttemptAtMs: Date.now() });
+      return;
+    }
     if (isAutoPlanSuppressed(readAutoContinueState(), lockedPlan)) {
       writeAutoContinueState({
         status: 'suppressed',
@@ -890,24 +928,6 @@ async function automaticHeadlessMain() {
         candidateTurnId: lockedPlan.candidates[0]?.turnId || null,
         targetAccountId: lockedPlan.target.accountId,
       });
-      return;
-    }
-    const storage = await headlessStoragePreflight(codexHome, lockedPlan.candidates);
-    if (!storage.ok) {
-      writeAutoContinueState(armAutomaticAttemptRetryHalt({
-        ...readAutoContinueState(),
-        status: 'blocked',
-        lastAttemptAtMs: Date.now(),
-        errorKind: 'CANDIDATE_UNAVAILABLE_IN_ACTIVE_CODEX_HOME',
-        actionRequired: true,
-        candidateThreadId: storage.threadId,
-        candidateTurnId: storage.failedTurnId,
-        targetAccountId: lockedPlan.target.accountId,
-        pending: null,
-        diagnostics: { phase: 'local-storage-preflight', reason: storage.reason,
-          threadId: storage.threadId, failedTurnId: storage.failedTurnId },
-      }, lockedPlan));
-      process.exitCode = 1;
       return;
     }
     const processSnapshot = processEntries();
@@ -929,12 +949,13 @@ async function automaticHeadlessMain() {
       writeAutoContinueState(prepared.state);
       if (prepared.notificationClaimed) sendPendingNotification(prepared.state.pending);
       if (prepared.outcome === 'suppressed') return;
-      const countdownOutcome = await awaitPendingCountdown(lockedPlan);
+      const countdownOutcome = await awaitPendingCountdown(lockedPlan, blockedCandidates);
       if (countdownOutcome === 'canceled') return;
       if (countdownOutcome !== 'execute') {
         const changedPlan = autoDecisionSnapshot();
         writeAutoContinueState({
           status: changedPlan.action === 'resume' ? 'waiting' : changedPlan.action,
+          waitingReason: changedPlan.action === 'resume' ? 'plan-changed' : changedPlan.reason,
           lastAttemptAtMs: Date.now(),
           errorKind: null,
           actionRequired: false,
@@ -946,8 +967,9 @@ async function automaticHeadlessMain() {
         return;
       }
       const expiredPlan = autoDecisionSnapshot();
-      if (!sameDecisionPlan(lockedPlan, expiredPlan)) {
-        writeAutoContinueState({ status: 'waiting', pending: null, errorKind: null, actionRequired: false });
+      if (!sameHeadlessDecisionPlan(lockedPlan, expiredPlan, blockedCandidates)) {
+        writeAutoContinueState({ status: 'waiting', waitingReason: 'plan-changed',
+          pending: null, errorKind: null, actionRequired: false });
         return;
       }
     }
@@ -969,13 +991,13 @@ async function automaticHeadlessMain() {
     writeAutoContinueState(clearExclusivityBlock(readAutoContinueState()));
     assertAutomaticOwnership();
     const ownedPlan = autoDecisionSnapshot();
-    if (!sameDecisionPlan(lockedPlan, ownedPlan)) throw new Error('AUTO_PLAN_CHANGED_BEFORE_SWITCH');
+    if (!sameHeadlessDecisionPlan(lockedPlan, ownedPlan, blockedCandidates)) throw new Error('AUTO_PLAN_CHANGED_BEFORE_SWITCH');
     switchToTarget(ownedPlan.target);
     refreshUsageNow();
     const switchedPlan = autoDecisionSnapshot();
-    if (!sameDecisionPlan(ownedPlan, switchedPlan)) throw new Error('AUTO_PLAN_CHANGED_AFTER_SWITCH');
+    if (!sameHeadlessDecisionPlan(lockedPlan, switchedPlan, blockedCandidates)) throw new Error('AUTO_PLAN_CHANGED_AFTER_SWITCH');
 
-    const plannedCandidates = [...switchedPlan.candidates];
+    const plannedCandidates = [...lockedPlan.candidates];
     for (let index = 0; index < plannedCandidates.length; index += 1) {
       currentCandidate = plannedCandidates[index];
       committed = false;
@@ -983,7 +1005,7 @@ async function automaticHeadlessMain() {
       refreshUsageNow();
       const remainingPlan = autoDecisionSnapshot();
       const expectedPlan = { ...switchedPlan, candidates: plannedCandidates.slice(index) };
-      if (!sameDecisionPlan(expectedPlan, remainingPlan)) throw new Error('AUTO_PLAN_CHANGED_BEFORE_RESUME');
+      if (!sameHeadlessDecisionPlan(expectedPlan, remainingPlan, blockedCandidates)) throw new Error('AUTO_PLAN_CHANGED_BEFORE_RESUME');
       const target = activeAccountState();
       if (target.accountId !== remainingPlan.target.accountId || target.accountKey !== remainingPlan.target.accountKey) {
         throw new Error('ACTIVE_ACCOUNT_CHANGED');
@@ -996,7 +1018,7 @@ async function automaticHeadlessMain() {
         assertAutomaticOwnership(controlledAppServerPid);
         refreshUsageNow();
         const commitPlan = autoDecisionSnapshot();
-        if (!sameDecisionPlan(expectedPlan, commitPlan)) throw new Error('AUTO_PLAN_CHANGED_BEFORE_COMMIT');
+        if (!sameHeadlessDecisionPlan(expectedPlan, commitPlan, blockedCandidates)) throw new Error('AUTO_PLAN_CHANGED_BEFORE_COMMIT');
         const commitTarget = activeAccountState();
         if (commitTarget.accountId !== target.accountId || commitTarget.accountKey !== target.accountKey) {
           throw new Error('ACTIVE_ACCOUNT_CHANGED_BEFORE_COMMIT');
@@ -1056,6 +1078,7 @@ async function automaticHeadlessMain() {
     } else {
       writeAutoContinueState({
         status: transient ? 'waiting' : 'blocked',
+        waitingReason: transient ? 'resume-already-running' : null,
         lastAttemptAtMs: Date.now(),
         errorKind: transient ? null : error?.message || 'AUTO_RESUME_FAILED',
         diagnostics: error?.diagnostics || null,
@@ -1259,6 +1282,7 @@ async function automaticDesktopMain() {
     writeAutoContinueState({
       ...reconciled,
       status: initial.action,
+      waitingReason: initial.action === 'waiting' ? initial.reason : null,
       lastAttemptAtMs: Date.now(),
       errorKind: initial.action === 'blocked' ? initial.reason : null,
       actionRequired: initial.actionRequired === true,
@@ -1560,6 +1584,8 @@ async function automaticMain() {
     ignoredPids: [process.pid],
   }).exclusive) writeAutoContinueState(clearExclusivityBlock(readAutoContinueState()));
   if (await reconcileOutstandingDesktopAttempts()) return 'reconciling';
+  const preferences = readStatusPreferences(statusPreferencesPath);
+  if (preferences.autoMode !== AUTO_MODE.DESKTOP) return automaticHeadlessMain();
   const beforeRetry = readAutoContinueState();
   const retryPlan = autoDecisionSnapshot();
   const reconciledFailure = reconcileFailedAutomaticAttempt(beforeRetry, retryPlan);
@@ -1569,8 +1595,6 @@ async function automaticMain() {
   }
   // A restore failure belongs to the whole controller plan. Repeating the
   // timer run must not quiesce the Desktop it just launched and restore again.
-  const preferences = readStatusPreferences(statusPreferencesPath);
-  if (preferences.autoMode !== AUTO_MODE.DESKTOP) return automaticHeadlessMain();
   const outcome = await automaticDesktopMain();
   if (outcome === 'fallback-headless') return automaticHeadlessMain();
   return outcome;
@@ -1578,7 +1602,10 @@ async function automaticMain() {
 
 async function main() {
   if (process.argv.includes('--restore-watchdog')) return watchdogMode();
-  if (process.argv.includes('--auto')) return automaticMain();
+  if (process.argv.includes('--auto')) {
+    const heartbeat = setInterval(() => writeAutoContinueState({}), 15_000);
+    try { return await automaticMain(); } finally { clearInterval(heartbeat); }
+  }
   const eventState = normalizeState(readJson(eventStatePath, {}), Date.now());
   const resumeState = normalizeResumeState(readJson(resumeStatePath, emptyResumeState()));
   const candidates = pendingInterruptedTurns(eventState, resumeState);

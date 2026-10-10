@@ -54,6 +54,7 @@ const {
   normalizeAutoContinueState,
   pendingAttentionDecision,
 } = require(path.join(__dirname, '..', 'lib', 'codex-auto-continue'));
+const { autoSchedulerHealth, readAutoTimerState } = require(path.join(__dirname, '..', 'lib', 'codex-auto-scheduler'));
 const {
   tableCell,
   activationObservationHoldLine,
@@ -193,6 +194,8 @@ try {
 } catch {}
 const fiveHourWorkerHealth = activationWorkerHealth(activationState, nowMs);
 const turnObserverHealth = observerHealth(eventState, nowMs);
+const schedulerHealth = autoSchedulerHealth(statusPreferences, autoContinueState,
+  statusPreferences.autoContinue ? readAutoTimerState() : null, nowMs);
 const exhaustionByAccountId = eventState.exhaustions || {};
 
 const lines = input.split('\n');
@@ -275,6 +278,8 @@ if (mappingOnly) {
 const interruptedCandidates = turnObserverHealth.healthy
   ? pendingInterruptedTurns(eventState, resumeState).slice(0, 6)
   : [];
+const pendingCandidateKeys = new Set(pendingInterruptedTurns(eventState, resumeState)
+  .map(candidate => JSON.stringify([candidate.threadId, candidate.turnId])));
 const interruptedWithKeys = interruptedCandidates.map((candidate, index) => ({
   ...candidate,
   continueKey: String(index + 4),
@@ -375,7 +380,9 @@ const problems = [
   statusPreferencesError
     ? `AUTO-CONTINUE CONFIG ERROR / ACTION REQUIRED: ${statusPreferencesError}; AUTO-CONTINUE är fail-closed OFF.`
     : null,
-  ...(autoContinueProblemLines(autoContinueState, statusPreferences.autoContinue === true) || []),
+  ...(autoContinueProblemLines(autoContinueState, statusPreferences.autoContinue === true,
+    { candidateKeys: pendingCandidateKeys }) || []),
+  schedulerHealth.healthy ? null : `${schedulerHealth.reason} / ACTION REQUIRED`,
   ...interruptedCandidateProblemLines(eventState, resumeState, {
     autoContinue: statusPreferences.autoContinue === true,
   }),

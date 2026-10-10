@@ -24,6 +24,8 @@ const {
   normalizeAutoContinueState,
   pendingAttentionDecision,
   pendingCountdownDecision,
+  partitionHeadlessCandidates,
+  headlessDiagnosticCandidates,
   recordExclusivityBlock,
   clearExclusivityBlock,
   resolveDesktopRestoreFailure,
@@ -33,6 +35,7 @@ const {
   reconcileSuppression,
   requiresPendingCountdown,
   resetAutoContinueForToggle,
+  sameHeadlessDecisionPlan,
   writeAutoContinueStateFile,
 } = require('../lib/codex-auto-continue');
 const {
@@ -175,6 +178,72 @@ test('HEADLESS storage preflight checks every exact candidate and failed turn', 
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }
+});
+
+test('missing oldest rollout is reported locally while the next candidate reaches the exact commit boundary', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-headless-queue-'));
+  try {
+    const directory = path.join(home, 'sessions', '2026', '10', '06');
+    fs.mkdirSync(directory, { recursive: true });
+    fs.writeFileSync(path.join(directory, 'rollout-2026-10-06T09-00-00-thread-second.jsonl'), [
+      JSON.stringify({ type: 'session_meta', payload: { id: 'thread-second' } }),
+      JSON.stringify({ type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-second' } }),
+      JSON.stringify({ type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn-second',
+        error: { codexErrorInfo: 'usageLimitExceeded' } } }),
+    ].join('\n') + '\n');
+    const full = decide();
+    const inspect = candidate => headlessStoragePreflight(home, [candidate]);
+    const selected = await partitionHeadlessCandidates(full, inspect, {}, NOW);
+    assert.deepEqual(selected.blocked.map(candidate => candidate.threadId), ['thread-first']);
+    assert.deepEqual(selected.plan.candidates.map(candidate => candidate.threadId), ['thread-second']);
+    assert.equal(selected.candidateBlocks['["thread-first","turn-first"]'].reason,
+      'ROLLOUT_NOT_IN_ACTIVE_CODEX_HOME');
+    assert.equal(selected.candidateBlocks['["thread-first","turn-first"]'].actionRequired, true);
+    assert.match(autoContinueProblemLine({ candidateBlocks: selected.candidateBlocks }, true),
+      /ad-first ROLLOUT_NOT_IN_ACTIVE_CODEX_HOME/);
+    assert.equal(sameHeadlessDecisionPlan(selected.plan, decide(), selected.blocked), true);
+    assert.deepEqual(await headlessStoragePreflight(home, selected.plan.candidates), { ok: true });
+    const oldFailedAttempt = { status: 'blocked', actionRequired: true,
+      errorKind: 'APP_SERVER_REQUEST_FAILED', desktopRestore: { status: 'ready' },
+      candidateThreadId: 'thread-first', candidateTurnId: 'turn-first',
+      targetAccountId: 'account-b' };
+    assert.equal(reconcileFailedAutomaticAttempt(oldFailedAttempt, selected.plan).restoreRetryHalt,
+      false);
+
+    const second = selected.plan.candidates[0];
+    const journal = markResumeCommitted({}, second, {
+      targetAccountId: 'account-b', continuation: continuationForCandidate(second),
+    }, NOW + 1);
+    assert.equal(journal.attempts['["thread-second","turn-second"]'].status, 'RESUME_COMMITTED');
+    assert.throws(() => markResumeCommitted(journal, second, {
+      targetAccountId: 'account-b', continuation: continuationForCandidate(second),
+    }, NOW + 2), /RESUME_ALREADY_COMMITTED/);
+    const retry = decide({ resumeState: journal });
+    assert.deepEqual(retry.candidates.map(candidate => candidate.threadId), ['thread-first']);
+    assert.equal(sameHeadlessDecisionPlan({ ...selected.plan, candidates: [] }, retry,
+      selected.blocked), true);
+    const restarted = await partitionHeadlessCandidates(retry, inspect, selected.candidateBlocks, NOW + 3);
+    assert.deepEqual(restarted.plan.candidates, []);
+    assert.equal(restarted.candidateBlocks['["thread-first","turn-first"]'].firstSeenAtMs, NOW);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('active-turn waiting reason remains visible in AUTO status', () => {
+  const observed = eventState({ activeTurns: { running: { threadId: 'other' } } });
+  const waiting = decide({ eventState: observed });
+  assert.equal(waiting.reason, 'active-turns');
+  assert.equal(autoContinueStatusLine({ autoMode: 'HEADLESS' }, {
+    status: waiting.action, waitingReason: waiting.reason,
+  }, NOW), 'AUTO: HEADLESS · WAIT: active-turns');
+  const candidates = headlessDiagnosticCandidates(observed, {}, { version: 1, claims: {} });
+  assert.deepEqual(candidates.map(candidate => candidate.threadId), ['thread-first', 'thread-second']);
+  const claimed = headlessDiagnosticCandidates(observed, {}, { version: 1, claims: {
+    '["thread-first","turn-first"]': { owner: 'manual-draft' },
+  } });
+  assert.deepEqual(claimed.map(candidate => candidate.threadId), ['thread-second']);
+  assert.deepEqual(headlessDiagnosticCandidates(observed, {}, { unverified: true }), []);
 });
 
 test('OFF never acts even when an older resumable candidate exists', () => {

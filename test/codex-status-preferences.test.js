@@ -13,6 +13,8 @@ const {
   toggleAutoContinue,
 } = require('../lib/codex-status-preferences');
 
+const fakeSystemctl = path.join(__dirname, 'fixtures', 'systemctl-test');
+
 test('AUTO-CONTINUE defaults fail closed to OFF and renders the permanent control', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-status-preferences-'));
   const statePath = path.join(root, 'config', 'status-preferences.json');
@@ -51,7 +53,9 @@ test('legacy ON migrates only to HEADLESS and never implicitly enables DESKTOP',
   assert.equal(migrated.autoContinue, true);
   const command = path.join(__dirname, '..', 'bin', 'codex-status-preferences');
   const result = spawnSync(process.execPath, [command, 'migrate'], {
-    env: { ...process.env, CODEX_STATUS_PREFERENCES: statePath }, encoding: 'utf8',
+    env: { ...process.env, CODEX_STATUS_PREFERENCES: statePath,
+      CODEX_AUTO_CONTINUE_STATE: path.join(root, 'auto.json'),
+      CODEX_SYSTEMCTL_BIN: fakeSystemctl }, encoding: 'utf8',
   });
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(JSON.parse(fs.readFileSync(statePath, 'utf8')), {
@@ -87,6 +91,7 @@ test('status control cancels only pending AUTO and OFF to ON clears suppression'
     ...process.env,
     CODEX_STATUS_PREFERENCES: preferencesPath,
     CODEX_AUTO_CONTINUE_STATE: autoStatePath,
+    CODEX_SYSTEMCTL_BIN: fakeSystemctl,
   };
 
   const canceled = spawnSync(process.execPath, [command, 'cancel-auto-pending'], { env, encoding: 'utf8' });
@@ -102,6 +107,23 @@ test('status control cancels only pending AUTO and OFF to ON clears suppression'
   autoState = JSON.parse(fs.readFileSync(autoStatePath, 'utf8'));
   assert.equal(autoState.suppression, null);
   assert.equal(autoState.status, 'idle');
+});
+
+test('toggle refuses HEADLESS when timer stays inactive and keeps the previous mode', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-status-timer-'));
+  const preferencesPath = path.join(root, 'preferences.json');
+  const autoStatePath = path.join(root, 'auto.json');
+  fs.writeFileSync(preferencesPath, JSON.stringify({ version: 2, autoMode: 'DESKTOP' }));
+  const result = spawnSync(process.execPath,
+    [path.join(__dirname, '..', 'bin', 'codex-status-preferences'), 'toggle-auto-continue'], {
+      env: { ...process.env, CODEX_STATUS_PREFERENCES: preferencesPath,
+        CODEX_AUTO_CONTINUE_STATE: autoStatePath,
+        CODEX_SYSTEMCTL_BIN: fakeSystemctl, CODEX_TEST_TIMER_ACTIVE: '0' },
+      encoding: 'utf8',
+    });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /AUTO_CONTROLLER_TIMER_INACTIVE/);
+  assert.equal(readStatusPreferences(preferencesPath).autoMode, 'DESKTOP');
 });
 
 test('AUTO mode toggle cannot race an account switch or continuation controller', () => {

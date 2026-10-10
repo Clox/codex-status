@@ -6,11 +6,13 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('path');
 const {
+  AUTO_MODE_ORDER,
+  CURRENT_VERSION,
   defaultStatusPreferencesPath,
   readStatusPreferences,
-  toggleAutoContinue,
   writeStatusPreferences,
 } = require(path.join(__dirname, '..', 'lib', 'codex-status-preferences'));
+const { ensureAutoTimerRunning } = require(path.join(__dirname, '..', 'lib', 'codex-auto-scheduler'));
 const {
   cancelPendingAction,
   emptyAutoContinueState,
@@ -71,10 +73,17 @@ try {
   if (command === 'show') {
     preferences = readStatusPreferences(statePath);
   } else if (command === 'migrate') {
-    preferences = writeStatusPreferences(statePath, readStatusPreferences(statePath));
+    preferences = withOperationLock(() => {
+      const migrated = readStatusPreferences(statePath);
+      if (migrated.autoMode !== 'OFF') ensureAutoTimerRunning();
+      return writeStatusPreferences(statePath, migrated);
+    });
   } else if (command === 'toggle-auto-continue') {
     preferences = withOperationLock(() => {
-      const next = toggleAutoContinue(statePath);
+      const current = readStatusPreferences(statePath);
+      const nextMode = AUTO_MODE_ORDER[(AUTO_MODE_ORDER.indexOf(current.autoMode) + 1) % AUTO_MODE_ORDER.length];
+      if (nextMode !== 'OFF') ensureAutoTimerRunning();
+      const next = writeStatusPreferences(statePath, { version: CURRENT_VERSION, autoMode: nextMode });
       writeAutoContinueStateFile(
         autoStatePath,
         resetAutoContinueForToggle(readAutoState(), next.autoMode)
