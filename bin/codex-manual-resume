@@ -23,6 +23,7 @@ const {
   markResumeCommitted,
   markResumeFailure,
   markResumeTerminal,
+  RESUME_STATE_VERSION,
   normalizeResumeState,
   pendingInterruptedTurns,
   pollAppServerExclusivity,
@@ -38,6 +39,8 @@ const {
   validateThreadForResume,
 } = require(path.join(__dirname, '..', 'lib', 'codex-manual-resume'));
 const { continuationForCandidate } = require(path.join(__dirname, '..', 'lib', 'codex-turn-continuation'));
+const { MIN_CANDIDATE_AGE_MS, MIN_CONTINUOUS_MISSING_MS, retirementEligible,
+  retireUnavailable, reactivateRetired } = require(path.join(__dirname, '..', 'lib', 'codex-candidate-lifecycle'));
 const { headlessStoragePreflight, acquireHeadlessClientsAfterStoragePreflight } =
   require(path.join(__dirname, '..', 'lib', 'codex-headless-storage-preflight'));
 const { normalizeState, observerHealth } = require(path.join(__dirname, '..', 'lib', 'codex-turn-observer'));
@@ -46,6 +49,8 @@ const {
   AUTO_CONTINUE_STATE_VERSION,
   automationDecision,
   beginExclusivityAttempt,
+  adoptAutomaticPlan,
+  archiveTerminalDesktopNavigation,
   createOrResumePending,
   clearExclusivityBlock,
   emptyAutoContinueState,
@@ -56,8 +61,9 @@ const {
   pendingCountdownDecision,
   partitionHeadlessCandidates,
   recordExclusivityBlock,
+  recordPrecommitPlanChange,
+  shouldReplanAutomaticError,
   resolveDesktopRestoreFailure,
-  armAutomaticAttemptRetryHalt,
   reconcileFailedAutomaticAttempt,
   restoreFailureBlocksAuto,
   reconcileSuppression,
@@ -747,9 +753,7 @@ function writeAutoContinueState(patch) {
     ...emptyAutoContinueState(),
     ...resolved,
     ...patch,
-    ...((patch.desktopRestore?.status === 'failed' ||
-      (previous.desktopRestore?.status === 'failed' && patch.desktopRestore?.status === 'ready'))
-      ? { restoreRetryHalt: true } : {}),
+    ...(patch.desktopRestore?.status === 'failed' ? { restoreRetryHalt: true } : {}),
     version: AUTO_CONTINUE_STATE_VERSION,
     heartbeatAtMs: Date.now(),
   });
@@ -757,6 +761,46 @@ function writeAutoContinueState(patch) {
 
 function readAutoContinueState() {
   return normalizeAutoContinueState(readJson(autoContinueStatePath, emptyAutoContinueState()));
+}
+
+async function retireBlockedCandidates(blocked, blocks, { lockHeld = false } = {}) {
+  const nowMs = Date.now();
+  const due = blocked.filter(candidate => {
+    const block = blocks[candidateKey(candidate.threadId, candidate.turnId)];
+    return block?.reason === 'ROLLOUT_NOT_IN_ACTIVE_CODEX_HOME' &&
+      nowMs - candidate.completedAtMs >= MIN_CANDIDATE_AGE_MS &&
+      nowMs - block.continuousMissingSinceMs >= MIN_CONTINUOUS_MISSING_MS;
+  });
+  if (!due.length) return [];
+  let lock = null;
+  try {
+    if (!lockHeld) lock = acquireLock();
+    let raw;
+    try { raw = JSON.parse(fs.readFileSync(resumeStatePath, 'utf8')); } catch { return []; }
+    if (raw.version !== RESUME_STATE_VERSION || !raw.attempts || typeof raw.attempts !== 'object') return [];
+    let journal = normalizeResumeState(raw);
+    const draftJournal = readDraftJournal();
+    if (draftJournal.unverified === true) return [];
+    const eventState = normalizeState(readJson(eventStatePath, {}), Date.now());
+    if (!observerHealth(eventState, Date.now()).healthy) return [];
+    const retired = [];
+    for (const candidate of due) {
+      const block = blocks[candidateKey(candidate.threadId, candidate.turnId)];
+      const storage = await headlessStoragePreflight(codexHome, [candidate]);
+      if (!retirementEligible({ candidate, block, eventState, resumeState: journal,
+        draftJournal, autoState: readAutoContinueState(), storage,
+        observerHealthy: observerHealth(eventState, Date.now()).healthy, nowMs: Date.now() })) continue;
+      journal = retireUnavailable(journal, candidate, block, Date.now());
+      retired.push(candidate);
+    }
+    if (retired.length) atomicWriteJson(resumeStatePath, journal);
+    return retired;
+  } catch (error) {
+    if (!lockHeld && error?.message === 'RESUME_ALREADY_RUNNING') return [];
+    throw error;
+  } finally {
+    if (lock) releaseLock();
+  }
 }
 
 function sendPendingNotification(pending) {
@@ -842,7 +886,8 @@ async function automaticHeadlessMain() {
     const reconciled = initial.reason === 'no-candidates' || initial.reason === 'disabled'
       ? clearExclusivityBlock(previous) : previous;
     let candidateBlocks = reconciled.candidateBlocks;
-    if (initial.action === 'waiting' && initial.reason === 'active-turns') {
+    if (initial.action !== 'disabled' && initial.reason !== 'no-candidates' &&
+        initial.reason !== 'observer-unverified') {
       const manualDraftJournal = readDraftJournal();
       if (manualDraftJournal.unverified !== true) {
         const eventState = normalizeState(readJson(eventStatePath, {}), Date.now());
@@ -851,6 +896,7 @@ async function automaticHeadlessMain() {
         const diagnostics = await partitionHeadlessCandidates({ candidates },
           candidate => headlessStoragePreflight(codexHome, [candidate]), candidateBlocks);
         candidateBlocks = diagnostics.candidateBlocks;
+        await retireBlockedCandidates(diagnostics.blocked, candidateBlocks);
       }
     }
     writeAutoContinueState({
@@ -876,6 +922,8 @@ async function automaticHeadlessMain() {
   let lastTerminalThreadId = null;
   let lockedPlan = initial;
   let blockedCandidates = [];
+  let shouldReplan = false;
+  let navigationPhase = false;
   try {
     lock = acquireLock();
     const fullPlan = autoDecisionSnapshot();
@@ -886,6 +934,10 @@ async function automaticHeadlessMain() {
     lockedPlan = partition.plan;
     blockedCandidates = partition.blocked;
     writeAutoContinueState({ candidateBlocks: partition.candidateBlocks });
+    const retired = await retireBlockedCandidates(blockedCandidates, partition.candidateBlocks, { lockHeld: true });
+    const retiredKeys = new Set(retired.map(candidate => candidateKey(candidate.threadId, candidate.turnId)));
+    blockedCandidates = blockedCandidates.filter(candidate =>
+      !retiredKeys.has(candidateKey(candidate.threadId, candidate.turnId)));
     if (lockedPlan.candidates.length === 0) {
       writeAutoContinueState({ status: 'blocked', waitingReason: null,
         errorKind: null, actionRequired: false, pending: null,
@@ -951,29 +1003,13 @@ async function automaticHeadlessMain() {
       if (prepared.outcome === 'suppressed') return;
       const countdownOutcome = await awaitPendingCountdown(lockedPlan, blockedCandidates);
       if (countdownOutcome === 'canceled') return;
-      if (countdownOutcome !== 'execute') {
-        const changedPlan = autoDecisionSnapshot();
-        writeAutoContinueState({
-          status: changedPlan.action === 'resume' ? 'waiting' : changedPlan.action,
-          waitingReason: changedPlan.action === 'resume' ? 'plan-changed' : changedPlan.reason,
-          lastAttemptAtMs: Date.now(),
-          errorKind: null,
-          actionRequired: false,
-          candidateThreadId: null,
-          candidateTurnId: null,
-          targetAccountId: null,
-          pending: null,
-        });
-        return;
-      }
+      if (countdownOutcome !== 'execute') throw new Error('AUTO_PLAN_CHANGED_DURING_COUNTDOWN');
       const expiredPlan = autoDecisionSnapshot();
       if (!sameHeadlessDecisionPlan(lockedPlan, expiredPlan, blockedCandidates)) {
-        writeAutoContinueState({ status: 'waiting', waitingReason: 'plan-changed',
-          pending: null, errorKind: null, actionRequired: false });
-        return;
+        throw new Error('AUTO_PLAN_CHANGED_DURING_COUNTDOWN');
       }
     }
-    const attemptState = beginExclusivityAttempt(readAutoContinueState(), exclusivityContext, {
+    const attemptState = beginExclusivityAttempt(adoptAutomaticPlan(readAutoContinueState()), exclusivityContext, {
       status: 'running',
       lastAttemptAtMs: Date.now(),
       errorKind: null,
@@ -982,9 +1018,8 @@ async function automaticHeadlessMain() {
       candidateTurnId: lockedPlan.candidates[0]?.turnId || null,
       targetAccountId: lockedPlan.target.accountId,
       pending: null,
-      desktopNavigation: null,
     });
-    writeAutoContinueState(armAutomaticAttemptRetryHalt(attemptState, lockedPlan));
+    writeAutoContinueState({ ...attemptState, desktopPreflight: null });
 
     lease = await acquireHeadlessClientsAfterStoragePreflight(codexHome, lockedPlan.candidates,
       () => acquireExclusiveClients({ autoMode: true }));
@@ -1057,7 +1092,15 @@ async function automaticHeadlessMain() {
       restoreRetryHaltGeneration: null,
     });
   } catch (error) {
-    if (committed && currentCandidate) {
+    const precommitPlanChange = shouldReplanAutomaticError(error, committed);
+    if (precommitPlanChange) {
+      shouldReplan = true;
+      writeAutoContinueState(recordPrecommitPlanChange(readAutoContinueState(), error.message, {
+        threadId: currentCandidate?.threadId || lockedPlan.candidates[0]?.threadId,
+        failedTurnId: currentCandidate?.turnId || lockedPlan.candidates[0]?.turnId,
+        targetAccountId: lockedPlan.target?.accountId,
+      }));
+    } else if (committed && currentCandidate) {
       let journal = normalizeResumeState(readJson(resumeStatePath, emptyResumeState()));
       journal = markResumeFailure(journal, currentCandidate, error?.message || 'AUTO_RESUME_FAILED', {
         committed: true,
@@ -1067,7 +1110,9 @@ async function automaticHeadlessMain() {
     }
     const preCommitExclusivity = !committed && error?.message === 'APP_SERVER_EXCLUSIVITY_FAILED';
     const transient = error?.message === 'RESUME_ALREADY_RUNNING';
-    if (preCommitExclusivity) {
+    if (precommitPlanChange) {
+      // The old lock and lease are released before the timer replans.
+    } else if (preCommitExclusivity) {
       const blocked = recordExclusivityBlock(readAutoContinueState(), error.diagnostics, {
         threadId: currentCandidate?.threadId || initial.candidates[0]?.threadId || null,
         failedTurnId: currentCandidate?.turnId || initial.candidates[0]?.turnId || null,
@@ -1110,6 +1155,7 @@ async function automaticHeadlessMain() {
           } : null,
         });
         if (navigation) {
+          navigationPhase = true;
           const atspi = new DesktopAtspiController();
           try {
             await runHeadlessPostRestoreNavigation({
@@ -1125,14 +1171,27 @@ async function automaticHeadlessMain() {
                   command: 'preflight', threadId: navigation.threadId, desktopPid: navigation.desktopPid,
                 })),
               })).diagnostics,
-              onState: desktopNavigation => writeAutoContinueState({ desktopNavigation }),
+              onState: desktopNavigation => writeAutoContinueState({ desktopNavigation: {
+                ...desktopNavigation, failedTurnId: currentCandidate?.turnId || null,
+              } }),
             });
           } finally {
             await atspi.close();
           }
         }
       } catch (error) {
-        writeAutoContinueState({
+        if (navigationPhase && readAutoContinueState().desktopRestore?.status === 'ready') {
+          const navigationFailure = { desktopNavigation: {
+            status: 'failed', threadId: lastTerminalThreadId,
+            failedTurnId: currentCandidate?.turnId || null,
+            errorKind: error?.message || 'DESKTOP_NAVIGATION_FAILED', completedAtMs: Date.now(),
+          } };
+          writeAutoContinueState(archiveTerminalDesktopNavigation({
+            ...readAutoContinueState(), ...navigationFailure,
+          }, normalizeResumeState(readJson(resumeStatePath, emptyResumeState()))));
+        } else {
+          shouldReplan = false;
+          writeAutoContinueState({
           status: 'blocked',
           lastAttemptAtMs: Date.now(),
           errorKind: error?.message || 'AUTO_CLIENT_RESTORE_FAILED',
@@ -1147,12 +1206,14 @@ async function automaticHeadlessMain() {
             errorKind: error?.message || 'AUTO_CLIENT_RESTORE_FAILED',
             diagnostics: error?.diagnostics || null,
           },
-        });
-        process.exitCode = 1;
+          });
+          process.exitCode = 1;
+        }
       }
     }
     if (lock) releaseLock(lock);
   }
+  return shouldReplan ? 'replan' : 'done';
 }
 
 function launchDesktopDeepLink(url) {
@@ -1357,13 +1418,13 @@ async function automaticDesktopMain() {
       if (outcome !== 'execute') return 'done';
       if (!sameDecisionPlan(lockedPlan, autoDecisionSnapshot())) return 'done';
     }
-    const attemptState = beginExclusivityAttempt(readAutoContinueState(), exclusivityContext, {
+    const attemptState = beginExclusivityAttempt(adoptAutomaticPlan(readAutoContinueState()), exclusivityContext, {
       status: 'desktop-preparing', lastAttemptAtMs: Date.now(), errorKind: null,
       actionRequired: false, candidateThreadId: lockedPlan.candidates[0]?.threadId || null,
       candidateTurnId: lockedPlan.candidates[0]?.turnId || null,
       targetAccountId: lockedPlan.target.accountId, pending: null,
     });
-    writeAutoContinueState(armAutomaticAttemptRetryHalt(attemptState, lockedPlan));
+    writeAutoContinueState(attemptState);
 
     lease = await acquireExclusiveClients({ autoMode: true });
     writeAutoContinueState(clearExclusivityBlock(readAutoContinueState()));
@@ -1565,6 +1626,12 @@ async function automaticDesktopMain() {
 }
 
 async function automaticMain() {
+  const navigationState = readAutoContinueState();
+  const archivedNavigation = archiveTerminalDesktopNavigation(navigationState,
+    normalizeResumeState(readJson(resumeStatePath, emptyResumeState())));
+  if (archivedNavigation.desktopNavigation !== navigationState.desktopNavigation) {
+    writeAutoContinueState(archivedNavigation);
+  }
   const diagnosticState = readAutoContinueState();
   if (diagnosticState.desktopRestore?.status === 'failed' &&
       diagnosticState.desktopRestore.errorKind !== 'DESKTOP_ROOT_AMBIGUOUS') {
@@ -1585,7 +1652,16 @@ async function automaticMain() {
   }).exclusive) writeAutoContinueState(clearExclusivityBlock(readAutoContinueState()));
   if (await reconcileOutstandingDesktopAttempts()) return 'reconciling';
   const preferences = readStatusPreferences(statusPreferencesPath);
-  if (preferences.autoMode !== AUTO_MODE.DESKTOP) return automaticHeadlessMain();
+  if (preferences.autoMode !== AUTO_MODE.DESKTOP) {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const result = await automaticHeadlessMain();
+      if (result !== 'replan') return result;
+      refreshUsageNow();
+    }
+    writeAutoContinueState({ status: 'waiting', waitingReason: 'plan-changing',
+      errorKind: null, actionRequired: false, pending: null });
+    return 'waiting';
+  }
   const beforeRetry = readAutoContinueState();
   const retryPlan = autoDecisionSnapshot();
   const reconciledFailure = reconcileFailedAutomaticAttempt(beforeRetry, retryPlan);
@@ -1606,8 +1682,40 @@ async function main() {
     const heartbeat = setInterval(() => writeAutoContinueState({}), 15_000);
     try { return await automaticMain(); } finally { clearInterval(heartbeat); }
   }
+  if (process.argv[2] === '--reactivate-retired') {
+    const threadId = process.argv[3];
+    const turnId = process.argv[4];
+    if (!threadId || !turnId || process.argv.length !== 5) throw new Error('EXACT_CANDIDATE_IDS_REQUIRED');
+    const lock = acquireLock();
+    try {
+      const eventState = normalizeState(readJson(eventStatePath, {}), Date.now());
+      if (!observerHealth(eventState, Date.now()).healthy) throw new Error('TURN_OBSERVER_UNVERIFIED');
+      const candidate = eventState.interruptedTurns?.[candidateKey(threadId, turnId)];
+      if (!candidate) throw new Error('CANDIDATE_NOT_FOUND');
+      const draftJournal = readDraftJournal();
+      if (draftJournal.unverified === true) throw new Error('MANUAL_DRAFT_JOURNAL_UNVERIFIED');
+      const storage = await headlessStoragePreflight(codexHome, [candidate]);
+      let raw;
+      try { raw = JSON.parse(fs.readFileSync(resumeStatePath, 'utf8')); }
+      catch { throw new Error('RESUME_JOURNAL_UNVERIFIED'); }
+      if (raw.version !== RESUME_STATE_VERSION || !raw.attempts || typeof raw.attempts !== 'object') {
+        throw new Error('RESUME_JOURNAL_UNVERIFIED');
+      }
+      const journal = normalizeResumeState(raw);
+      atomicWriteJson(resumeStatePath,
+        reactivateRetired(journal, candidate, eventState, draftJournal, storage));
+      process.stdout.write(`Reactivated ${threadId} ${turnId}; AUTO may now consider this candidate.\n`);
+    } finally { releaseLock(); }
+    return;
+  }
   const eventState = normalizeState(readJson(eventStatePath, {}), Date.now());
   const resumeState = normalizeResumeState(readJson(resumeStatePath, emptyResumeState()));
+  if (process.argv.includes('--list-retired')) {
+    for (const entry of resumeState.retirementHistory) {
+      process.stdout.write(`${entry.threadId}\t${entry.turnId}\t${entry.reason}\t${new Date(entry.retiredAtMs).toISOString()}\n`);
+    }
+    return;
+  }
   const candidates = pendingInterruptedTurns(eventState, resumeState);
   if (process.argv.includes('--list')) {
     for (const candidate of candidates) {

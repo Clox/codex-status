@@ -29,6 +29,11 @@ const {
   recordExclusivityBlock,
   clearExclusivityBlock,
   resolveDesktopRestoreFailure,
+  archiveDesktopNavigation,
+  archiveTerminalDesktopNavigation,
+  recordPrecommitPlanChange,
+  adoptAutomaticPlan,
+  shouldReplanAutomaticError,
   armAutomaticAttemptRetryHalt,
   reconcileFailedAutomaticAttempt,
   restoreFailureBlocksAuto,
@@ -340,6 +345,97 @@ test('post-restore Desktop navigation failure is visible without changing contin
   'AUTO-CONTINUE / ACTION REQUIRED: continuation completed, but Desktop navigation failed (DESKTOP_DEEPLINK_LAUNCH_FAILED).');
 });
 
+test('a changed target before commit is requeued and old plan problems become history', () => {
+  const original = decide();
+  const changed = decide({ usageCache: usageCache({ 'account-b': usage(0, 0) }) });
+  assert.equal(original.action, 'resume');
+  assert.equal(changed.action, 'resume');
+  assert.notEqual(original.target.accountId, changed.target.accountId);
+  const error = new Error('AUTO_PLAN_CHANGED_BEFORE_COMMIT');
+  assert.equal(shouldReplanAutomaticError(error, false), true);
+  const recorded = recordPrecommitPlanChange({ status: 'blocked', actionRequired: true,
+    errorKind: error.message }, error.message, {
+    threadId: original.candidates[0].threadId, failedTurnId: original.candidates[0].turnId,
+    targetAccountId: original.target.accountId,
+  }, NOW);
+  assert.deepEqual(autoContinueProblemLines(recorded, true), []);
+  const next = adoptAutomaticPlan(recorded, NOW + 1);
+  assert.equal(next.status, 'running');
+  assert.equal(next.planChangeHistory[0].reason, error.message);
+  assert.deepEqual(autoContinueProblemLines(next, true), []);
+  assert.equal(changed.candidates[0].turnId, original.candidates[0].turnId);
+});
+
+test('changed target after commit never enters replan and committed turn remains exact once', () => {
+  const candidate = decide().candidates[0];
+  assert.equal(shouldReplanAutomaticError(new Error('AUTO_PLAN_CHANGED_BEFORE_RESUME'), true), false);
+  const journal = markResumeCommitted({}, candidate, {
+    targetAccountId: 'account-b', continuation: continuationForCandidate(candidate),
+  }, NOW);
+  assert.throws(() => markResumeCommitted(journal, candidate, {
+    targetAccountId: 'account-c', continuation: continuationForCandidate(candidate),
+  }, NOW + 1), /RESUME_ALREADY_COMMITTED/);
+});
+
+test('candidate list changing before commit replans only the remaining eligible turns', () => {
+  const first = decide();
+  const changedEvents = eventState();
+  delete changedEvents.interruptedTurns.first;
+  const next = decide({ eventState: changedEvents });
+  assert.equal(shouldReplanAutomaticError(new Error('AUTO_PLAN_CHANGED_BEFORE_RESUME'), false), true);
+  assert.deepEqual(next.candidates.map(candidate => candidate.turnId), ['turn-second']);
+  assert.notDeepEqual(first.candidates.map(candidate => candidate.turnId),
+    next.candidates.map(candidate => candidate.turnId));
+});
+
+test('completed navigation failure is archived when the next candidate plan starts', () => {
+  const failed = { status: 'completed', errorKind: null, actionRequired: false,
+    desktopRestore: { status: 'ready', desktopPid: 4, desktopStartTicks: 5 },
+    desktopNavigation: { status: 'failed', threadId: 'thread-first', failedTurnId: 'turn-first',
+      errorKind: 'DESKTOP_DEEPLINK_LAUNCH_FAILED' } };
+  const next = adoptAutomaticPlan(failed, NOW);
+  assert.equal(next.desktopNavigation, null);
+  assert.equal(next.desktopNavigationHistory.length, 1);
+  assert.equal(next.desktopNavigationHistory[0].threadId, 'thread-first');
+  assert.deepEqual(autoContinueProblemLines(next, true), []);
+  const restarted = normalizeAutoContinueState(JSON.parse(JSON.stringify(next)));
+  assert.equal(restarted.desktopNavigationHistory[0].errorKind, 'DESKTOP_DEEPLINK_LAUNCH_FAILED');
+  assert.equal(archiveDesktopNavigation(restarted, NOW + 1).desktopNavigationHistory.length, 1);
+});
+
+test('legacy navigation failure is archived only for one verified completed turn', () => {
+  const state = { desktopNavigation: { status: 'failed', threadId: 'thread-first',
+    errorKind: 'COMPOSER_COUNT_0' } };
+  const completed = { attempts: {
+    '["thread-first","turn-first"]': { status: 'COMPLETED' },
+    '["thread-second","turn-second"]': { status: 'RESUME_COMMITTED' },
+  } };
+  const archived = archiveTerminalDesktopNavigation(state, completed, NOW);
+  assert.equal(archived.desktopNavigation, null);
+  assert.equal(archived.desktopNavigationHistory[0].failedTurnId, 'turn-first');
+  assert.deepEqual(autoContinueProblemLines(archived, true), []);
+  assert.equal(archiveTerminalDesktopNavigation(state, { attempts: {
+    '["thread-first","turn-first"]': { status: 'RESUME_COMMITTED' },
+  } }, NOW).desktopNavigation.status, 'failed');
+  assert.equal(archiveTerminalDesktopNavigation(state, { attempts: {
+    '["thread-first","turn-first"]': { status: 'COMPLETED' },
+    '["thread-first","turn-second"]': { status: 'COMPLETED' },
+  } }, NOW).desktopNavigation.status, 'failed');
+});
+
+test('ready Desktop resolves a stale restore latch and its active problem', () => {
+  const stale = { status: 'blocked', actionRequired: true,
+    errorKind: 'DESKTOP_RESTORE_RETRY_HALTED', restoreRetryHalt: true,
+    restoreRetryHaltGeneration: 'old-plan',
+    desktopRestore: { status: 'ready', desktopPid: 4, desktopStartTicks: 5 } };
+  assert.deepEqual(autoContinueProblemLines(stale, true), []);
+  const adopted = adoptAutomaticPlan(stale, NOW);
+  assert.equal(adopted.restoreRetryHalt, false);
+  assert.equal(adopted.restoreRetryHaltGeneration, null);
+  assert.equal(adopted.actionRequired, false);
+  assert.deepEqual(autoContinueProblemLines(adopted, true), []);
+});
+
 test('temporary pre-commit exclusivity blocking waits and self-heals without action required', () => {
   const diagnostics = {
     phase: 'acquire-app-server-exclusivity',
@@ -484,12 +580,10 @@ test('late verified Desktop root resolves restore failure but retains bounded di
   assert.equal(restored.desktopRestore.status, 'ready');
   assert.equal(restored.errorKind, null);
   assert.equal(restored.desktopRestoreHistory[0].resolvedAtMs, NOW + 2);
-  assert.equal(restored.restoreRetryHalt, true);
-  assert.equal(autoContinueProblemLines(restored, true).length, 2);
+  assert.equal(restored.restoreRetryHalt, false);
+  assert.equal(autoContinueProblemLines(restored, true).length, 1);
   const exclusive = clearExclusivityBlock(restored, NOW + 3);
-  assert.deepEqual(autoContinueProblemLines(exclusive, true), [
-    'AUTO-CONTINUE BLOCKED / ACTION REQUIRED: DESKTOP_RESTORE_RETRY_HALTED',
-  ]);
+  assert.deepEqual(autoContinueProblemLines(exclusive, true), []);
   assert.equal(exclusive.exclusivityHistory[0].resolvedAtMs, NOW + 3);
 });
 
@@ -508,7 +602,7 @@ test('failed restore blocks timer retries until explicit OFF acknowledgement', (
   assert.deepEqual(autoContinueProblemLines(acknowledged, true), []);
 });
 
-test('successful Desktop restore after pre-commit App Server error blocks the next same-turn attempt', () => {
+test('successful Desktop restore after pre-commit App Server error permits the next safe plan', () => {
   const plan = decide();
   const armed = armAutomaticAttemptRetryHalt({}, plan);
   // Mirrors HEADLESS: a pre-commit App Server request fails, finally restores
@@ -525,15 +619,15 @@ test('successful Desktop restore after pre-commit App Server error blocks the ne
     continuationControllersStarted += 1;
   }
   assert.equal(failedAttempt.errorKind, 'APP_SERVER_REQUEST_FAILED');
-  assert.equal(restoreFailureBlocksAuto(failedAttempt, nextPlan), true);
-  assert.equal(restoreUnitsStarted, 1);
-  assert.equal(continuationControllersStarted, 1);
+  assert.equal(restoreFailureBlocksAuto(failedAttempt, nextPlan), false);
+  assert.equal(restoreUnitsStarted, 2);
+  assert.equal(continuationControllersStarted, 2);
   assert.equal(restoreFailureBlocksAuto(failedAttempt, decide({
     preferences: { version: 2, autoMode: 'OFF', autoContinue: false },
   })), false);
 });
 
-test('legacy APP_SERVER_REQUEST_FAILED plus ready Desktop is latched before another timer iteration', () => {
+test('legacy APP_SERVER_REQUEST_FAILED plus ready Desktop is not latched before another timer iteration', () => {
   const plan = decide();
   const stateFromFailedLiveRun = { status: 'blocked', errorKind: 'APP_SERVER_REQUEST_FAILED',
     actionRequired: true, candidateThreadId: plan.candidates[0].threadId,
@@ -541,7 +635,7 @@ test('legacy APP_SERVER_REQUEST_FAILED plus ready Desktop is latched before anot
     desktopRestore: { status: 'ready', desktopPid: 7001, desktopStartTicks: 9001 } };
   const migrated = reconcileFailedAutomaticAttempt(stateFromFailedLiveRun, decide());
   assert.equal(migrated.errorKind, 'APP_SERVER_REQUEST_FAILED');
-  assert.equal(migrated.restoreRetryHalt, true);
+  assert.equal(migrated.restoreRetryHalt, false);
 
   // This is the next systemd timer firing in the reproduced loop. Its entry
   // gate sees the same (threadId, turnId, target) and never starts restore.
@@ -551,8 +645,8 @@ test('legacy APP_SERVER_REQUEST_FAILED plus ready Desktop is latched before anot
     restoreStarts += 1;
     resumeStarts += 1;
   }
-  assert.equal(restoreStarts, 1);
-  assert.equal(resumeStarts, 1);
+  assert.equal(restoreStarts, 2);
+  assert.equal(resumeStarts, 2);
 });
 
 test('already committed candidates are excluded after crash/restart and can never be sent twice', () => {

@@ -55,6 +55,7 @@ const {
   pendingAttentionDecision,
 } = require(path.join(__dirname, '..', 'lib', 'codex-auto-continue'));
 const { autoSchedulerHealth, readAutoTimerState } = require(path.join(__dirname, '..', 'lib', 'codex-auto-scheduler'));
+const { formatInterruptedCandidate, readInterruptedMetadata } = require(path.join(__dirname, '..', 'lib', 'codex-interrupted-label'));
 const {
   tableCell,
   activationObservationHoldLine,
@@ -278,6 +279,8 @@ if (mappingOnly) {
 const interruptedCandidates = turnObserverHealth.healthy
   ? pendingInterruptedTurns(eventState, resumeState).slice(0, 6)
   : [];
+const interruptedMetadata = readInterruptedMetadata(process.env.CODEX_HOME || path.join(process.env.HOME, '.codex'),
+  interruptedCandidates, eventState);
 const pendingCandidateKeys = new Set(pendingInterruptedTurns(eventState, resumeState)
   .map(candidate => JSON.stringify([candidate.threadId, candidate.turnId])));
 const interruptedWithKeys = interruptedCandidates.map((candidate, index) => ({
@@ -307,7 +310,7 @@ const tableSeparatorOverhead = 6;
 const requestedTableWidth = Number(process.env.CODEX_STATUS_COLUMNS);
 const tableWidth = Number.isInteger(requestedTableWidth) && requestedTableWidth > 0
   ? requestedTableWidth
-  : plain(header).trimEnd().length;
+  : process.stdout.columns || plain(header).trimEnd().length;
 const accountWidth = Math.max(
   'ACCOUNT'.length,
   tableWidth - statusWidth - resetWidth - fiveHourWidth - weeklyWidth - scoreWidth - activityWidth - tableSeparatorOverhead
@@ -419,14 +422,13 @@ const activeTurnsSection = activeTurns.length > 0
 const interruptedTurnsSection = interruptedCandidates.length > 0
   ? `\n\x1b[1;33mINTERRUPTED CODEX TURNS:\x1b[0m\n${interruptedCandidates.map(candidate => {
       const accountLabel = labelByAccountId.get(candidate.accountId) || 'unknown account';
-      const thread = `…${candidate.threadId.slice(-8)}`;
-      const title = candidate.title ? ` — ${candidate.title.slice(0, 42)}` : '';
       const state = candidate.interruptionClass === 'INTERRUPTED_AFTER_WORK'
         ? 'quota-interrupted-after-work'
         : candidate.interruptionClass === 'REJECTED_BEFORE_WORK'
           ? 'quota-rejected-before-work'
           : 'quota-interruption-unverified';
-      return `\x1b[33m${accountLabel} | ${thread}${title} | ${state}\x1b[0m`;
+      return `\x1b[33m${formatInterruptedCandidate(candidate, accountLabel,
+        interruptedMetadata[candidate.threadId], state, tableWidth)}\x1b[0m`;
     }).join('\n')}`
   : '';
 problems.push(...currentResumeProblemLines(resumeState));
