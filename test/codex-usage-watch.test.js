@@ -15,6 +15,26 @@ test('status watch avoids unchanged redraws and exposes a render-only pause togg
   assert.match(source, /if \(\(paused_rendering\)\); then\s+paused_rendering=0/);
 });
 
+test('F freezes terminal writes, keeps background work, and redraws local state immediately on resume', () => {
+  const toggle = source.slice(source.indexOf('      f|F)'), source.indexOf("      '['|']'|$'\\e')"));
+  assert.match(toggle, /if \(\(display_frozen\)\); then/);
+  assert.match(toggle, /display_frozen=0[\s\S]*refresh_local_frame[\s\S]*draw_current_frame 1/);
+  assert.match(toggle, /freeze_indicator=1[\s\S]*draw_frame "\$frozen_frame"[\s\S]*display_frozen=1/);
+  assert.doesNotMatch(toggle, /process_snapshot|launch_usage_refresh|RESET_CREDITS_REFRESHER|CODEX_QUOTA_TRANSITION_BIN|CODEX_STATUS_PREFERENCES_BIN/);
+  assert.match(source, /draw_frame\(\) \{\s+\(\(display_frozen\)\) && return 0/);
+  assert.match(source, /draw_current_frame\(\) \{\s+\(\(display_frozen\)\) && return 0/);
+  const loop = source.slice(source.indexOf('while true; do'), source.indexOf('  key=\'\''));
+  assert.match(loop, /launch_usage_refresh/);
+  assert.match(loop, /finish_local_collection/);
+  assert.match(loop, /refresh_local_frame/);
+  assert.match(loop, /if \(\(SECONDS - last_background_refresh >= 10\)\); then\s+launch_usage_refresh/);
+  assert.match(loop, /if \(\(force_render\)\) && \[\[ -n \$raw_frame \]\]; then\s+process_snapshot/);
+  assert.match(source, /if \(\(!paused_rendering && !display_frozen\)\) && \(\(scroll_direction != 0\)\)/);
+  const pause = source.slice(source.indexOf('      p|P)'), source.indexOf('      f|F)'));
+  assert.match(pause, /if \(\(paused_rendering\)\); then/);
+  assert.doesNotMatch(pause, /display_frozen|freeze_indicator/);
+});
+
 test('switch spinner uses a cheap five-fps UI tick independent of collection and freezes while paused', () => {
   assert.match(source, /pending_spinner_frames=\('WAIT\/' 'WAIT─' 'WAIT\\' 'WAIT\|'\)/);
   assert.match(source, /CODEX_PENDING_STATUS='WAIT\/'/);

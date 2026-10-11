@@ -14,6 +14,7 @@ process.stdin.on('end', () => {
     columns: process.env.CODEX_STATUS_COLUMNS,
     offset: process.env.CODEX_STATUS_SCROLL_OFFSET,
     paused: process.env.CODEX_STATUS_PAUSED === '1',
+    frozen: process.env.CODEX_STATUS_FROZEN === '1',
   });
   process.stdout.write(serializeStatusFrame(result));
 });

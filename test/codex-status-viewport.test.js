@@ -6,7 +6,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const test = require('node:test');
-const { layoutStatusFrame, splitStatusFrame, serializeStatusFrame } =
+const { layoutStatusFrame, splitStatusFrame, serializeStatusFrame, physicalLines } =
   require('../lib/codex-status-viewport');
 const { displayWidth } = require('../lib/codex-interrupted-label');
 
@@ -114,6 +114,30 @@ test('paused layout keeps the pause affordance within the terminal height', () =
   assert.equal(rendered.lines.length, 13);
   assert.match(plain(rendered.lines.at(-1)), /PAUSED.*\[P\]/);
   assert.equal(splitStatusFrame(frame()).middle.some(line => line.includes('problem-7')), true);
+});
+
+test('frozen display announces F resume and preserves the middle scroll offset', () => {
+  const original = frame({ active: 8, interrupted: 8, problems: 8 });
+  const before = layoutStatusFrame(original, { rows: 13, columns: 78, offset: 5 });
+  const frozen = layoutStatusFrame(original, { rows: 13, columns: 78,
+    offset: before.offset, frozen: true });
+  const after = layoutStatusFrame(original, { rows: 13, columns: 78, offset: frozen.offset });
+  assert.equal(frozen.offset, before.offset);
+  assert.equal(after.offset, before.offset);
+  assert.match(frozen.lines.map(plain).join('\n'), /DISPLAY FROZEN · F to resume/);
+  assert.match(after.lines.map(plain).join('\n'), /F freeze display/);
+  assert.ok(serializeStatusFrame(frozen).split('\n').slice(1).length <= 13);
+  assert.ok(!serializeStatusFrame(frozen).endsWith('\n'));
+});
+
+test('freeze and pause help stays on one physical line at 77–79 columns', () => {
+  for (const columns of [77, 78, 79]) {
+    const layout = layoutStatusFrame(frame({ active: 0, interrupted: 0, problems: 0 }),
+      { rows: 24, columns });
+    const help = layout.lines.at(-1);
+    assert.match(plain(help), /F freeze display · P pause view/);
+    assert.equal(physicalLines([help], columns).length, 1);
+  }
 });
 
 test('one middle row shows actual content and moves overflow notice into fixed help', () => {

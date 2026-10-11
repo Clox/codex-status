@@ -111,6 +111,8 @@ auto_spinner_index=0
 key_map=''
 last_background_refresh=-10
 paused_rendering=0
+display_frozen=0
+freeze_indicator=0
 last_drawn_frame=''
 last_drawn_input=''
 last_drawn_rows=''
@@ -159,13 +161,15 @@ launch_usage_refresh() {
 }
 
 draw_frame() {
+  ((display_frozen)) && return 0
   local frame_to_draw=$1
   local layout_result rendered_frame
   read_terminal_size
   layout_result=$(printf '%s' "$frame_to_draw" |
     CODEX_STATUS_LINES="$terminal_rows" CODEX_STATUS_COLUMNS="$terminal_columns" \
       CODEX_STATUS_SCROLL_OFFSET="$scroll_offset" \
-      CODEX_STATUS_PAUSED="$paused_rendering" "$STATUS_VIEWPORT_BIN") || return 1
+      CODEX_STATUS_PAUSED="$paused_rendering" CODEX_STATUS_FROZEN="$freeze_indicator" \
+      "$STATUS_VIEWPORT_BIN") || return 1
   scroll_offset=${layout_result%%$'\n'*}
   rendered_frame=${layout_result#*$'\n'}
   tput rmam 2>/dev/null || printf '\033[?7l'
@@ -182,13 +186,15 @@ draw_frame() {
 }
 
 draw_current_frame() {
+  ((display_frozen)) && return 0
+  local force_draw=${1:-0}
   local display_frame=$base_frame
   if [[ -n $pending_source_row ]]; then
     display_frame=${display_frame//WAIT\//${pending_spinner_frames[$pending_spinner_index]}}
   fi
   display_frame=${display_frame//AUTO_SPINNER/${auto_spinner_frames[$auto_spinner_index]}}
   read_terminal_size
-  if ((!paused_rendering)) && { [[ $display_frame != "$last_drawn_input" ]] ||
+  if ((!paused_rendering || force_draw)) && { [[ $display_frame != "$last_drawn_input" ]] ||
       [[ $terminal_rows != "$last_drawn_rows" ]] ||
       [[ $terminal_columns != "$last_drawn_columns" ]] ||
       [[ $scroll_offset != "$last_drawn_scroll_offset" ]]; }; then
@@ -330,7 +336,8 @@ while true; do
   ui_tick=$((ui_tick + 1))
   if ((ui_tick % 5 == 0)); then
     current_script_hash=$(sha256sum "$0" 2>/dev/null | awk '{ print $1 }')
-    if [[ -z $current_script_hash || $current_script_hash != "$loaded_script_hash" ]]; then
+    if ((!display_frozen)) &&
+        [[ -z $current_script_hash || $current_script_hash != "$loaded_script_hash" ]]; then
       notify-send 'Codex-kontostatus uppdaterad' 'Statusfönstret stängs för att inte fortsätta med gammal kod. Öppna det igen.' 2>/dev/null || true
       printf '\nStatusverktyget har uppdaterats. Öppna Codex-kontostatus igen.\n'
       exit 75
@@ -455,7 +462,7 @@ while true; do
           force_render=1
           [[ -z $raw_frame ]] || process_snapshot
           force_render=0
-          draw_current_frame
+          draw_current_frame 1
         else
           paused_rendering=1
           frozen_frame=$base_frame
@@ -464,6 +471,24 @@ while true; do
           fi
           frozen_frame=${frozen_frame//AUTO_SPINNER/${auto_spinner_frames[$auto_spinner_index]}}
           draw_frame "$frozen_frame"
+        fi
+        ;;
+      f|F)
+        if ((display_frozen)); then
+          display_frozen=0
+          freeze_indicator=0
+          last_drawn_input=''
+          refresh_local_frame
+          draw_current_frame 1
+        else
+          freeze_indicator=1
+          frozen_frame=$base_frame
+          if [[ -n $pending_source_row ]]; then
+            frozen_frame=${frozen_frame//WAIT\//${pending_spinner_frames[$pending_spinner_index]}}
+          fi
+          frozen_frame=${frozen_frame//AUTO_SPINNER/${auto_spinner_frames[$auto_spinner_index]}}
+          draw_frame "$frozen_frame"
+          display_frozen=1
         fi
         ;;
       '['|']'|$'\e')
@@ -483,7 +508,7 @@ while true; do
             esac
             ;;
         esac
-        if ((!paused_rendering)) && ((scroll_direction != 0)); then
+        if ((!paused_rendering && !display_frozen)) && ((scroll_direction != 0)); then
           scroll_step=1
           if ((scroll_page)); then
             read_terminal_size
