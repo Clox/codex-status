@@ -111,6 +111,7 @@ paused_rendering=0
 last_drawn_frame=''
 last_drawn_input=''
 last_drawn_rows=''
+last_drawn_columns=''
 last_drawn_scroll_offset=''
 scroll_offset=0
 base_frame=''
@@ -121,6 +122,21 @@ ui_tick=0
 collector_tick=0
 last_columns=''
 force_render=0
+trap 'force_render=1' WINCH
+
+read_terminal_size() {
+  local size
+  size=$(stty size </dev/tty 2>/dev/null || true)
+  if [[ $size =~ ^([1-9][0-9]*)[[:space:]]+([1-9][0-9]*)$ ]]; then
+    terminal_rows=${BASH_REMATCH[1]}
+    terminal_columns=${BASH_REMATCH[2]}
+  else
+    terminal_rows=$(tput lines 2>/dev/null || printf '24')
+    terminal_columns=$(tput cols 2>/dev/null || printf '100')
+    [[ $terminal_rows =~ ^[1-9][0-9]*$ ]] || terminal_rows=24
+    [[ $terminal_columns =~ ^[1-9][0-9]*$ ]] || terminal_columns=100
+  fi
+}
 
 launch_detached() {
   setsid -f "$@" {status_lock_fd}>&- </dev/null >/dev/null 2>&1
@@ -138,11 +154,11 @@ launch_usage_refresh() {
 
 draw_frame() {
   local frame_to_draw=$1
-  local rows layout_result rendered_frame
-  rows=$(tput lines 2>/dev/null || printf '24')
-  [[ $rows =~ ^[1-9][0-9]*$ ]] || rows=24
+  local layout_result rendered_frame
+  read_terminal_size
   layout_result=$(printf '%s' "$frame_to_draw" |
-    CODEX_STATUS_LINES="$rows" CODEX_STATUS_SCROLL_OFFSET="$scroll_offset" \
+    CODEX_STATUS_LINES="$terminal_rows" CODEX_STATUS_COLUMNS="$terminal_columns" \
+      CODEX_STATUS_SCROLL_OFFSET="$scroll_offset" \
       CODEX_STATUS_PAUSED="$paused_rendering" "$STATUS_VIEWPORT_BIN") || return 1
   scroll_offset=${layout_result%%$'\n'*}
   rendered_frame=${layout_result#*$'\n'}
@@ -154,18 +170,21 @@ draw_frame() {
   tput smam 2>/dev/null || printf '\033[?7h'
   last_drawn_frame=$rendered_frame
   last_drawn_input=$frame_to_draw
-  last_drawn_rows=$rows
+  last_drawn_rows=$terminal_rows
+  last_drawn_columns=$terminal_columns
   last_drawn_scroll_offset=$scroll_offset
 }
 
 draw_current_frame() {
-  local display_frame=$base_frame rows
+  local display_frame=$base_frame
   if [[ -n $pending_source_row ]]; then
     display_frame=${display_frame//WAIT\//${pending_spinner_frames[$pending_spinner_index]}}
   fi
-  rows=$(tput lines 2>/dev/null || printf '24')
+  read_terminal_size
   if ((!paused_rendering)) && { [[ $display_frame != "$last_drawn_input" ]] ||
-      [[ $rows != "$last_drawn_rows" ]] || [[ $scroll_offset != "$last_drawn_scroll_offset" ]]; }; then
+      [[ $terminal_rows != "$last_drawn_rows" ]] ||
+      [[ $terminal_columns != "$last_drawn_columns" ]] ||
+      [[ $scroll_offset != "$last_drawn_scroll_offset" ]]; }; then
     draw_frame "$display_frame"
   fi
 }
@@ -266,8 +285,8 @@ process_snapshot() {
   fi
 }
 
-columns=$(tput cols 2>/dev/null || printf '100')
-[[ $columns =~ ^[0-9]+$ ]] || columns=100
+read_terminal_size
+columns=$terminal_columns
 last_columns=$columns
 if [[ -s $status_raw_frame_cache ]]; then
   raw_frame=$(<"$status_raw_frame_cache")
@@ -288,12 +307,12 @@ while true; do
       printf '\nStatusverktyget har uppdaterats. Öppna Codex-kontostatus igen.\n'
       exit 75
     fi
-    columns=$(tput cols 2>/dev/null || printf '100')
-    [[ $columns =~ ^[0-9]+$ ]] || columns=100
-    if [[ $columns != "$last_columns" ]]; then
-      last_columns=$columns
-      force_render=1
-    fi
+  fi
+  read_terminal_size
+  columns=$terminal_columns
+  if [[ $columns != "$last_columns" ]]; then
+    last_columns=$columns
+    force_render=1
   fi
 
   if ((SECONDS - last_background_refresh >= 10)); then
@@ -422,9 +441,8 @@ while true; do
         if ((!paused_rendering)) && ((scroll_direction != 0)); then
           scroll_step=1
           if ((scroll_page)); then
-            rows=$(tput lines 2>/dev/null || printf '24')
-            [[ $rows =~ ^[1-9][0-9]*$ ]] || rows=24
-            scroll_step=$((rows > 12 ? rows - 10 : 3))
+            read_terminal_size
+            scroll_step=$((terminal_rows > 12 ? terminal_rows - 10 : 3))
           fi
           scroll_offset=$((scroll_offset + scroll_direction * scroll_step))
           ((scroll_offset >= 0)) || scroll_offset=0

@@ -4,7 +4,9 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
-const { layoutStatusFrame, splitStatusFrame } = require('../lib/codex-status-viewport');
+const { layoutStatusFrame, splitStatusFrame, serializeStatusFrame } =
+  require('../lib/codex-status-viewport');
+const { displayWidth } = require('../lib/codex-interrupted-label');
 
 const source = fs.readFileSync(path.join(__dirname, '..', 'bin', 'codex-usage-watch'), 'utf8');
 const plain = value => String(value).replace(/\x1b\[[0-9;]*m/g, '');
@@ -123,11 +125,86 @@ test('physically undersized terminals never receive more rows than they have', (
 });
 
 test('watch uses terminal height, in-place redraw, distinct scroll keys and no trailing newline', () => {
-  assert.match(source, /rows=\$\(tput lines/);
+  assert.match(source, /stty size <\/dev\/tty/);
+  assert.match(source, /CODEX_STATUS_LINES="\$terminal_rows" CODEX_STATUS_COLUMNS="\$terminal_columns"/);
+  assert.match(source, /trap 'force_render=1' WINCH/);
   assert.match(source, /CODEX_STATUS_SCROLL_OFFSET="\$scroll_offset"/);
   assert.match(source, /printf '%s' "\$rendered_frame"/);
   assert.match(source, /tput cup 0 0/);
   assert.match(source, /'\['\|'\]'\|\$'\\e'/);
   assert.match(source, /'\[5~'/);
   assert.match(source, /'\[6~'/);
+});
+
+function physicalFrameHeight(result, columns) {
+  const wire = serializeStatusFrame(result);
+  const body = wire.slice(wire.indexOf('\n') + 1);
+  const lines = body.split('\n');
+  for (const line of lines) {
+    assert.ok(displayWidth(plain(line)) < columns,
+      `physical row exceeds ${columns - 1} cells: ${plain(line)}`);
+  }
+  return lines.length;
+}
+
+function liveShapeFrame({ extraProblems = 0 } = {}) {
+  return [
+    '\x1b[1m ACCOUNT                         5H USAGE         WEEKLY USAGE\x1b[0m',
+    '────────────────────────────────────────────────────────────────────',
+    '  01 alexander@example.test      EXHAU             EXHAU',
+    '  02 marko@example.test          OK                 OK',
+    '  03 linus@example.test          OK                 OK',
+    '  04 ogggan@example.test         OK                 OK',
+    '',
+    'RECOMMENDATION: Marko',
+    '',
+    'ACTIVE CODEX TURNS:',
+    'linus@example.test | Spadrig · Förbättra formulärvyn 界面 😀 med extra detaljer | …a08a86a9 | running',
+    'marko@example.test | Codex-status · Fixa terminalens höjd och scrollning | …f7a3e2d8 | running',
+    '',
+    'INTERRUPTED CODEX TURNS:',
+    'marko@example.test | Spadrig · Tablance navigation | …fcc0c140 | quota-interrupted-after-work',
+    '',
+    'UNAVAILABLE INTERRUPTED TURNS:',
+    'ogggan@example.test | …bda82e93 | rollout missing · awaiting retirement',
+    '',
+    'ACCOUNT PROBLEMS:',
+    '  • AUTO-CONTINUE BLOCKED / ACTION REQUIRED: …bda82e93 ROLLOUT_NOT_IN_ACTIVE_CODEX_HOME',
+    ...Array.from({ length: extraProblems }, (_, index) => `  • problem ${index}: ${'long detail '.repeat(7)}`),
+    '',
+    '\x1b[1;35mAUTO: HEADLESS · WAIT: active-turns\x1b[0m',
+  ].join('\n');
+}
+
+test('wire frame fits actual terminal rows at the boundary and during overflow', () => {
+  const columns = 78;
+  const frame = liveShapeFrame({ extraProblems: 12 });
+  for (const terminalRows of [23, 24, 25]) {
+    for (const offset of [0, 5, 999]) {
+      const result = layoutStatusFrame(frame, { rows: terminalRows, columns, offset });
+      assert.equal(physicalFrameHeight(result, columns), terminalRows);
+      const body = serializeStatusFrame(result).split('\n').slice(1);
+      assert.match(plain(body[0]), /ACCOUNT/);
+      assert.match(plain(body.slice(-5).join('\n')), /AUTO: HEADLESS/);
+      assert.ok(!serializeStatusFrame(result).endsWith('\n'));
+      assert.ok(result.below > 0 || result.above > 0);
+    }
+  }
+  const exact = layoutStatusFrame(liveShapeFrame(), { rows: 24, columns });
+  assert.equal(physicalFrameHeight(exact, columns), 24);
+  assert.match(plain(serializeStatusFrame(exact).split('\n').slice(-5).join('\n')), /AUTO: HEADLESS/);
+  const tooLong = `${serializeStatusFrame(exact)}\n`;
+  assert.equal(tooLong.slice(tooLong.indexOf('\n') + 1).split('\n').length, 25);
+});
+
+test('ANSI and wide text consume physical rows before middle scroll is chosen', () => {
+  const frame = liveShapeFrame({ extraProblems: 2 });
+  const narrow = layoutStatusFrame(frame, { rows: 20, columns: 54, offset: 999 });
+  assert.equal(physicalFrameHeight(narrow, 54), 20);
+  assert.match(plain(narrow.lines[0]), /ACCOUNT/);
+  assert.match(plain(narrow.lines.join('\n')), /AUTO: HEADLESS/);
+  const wide = layoutStatusFrame(frame, { rows: 20, columns: 110, offset: narrow.offset });
+  assert.equal(physicalFrameHeight(wide, 110), 20);
+  assert.match(plain(wide.lines[0]), /ACCOUNT/);
+  assert.notEqual(narrow.offset, wide.offset);
 });
