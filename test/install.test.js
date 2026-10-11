@@ -42,6 +42,8 @@ test('existing installation verifies and updates payload without changing privat
     fs.readFileSync(path.join(__dirname, '..', 'bin', 'codex-status-viewport'), 'utf8'));
   assert.equal(fs.readFileSync(path.join(home, '.local', 'lib', 'codex-status-viewport.js'), 'utf8'),
     fs.readFileSync(path.join(__dirname, '..', 'lib', 'codex-status-viewport.js'), 'utf8'));
+  assert.equal(fs.readFileSync(path.join(home, '.local', 'lib', 'codex-display-snapshots.js'), 'utf8'),
+    fs.readFileSync(path.join(__dirname, '..', 'lib', 'codex-display-snapshots.js'), 'utf8'));
   for (const [file, content] of privateFiles) assert.equal(fs.readFileSync(file, 'utf8'), content);
   assert.equal(fs.existsSync(path.join(home, '.local', 'state', 'codex-auth-setup-backups')), false);
 });

@@ -14,6 +14,9 @@ const {
   pruneEventState,
   turnKey,
 } = require(path.join(__dirname, '..', 'lib', 'codex-turn-observer'));
+const { readInterruptedMetadata } = require(path.join(__dirname, '..', 'lib', 'codex-interrupted-label'));
+const { updateDisplaySnapshot, pruneDisplaySnapshots } =
+  require(path.join(__dirname, '..', 'lib', 'codex-display-snapshots'));
 
 const codexHome = process.env.CODEX_HOME || path.join(process.env.HOME, '.codex');
 const cacheDirectory = process.env.XDG_CACHE_HOME
@@ -21,6 +24,7 @@ const cacheDirectory = process.env.XDG_CACHE_HOME
   : path.join(process.env.HOME, '.cache', 'codex-account-switcher');
 const statePath = process.env.CODEX_EVENT_STATE || path.join(cacheDirectory, 'turn-events.json');
 const usageCachePath = process.env.USAGE_CACHE || path.join(cacheDirectory, 'usage.json');
+const resumeStatePath = process.env.CODEX_RESUME_STATE || path.join(cacheDirectory, 'manual-resume.json');
 const registryPath = path.join(codexHome, 'accounts', 'registry.json');
 const sessionsPath = path.join(codexHome, 'sessions');
 const stateDatabasePath = path.join(codexHome, 'state_5.sqlite');
@@ -319,8 +323,25 @@ function scan() {
     for (const candidate of Object.values(state.interruptedTurns || {})) {
       if (!candidate.title) candidate.title = titleForThread(candidate.threadId);
     }
+    const visibleThreads = [...Object.values(state.activeTurns),
+      ...Object.values(state.interruptedTurns || {}),
+      ...(state.terminalTurns || []).filter(turn => nowMs - Number(turn.completedAtMs || 0) < 300_000),
+      ...batches.map(batch => ({ threadId: state.files[batch.key]?.threadId }))];
+    for (const turn of visibleThreads) {
+      if (turn.threadIdentityVerified === false || !turn.threadId || !turn.title) continue;
+      state = updateDisplaySnapshot(state, turn.threadId,
+        { threadTitle: turn.title }, 'observer-title', nowMs);
+    }
+    const metadata = readInterruptedMetadata(codexHome, visibleThreads, state);
+    for (const [threadId, found] of Object.entries(metadata)) {
+      if (found.rolloutMetadata) state = updateDisplaySnapshot(state, threadId,
+        found.rolloutMetadata, 'rollout-session-meta', nowMs);
+      if (found.dbMetadata) state = updateDisplaySnapshot(state, threadId,
+        found.dbMetadata, 'thread-db', nowMs);
+    }
     state = clearRecoveredExhaustions(state, readJson(usageCachePath, {}));
     state = pruneEventState(state, nowMs);
+    state = pruneDisplaySnapshots(state, readJson(resumeStatePath, {}));
     state.worker = {
       heartbeatAtMs: nowMs,
       lastScanAtMs: nowMs,

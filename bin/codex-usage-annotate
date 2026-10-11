@@ -55,7 +55,9 @@ const {
   pendingAttentionDecision,
 } = require(path.join(__dirname, '..', 'lib', 'codex-auto-continue'));
 const { autoSchedulerHealth, readAutoTimerState } = require(path.join(__dirname, '..', 'lib', 'codex-auto-scheduler'));
-const { formatInterruptedCandidate, readInterruptedMetadata } = require(path.join(__dirname, '..', 'lib', 'codex-interrupted-label'));
+const { formatInterruptedCandidate, readInterruptedMetadata, partitionInterruptedCandidates,
+  unavailableCandidateState } = require(path.join(__dirname, '..', 'lib', 'codex-interrupted-label'));
+const { displayMetadata } = require(path.join(__dirname, '..', 'lib', 'codex-display-snapshots'));
 const {
   tableCell,
   activationObservationHoldLine,
@@ -277,13 +279,20 @@ if (mappingOnly) {
 }
 
 const interruptedCandidates = turnObserverHealth.healthy
-  ? pendingInterruptedTurns(eventState, resumeState).slice(0, 6)
+  ? pendingInterruptedTurns(eventState, resumeState)
+  : [];
+const { available: resumableInterruptedCandidates, unavailable: unavailableInterruptedCandidates } =
+  partitionInterruptedCandidates(interruptedCandidates, autoContinueState.candidateBlocks);
+const activeTurns = turnObserverHealth.healthy
+  ? Object.values(eventState.activeTurns || {}).sort((left, right) => left.startedAtMs - right.startedAtMs)
   : [];
 const interruptedMetadata = readInterruptedMetadata(process.env.CODEX_HOME || path.join(process.env.HOME, '.codex'),
-  interruptedCandidates, eventState);
+  [...activeTurns, ...interruptedCandidates], eventState);
+const metadataForThread = threadId => displayMetadata(eventState.displaySnapshots?.[threadId],
+  interruptedMetadata[threadId]);
 const pendingCandidateKeys = new Set(pendingInterruptedTurns(eventState, resumeState)
   .map(candidate => JSON.stringify([candidate.threadId, candidate.turnId])));
-const interruptedWithKeys = interruptedCandidates.map((candidate, index) => ({
+const interruptedWithKeys = interruptedCandidates.slice(0, 6).map((candidate, index) => ({
   ...candidate,
   continueKey: String(index + 4),
 }));
@@ -405,22 +414,18 @@ const informationSection = information.length > 0
   ? `\n\x1b[1;36mACCOUNT INFO:\x1b[0m\n${information.map(line => `\x1b[36m${line}\x1b[0m`).join('\n')}`
   : '';
 const labelByAccountId = new Map(rankedRows.map(row => [row.accountId, row.label]));
-const activeTurns = turnObserverHealth.healthy
-  ? Object.values(eventState.activeTurns || {}).sort((left, right) => left.startedAtMs - right.startedAtMs)
-  : [];
 const activeTurnsSection = activeTurns.length > 0
   ? `\n\x1b[1;36mACTIVE CODEX TURNS:\x1b[0m\n${activeTurns.map(turn => {
       const accountLabel = labelByAccountId.get(turn.accountId) || 'unknown account';
-      const thread = turn.threadId ? `…${turn.threadId.slice(-8)}` : 'unknown thread';
       const role = turn.parentThreadId
         ? ` (${turn.threadSource === 'guardian_review' ? 'guardian' : 'subagent'})`
         : '';
-      const title = turn.title ? ` — ${turn.title.slice(0, 42)}` : '';
-      return `\x1b[36m${accountLabel} | ${thread}${role}${title} | running\x1b[0m`;
+      return `\x1b[36m${formatInterruptedCandidate(turn, accountLabel,
+        metadataForThread(turn.threadId), `running${role}`, tableWidth)}\x1b[0m`;
     }).join('\n')}`
   : '';
-const interruptedTurnsSection = interruptedCandidates.length > 0
-  ? `\n\x1b[1;33mINTERRUPTED CODEX TURNS:\x1b[0m\n${interruptedCandidates.map(candidate => {
+const interruptedTurnsSection = resumableInterruptedCandidates.length > 0
+  ? `\n\x1b[1;33mINTERRUPTED CODEX TURNS:\x1b[0m\n${resumableInterruptedCandidates.map(candidate => {
       const accountLabel = labelByAccountId.get(candidate.accountId) || 'unknown account';
       const state = candidate.interruptionClass === 'INTERRUPTED_AFTER_WORK'
         ? 'quota-interrupted-after-work'
@@ -428,7 +433,14 @@ const interruptedTurnsSection = interruptedCandidates.length > 0
           ? 'quota-rejected-before-work'
           : 'quota-interruption-unverified';
       return `\x1b[33m${formatInterruptedCandidate(candidate, accountLabel,
-        interruptedMetadata[candidate.threadId], state, tableWidth)}\x1b[0m`;
+        metadataForThread(candidate.threadId), state, tableWidth)}\x1b[0m`;
+    }).join('\n')}`
+  : '';
+const unavailableTurnsSection = unavailableInterruptedCandidates.length > 0
+  ? `\n\x1b[1;33mUNAVAILABLE INTERRUPTED TURNS:\x1b[0m\n${unavailableInterruptedCandidates.map(({ candidate, block }) => {
+      const accountLabel = labelByAccountId.get(candidate.accountId) || 'unknown account';
+      return `\x1b[33m${formatInterruptedCandidate(candidate, accountLabel,
+        metadataForThread(candidate.threadId), unavailableCandidateState(block), tableWidth)}\x1b[0m`;
     }).join('\n')}`
   : '';
 problems.push(...currentResumeProblemLines(resumeState));
@@ -438,6 +450,7 @@ const problemSection = problems.length > 0
 const footerParts = [
   activeTurnsSection,
   interruptedTurnsSection,
+  unavailableTurnsSection,
   informationSection,
   problemSection,
   usageQualityLine,
