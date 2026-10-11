@@ -250,7 +250,7 @@ test('unavailable turns use a separate section, exact blocks, ID fallback, and r
     }, terminalTurns: [], pendingErrors: {}, exhaustions: {},
     displaySnapshots: snapshot.displaySnapshots }));
   fs.writeFileSync(auto, JSON.stringify({ candidateBlocks: { [oldKey]: {
-    threadId: THREAD, failedTurnId: TURN, actionRequired: true,
+    threadId: THREAD, failedTurnId: TURN, actionRequired: false,
     reason: 'ROLLOUT_NOT_IN_ACTIVE_CODEX_HOME',
   } } }));
   const input = '     ACCOUNT           PLAN  5H USAGE     WEEKLY USAGE           LAST ACTIVITY\n'
@@ -268,6 +268,7 @@ test('unavailable turns use a separate section, exact blocks, ID fallback, and r
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /INTERRUPTED CODEX TURNS:[\s\S]*…bda82e94 \| quota-interrupted-after-work/);
   assert.match(result.stdout, /UNAVAILABLE INTERRUPTED TURNS:[\s\S]*Spadrig · Förbättra blankettvyn \| …bda82e93 \| rollout missing · awaiting retirement/);
+  assert.doesNotMatch(result.stdout, /AUTO-CONTINUE BLOCKED[^\n]*ROLLOUT_NOT_IN_ACTIVE_CODEX_HOME/);
   assert.doesNotMatch(result.stdout.split('UNAVAILABLE INTERRUPTED TURNS:')[0], /…bda82e93/);
   fs.writeFileSync(resume, JSON.stringify({ attempts: {}, retiredCandidates: {
     [oldKey]: { threadId: THREAD, turnId: TURN },
@@ -280,4 +281,70 @@ test('unavailable turns use a separate section, exact blocks, ID fallback, and r
     [newKey]: { threadId: THREAD, failedTurnId: TURN, actionRequired: true, reason: 'BAD' },
   });
   assert.equal(mismatched.available.length, 1);
+});
+
+test('status shows AUTO switch progress and HEADLESS continuation without duplicate interrupted row', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-auto-display-status-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const home = path.join(root, 'codex');
+  fs.mkdirSync(path.join(home, 'accounts'), { recursive: true });
+  fs.writeFileSync(path.join(home, 'accounts', 'registry.json'), JSON.stringify({ accounts: [
+    { account_key: 'source-key', chatgpt_account_id: 'source', email: 'source@example.test' },
+    { account_key: 'target-key', chatgpt_account_id: 'target', email: 'target@example.test' },
+  ] }));
+  const events = path.join(root, 'events.json');
+  const resume = path.join(root, 'resume.json');
+  const auto = path.join(root, 'auto.json');
+  const inputFile = path.join(root, 'input');
+  fs.writeFileSync(inputFile, '     ACCOUNT           PLAN  5H USAGE     WEEKLY USAGE           LAST ACTIVITY\n'
+    + '  01 source@example.test Plus  -             -               Now\n'
+    + '  02 target@example.test Plus  -             -               Now\n');
+  const snapshot = updateDisplaySnapshot({}, THREAD,
+    { name: 'Förbättra blankettvyn', projectName: 'Spadrig' }, 'thread-db', Date.now());
+  const candidate = { threadId: THREAD, turnId: TURN, accountId: 'source',
+    completedAtMs: Date.now(), resumable: true, threadIdentityVerified: true,
+    classificationVerified: true, interruptionClass: 'INTERRUPTED_AFTER_WORK' };
+  const key = turnKey(THREAD, TURN);
+  const event = { version: 4, worker: { heartbeatAtMs: Date.now(), errorKind: null },
+    files: {}, activeTurns: {}, interruptedTurns: { [key]: candidate }, terminalTurns: [],
+    pendingErrors: {}, exhaustions: {}, displaySnapshots: snapshot.displaySnapshots };
+  const env = { ...process.env, HOME: root, CODEX_HOME: home,
+    CODEX_EVENT_STATE: events, CODEX_RESUME_STATE: resume,
+    CODEX_AUTO_CONTINUE_STATE: auto,
+    CODEX_STATUS_PREFERENCES: path.join(root, 'preferences.json'),
+    CODEX_STATUS_COLUMNS: '110', CODEX_AUTO_SPINNER_PLACEHOLDER: '1' };
+  fs.writeFileSync(env.CODEX_STATUS_PREFERENCES, JSON.stringify({ version: 2,
+    autoMode: 'HEADLESS', autoContinue: true }));
+  const render = () => {
+    fs.writeFileSync(events, JSON.stringify(event));
+    return renderStatus(root, env, inputFile).stdout;
+  };
+  fs.writeFileSync(resume, JSON.stringify({ attempts: {} }));
+  fs.writeFileSync(auto, JSON.stringify({ status: 'idle' }));
+  assert.match(render(), /INTERRUPTED CODEX TURNS:[\s\S]*Spadrig · Förbättra blankettvyn/);
+  fs.writeFileSync(auto, JSON.stringify({ status: 'running', phase: 'switching auth',
+    candidateThreadId: THREAD, candidateTurnId: TURN,
+    sourceAccountId: 'source', targetAccountId: 'target' }));
+  let frame = render();
+  assert.match(frame, /HEADLESS CONTINUATION:[\s\S]*AUTO_SPINNER [^\n]*Spadrig · Förbättra blankettvyn[^\n]*switching auth/);
+  assert.match(frame, /source@example\.tes → target@example\.tes · switching auth/);
+  assert.doesNotMatch(frame, /INTERRUPTED CODEX TURNS:/);
+  fs.writeFileSync(resume, JSON.stringify({ attempts: { [key]: {
+    threadId: THREAD, interruptedTurnId: TURN, accountId: 'source', targetAccountId: 'target',
+    committedAtMs: Date.now(), status: 'RESUME_COMMITTED', automatic: true,
+  } } }));
+  event.activeTurns = { running: { threadId: THREAD, turnId: 'continuation-turn',
+    accountId: 'target', startedAtMs: Date.now() } };
+  fs.writeFileSync(auto, JSON.stringify({ status: 'waiting', waitingReason: 'resume-already-running' }));
+  frame = render();
+  assert.match(frame, /HEADLESS CONTINUATION:[\s\S]*Spadrig · Förbättra blankettvyn[^\n]*running/);
+  assert.match(frame, /AUTO: HEADLESS · RUNNING/);
+  assert.doesNotMatch(frame, /ACTIVE CODEX TURNS:|INTERRUPTED CODEX TURNS:/);
+  fs.writeFileSync(resume, JSON.stringify({ attempts: { [key]: {
+    threadId: THREAD, interruptedTurnId: TURN, continuationTurnId: 'continuation-turn',
+    committedAtMs: Date.now(), status: 'COMPLETED',
+  } } }));
+  fs.writeFileSync(auto, JSON.stringify({ status: 'completed' }));
+  frame = render();
+  assert.doesNotMatch(frame, /HEADLESS CONTINUATION:|ACTIVE CODEX TURNS:|INTERRUPTED CODEX TURNS:/);
 });

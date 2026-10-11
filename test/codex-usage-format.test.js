@@ -141,3 +141,9 @@ test('renders exact-width cells with stable alignment and no separator padding',
   assert.equal(fitCell('42', 5, 'right'), '   42');
   assert.equal(Array.from(tableCell('RESET', 8)).length, 9);
 });
+
+test('cell fitting uses terminal cells for wide account names', () => {
+  assert.equal(fitCell('界😀abc', 6), '界😀ab');
+  assert.equal(fitCell('界😀abc', 5), '界😀a');
+  assert.equal(fitCell('界😀abc', 3), '界 ');
+});

@@ -939,8 +939,14 @@ async function automaticHeadlessMain() {
     blockedCandidates = blockedCandidates.filter(candidate =>
       !retiredKeys.has(candidateKey(candidate.threadId, candidate.turnId)));
     if (lockedPlan.candidates.length === 0) {
-      writeAutoContinueState({ status: 'blocked', waitingReason: null,
+      const onlyMissing = blockedCandidates.length > 0 && blockedCandidates.every(candidate =>
+        partition.candidateBlocks[candidateKey(candidate.threadId, candidate.turnId)]?.reason ===
+          'ROLLOUT_NOT_IN_ACTIVE_CODEX_HOME');
+      writeAutoContinueState({ status: onlyMissing || blockedCandidates.length === 0 ? 'waiting' : 'blocked',
+        waitingReason: blockedCandidates.length === 0 ? 'no-candidates' :
+          (onlyMissing ? 'unavailable-candidates' : null),
         errorKind: null, actionRequired: false, pending: null,
+        candidateBlocks: blockedCandidates.length === 0 ? {} : partition.candidateBlocks,
         candidateThreadId: blockedCandidates[0]?.threadId || null,
         candidateTurnId: blockedCandidates[0]?.turnId || null,
         targetAccountId: fullPlan.target.accountId });
@@ -1011,6 +1017,8 @@ async function automaticHeadlessMain() {
     }
     const attemptState = beginExclusivityAttempt(adoptAutomaticPlan(readAutoContinueState()), exclusivityContext, {
       status: 'running',
+      phase: 'preparing',
+      sourceAccountId: initial.active?.accountId || null,
       lastAttemptAtMs: Date.now(),
       errorKind: null,
       actionRequired: false,
@@ -1027,7 +1035,9 @@ async function automaticHeadlessMain() {
     assertAutomaticOwnership();
     const ownedPlan = autoDecisionSnapshot();
     if (!sameHeadlessDecisionPlan(lockedPlan, ownedPlan, blockedCandidates)) throw new Error('AUTO_PLAN_CHANGED_BEFORE_SWITCH');
+    writeAutoContinueState({ phase: 'switching auth' });
     switchToTarget(ownedPlan.target);
+    writeAutoContinueState({ phase: 'verifying target' });
     refreshUsageNow();
     const switchedPlan = autoDecisionSnapshot();
     if (!sameHeadlessDecisionPlan(lockedPlan, switchedPlan, blockedCandidates)) throw new Error('AUTO_PLAN_CHANGED_AFTER_SWITCH');
@@ -1036,6 +1046,8 @@ async function automaticHeadlessMain() {
     for (let index = 0; index < plannedCandidates.length; index += 1) {
       currentCandidate = plannedCandidates[index];
       committed = false;
+      writeAutoContinueState({ phase: 'starting continuation',
+        candidateThreadId: currentCandidate.threadId, candidateTurnId: currentCandidate.turnId });
       await waitForObserverIdleAfterTurn();
       refreshUsageNow();
       const remainingPlan = autoDecisionSnapshot();
@@ -1061,10 +1073,12 @@ async function automaticHeadlessMain() {
         let journal = normalizeResumeState(readJson(resumeStatePath, emptyResumeState()));
         journal = markResumeCommitted(journal, persisted, {
           targetAccountId: target.accountId,
+          automatic: true,
           continuation,
         });
         atomicWriteJson(resumeStatePath, journal);
         committed = true;
+        writeAutoContinueState({ phase: 'running' });
       }, { automatic: true });
 
       const finalTarget = activeAccountState();
@@ -1081,6 +1095,8 @@ async function automaticHeadlessMain() {
 
     writeAutoContinueState({
       status: 'completed',
+      phase: null,
+      sourceAccountId: null,
       lastSuccessAtMs: Date.now(),
       errorKind: null,
       actionRequired: false,
@@ -1420,6 +1436,7 @@ async function automaticDesktopMain() {
     }
     const attemptState = beginExclusivityAttempt(adoptAutomaticPlan(readAutoContinueState()), exclusivityContext, {
       status: 'desktop-preparing', lastAttemptAtMs: Date.now(), errorKind: null,
+      phase: 'preparing', sourceAccountId: initial.active?.accountId || null,
       actionRequired: false, candidateThreadId: lockedPlan.candidates[0]?.threadId || null,
       candidateTurnId: lockedPlan.candidates[0]?.turnId || null,
       targetAccountId: lockedPlan.target.accountId, pending: null,
@@ -1431,7 +1448,9 @@ async function automaticDesktopMain() {
     assertAutomaticOwnership();
     const ownedPlan = autoDecisionSnapshot();
     if (!sameDecisionPlan(lockedPlan, ownedPlan)) throw new Error('AUTO_PLAN_CHANGED_BEFORE_SWITCH');
+    writeAutoContinueState({ phase: 'switching auth' });
     switchToTarget(ownedPlan.target);
+    writeAutoContinueState({ phase: 'verifying target' });
     refreshUsageNow();
     const switchedPlan = autoDecisionSnapshot();
     if (!sameDecisionPlan(ownedPlan, switchedPlan)) throw new Error('AUTO_PLAN_CHANGED_AFTER_SWITCH');
@@ -1455,6 +1474,8 @@ async function automaticDesktopMain() {
     for (let index = 0; index < plannedCandidates.length; index += 1) {
       currentCandidate = plannedCandidates[index];
       promptInjected = false;
+      writeAutoContinueState({ phase: 'starting continuation',
+        candidateThreadId: currentCandidate.threadId, candidateTurnId: currentCandidate.turnId });
       const target = activeAccountState();
       if (target.accountId !== switchedPlan.target.accountId || target.accountKey !== switchedPlan.target.accountKey) {
         throw new Error('ACTIVE_ACCOUNT_CHANGED');
@@ -1539,6 +1560,7 @@ async function automaticDesktopMain() {
         journal = markDesktopSendCommitted(journal, commitCandidate, commitPlan, capability, eventState);
         atomicWriteJson(resumeStatePath, journal);
         anyCommitted = true;
+        writeAutoContinueState({ phase: 'running' });
 
         // Claim the one permitted action before writing to the long-lived
         // helper. If either process dies now, reconciliation may only observe.
@@ -1567,6 +1589,7 @@ async function automaticDesktopMain() {
     }
     writeAutoContinueState({
       status: 'completed', lastSuccessAtMs: Date.now(), errorKind: null,
+      phase: null, sourceAccountId: null,
       actionRequired: false, candidateThreadId: null, candidateTurnId: null,
       targetAccountId: switchedPlan.target.accountId, pending: null,
       restoreRetryHalt: false, restoreRetryHaltGeneration: null,

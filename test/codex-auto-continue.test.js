@@ -203,9 +203,8 @@ test('missing oldest rollout is reported locally while the next candidate reache
     assert.deepEqual(selected.plan.candidates.map(candidate => candidate.threadId), ['thread-second']);
     assert.equal(selected.candidateBlocks['["thread-first","turn-first"]'].reason,
       'ROLLOUT_NOT_IN_ACTIVE_CODEX_HOME');
-    assert.equal(selected.candidateBlocks['["thread-first","turn-first"]'].actionRequired, true);
-    assert.match(autoContinueProblemLine({ candidateBlocks: selected.candidateBlocks }, true),
-      /ad-first ROLLOUT_NOT_IN_ACTIVE_CODEX_HOME/);
+    assert.equal(selected.candidateBlocks['["thread-first","turn-first"]'].actionRequired, false);
+    assert.deepEqual(autoContinueProblemLines({ candidateBlocks: selected.candidateBlocks }, true), []);
     assert.equal(sameHeadlessDecisionPlan(selected.plan, decide(), selected.blocked), true);
     assert.deepEqual(await headlessStoragePreflight(home, selected.plan.candidates), { ok: true });
     const oldFailedAttempt = { status: 'blocked', actionRequired: true,
@@ -233,6 +232,27 @@ test('missing oldest rollout is reported locally while the next candidate reache
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }
+});
+
+test('isolated missing rollout is informational while a genuine global blocker remains visible', () => {
+  const missing = { '["thread-first","turn-first"]': {
+    threadId: 'thread-first', failedTurnId: 'turn-first',
+    reason: 'ROLLOUT_NOT_IN_ACTIVE_CODEX_HOME', actionRequired: false,
+  } };
+  assert.deepEqual(autoContinueProblemLines({ status: 'blocked', candidateBlocks: missing }, true), []);
+  assert.equal(autoContinueStatusLine({ autoMode: 'HEADLESS' },
+    { status: 'blocked', candidateBlocks: missing }, NOW),
+  'AUTO: HEADLESS · WAIT: unavailable-candidates');
+  assert.equal(autoContinueStatusLine({ autoMode: 'HEADLESS' },
+    { status: 'waiting', waitingReason: 'active-turns', candidateBlocks: missing }, NOW),
+  'AUTO: HEADLESS · WAIT: active-turns');
+  const global = { status: 'blocked', candidateBlocks: missing,
+    actionRequired: true, errorKind: 'MANUAL_DRAFT_JOURNAL_UNVERIFIED' };
+  assert.deepEqual(autoContinueProblemLines(global, true), [
+    'AUTO-CONTINUE BLOCKED / ACTION REQUIRED: MANUAL_DRAFT_JOURNAL_UNVERIFIED',
+  ]);
+  assert.equal(autoContinueStatusLine({ autoMode: 'HEADLESS' }, global, NOW),
+    'AUTO: HEADLESS · BLOCKED');
 });
 
 test('active-turn waiting reason remains visible in AUTO status', () => {

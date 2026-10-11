@@ -2,7 +2,9 @@
 
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
+const { spawnSync } = require('node:child_process');
 const test = require('node:test');
 const { layoutStatusFrame, splitStatusFrame, serializeStatusFrame } =
   require('../lib/codex-status-viewport');
@@ -45,6 +47,19 @@ test('small terminal pins table, recommendation, AUTO and help while scrolling c
   assert.match(lines.at(-1), /scroll.*P pause/);
   assert.match(lines.join('\n'), /↓ more/);
   assert.equal(lines.includes('problem-7'), false);
+});
+
+test('AUTO continuation progress stays inside the middle viewport at 77–79 columns', () => {
+  const progressFrame = frame({ active: 2, interrupted: 2, problems: 3 })
+    .replace('ACTIVE CODEX TURNS:', 'HEADLESS CONTINUATION:\n/ target@example.test | Spadrig · Förbättra blankettvyn | …bda82e93 | switching auth\nsource@example.test → target@example.test · switching auth\n\nACTIVE CODEX TURNS:');
+  for (const columns of [77, 78, 79]) {
+    const layout = layoutStatusFrame(progressFrame, { rows: 13, columns });
+    const rendered = serializeStatusFrame(layout);
+    assert.equal(layout.lines.map(plain)[0], 'ACCOUNT │ STATUS');
+    assert.match(layout.lines.map(plain).join('\n'), /AUTO: HEADLESS/);
+    assert.ok(rendered.split('\n').slice(1).length <= 13);
+    assert.equal(rendered.endsWith('\n'), false);
+  }
 });
 
 test('user scroll survives refresh, exposes above/below and clamps when content shrinks', () => {
@@ -207,4 +222,56 @@ test('ANSI and wide text consume physical rows before middle scroll is chosen', 
   assert.equal(physicalFrameHeight(wide, 110), 20);
   assert.match(plain(wide.lines[0]), /ACCOUNT/);
   assert.notEqual(narrow.offset, wide.offset);
+});
+
+test('four-account table stays exactly six physical rows at 77, 78 and 79 columns', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-table-viewport-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const home = path.join(root, 'codex');
+  fs.mkdirSync(path.join(home, 'accounts'), { recursive: true });
+  const labels = ['alexander@example.test', 'marko@example.test',
+    'linus@example.test', 'ogggan@example.test'];
+  fs.writeFileSync(path.join(home, 'accounts', 'registry.json'), JSON.stringify({ accounts:
+    labels.map((email, index) => ({ email, chatgpt_account_id: `account-${index}` })),
+  }));
+  const input = [
+    '     ACCOUNT                    PLAN  5H USAGE     WEEKLY USAGE           LAST ACTIVITY',
+    '-------------------------------------------------------------------------------------------',
+    ...labels.map((label, index) => `  0${index + 1} ${label.padEnd(27)} Plus  -             -                      Now`),
+  ].join('\n');
+  const inputFile = path.join(root, 'input');
+  const outputFile = path.join(root, 'output');
+  const errorFile = path.join(root, 'error');
+  fs.writeFileSync(inputFile, input);
+  for (const columns of [77, 78, 79]) {
+    const descriptors = [fs.openSync(inputFile, 'r'), fs.openSync(outputFile, 'w'),
+      fs.openSync(errorFile, 'w')];
+    let result;
+    try {
+      result = spawnSync(process.execPath,
+        [path.join(__dirname, '..', 'bin', 'codex-usage-annotate')], {
+          env: { ...process.env, HOME: root, CODEX_HOME: home,
+            CODEX_STATUS_COLUMNS: String(columns),
+            CODEX_STATUS_PREFERENCES: path.join(root, 'missing-preferences.json') },
+          stdio: descriptors, timeout: 5_000,
+        });
+    } finally {
+      for (const descriptor of descriptors) fs.closeSync(descriptor);
+    }
+    assert.equal(result.status, 0, fs.readFileSync(errorFile, 'utf8') || result.error?.message);
+    const annotated = fs.readFileSync(outputFile, 'utf8');
+    const sections = splitStatusFrame(annotated);
+    assert.equal(sections.table.length, 6);
+    const layout = layoutStatusFrame(annotated, { rows: 24, columns });
+    assert.equal(physicalFrameHeight(layout, columns), 24);
+    const table = layout.lines.slice(0, 6).map(plain);
+    assert.match(table[0], /ACCOUNT.*STATU.*RESETS.*5H USAGE.*WEEKLY USAGE.*PRIOR.*ACTIVITY/);
+    assert.match(table[1], /┼/);
+    for (let index = 0; index < 4; index++) {
+      assert.match(table[index + 2], new RegExp(`0${index + 1}`));
+      assert.equal(table[index + 2].split('│').length, 7);
+    }
+    assert.ok(table.every(line => line.trim() && displayWidth(line) < columns));
+    assert.ok(!serializeStatusFrame(layout).endsWith('\n'));
+  }
 });

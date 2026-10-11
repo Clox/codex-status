@@ -50,10 +50,23 @@ test('recommendation precedes dynamic sections and magenta auto-continue remains
 
 test('pending AUTO renders countdown attention and exposes an isolated X cancel action', () => {
   assert.match(annotateSource, /pendingAttentionDecision\(autoContinueState, statusPreferences\.autoContinue === true, nowMs\)/);
-  assert.match(annotateSource, /autoContinueStatusLine\(statusPreferences, autoContinueState, nowMs\)/);
+  assert.match(annotateSource, /autoContinueStatusLine\(statusPreferences, autoContinueState, nowMs, \{ operation \}\)/);
   assert.match(source, /x\|X\)/);
   assert.match(source, /grep -Fq '\[X\] Avbryt'/);
   assert.match(source, /cancel-auto-pending/);
+});
+
+test('AUTO animation and countdown redraw locally without extra usage refresh', () => {
+  const local = source.slice(source.indexOf('refresh_local_frame() {'),
+    source.indexOf('signal_launcher_ready() {'));
+  assert.match(local, /CODEX_STATUS_NOW_MS="\$now_ms" "\$USAGE_ANNOTATOR"/);
+  assert.doesNotMatch(local, /USAGE_REFRESHER|launch_usage_refresh|CODEX_QUOTA_TRANSITION_BIN/);
+  assert.match(source, /display_frame=\$\{display_frame\/\/AUTO_SPINNER/);
+  assert.match(source, /auto_spinner_frames=\('\/' '-' '\\' '\|'\)/);
+  assert.match(source, /live_interval=5[\s\S]*AUTO_SPINNER[\s\S]*live_interval=1/);
+  assert.match(source, /if \(\(SECONDS != last_live_second\)\)/);
+  assert.match(source, /if \(\(!paused_rendering\)\) && \[\[ \$base_frame == \*AUTO_SPINNER\* \]\]/);
+  assert.equal((source.match(/launch_usage_refresh\n/g) || []).length, 1);
 });
 
 test('a quota recovery event sends one labelled desktop notification and persistent attention', () => {

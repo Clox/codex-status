@@ -58,6 +58,7 @@ const { autoSchedulerHealth, readAutoTimerState } = require(path.join(__dirname,
 const { formatInterruptedCandidate, readInterruptedMetadata, partitionInterruptedCandidates,
   unavailableCandidateState } = require(path.join(__dirname, '..', 'lib', 'codex-interrupted-label'));
 const { displayMetadata } = require(path.join(__dirname, '..', 'lib', 'codex-display-snapshots'));
+const { autoDisplayPlan } = require(path.join(__dirname, '..', 'lib', 'codex-auto-display'));
 const {
   tableCell,
   activationObservationHoldLine,
@@ -281,13 +282,15 @@ if (mappingOnly) {
 const interruptedCandidates = turnObserverHealth.healthy
   ? pendingInterruptedTurns(eventState, resumeState)
   : [];
-const { available: resumableInterruptedCandidates, unavailable: unavailableInterruptedCandidates } =
-  partitionInterruptedCandidates(interruptedCandidates, autoContinueState.candidateBlocks);
 const activeTurns = turnObserverHealth.healthy
   ? Object.values(eventState.activeTurns || {}).sort((left, right) => left.startedAtMs - right.startedAtMs)
   : [];
+const displayPlan = autoDisplayPlan(autoContinueState, resumeState, eventState,
+  interruptedCandidates, activeTurns, statusPreferences.autoMode || 'OFF');
+const { available: resumableInterruptedCandidates, unavailable: unavailableInterruptedCandidates } =
+  partitionInterruptedCandidates(displayPlan.interrupted, autoContinueState.candidateBlocks);
 const interruptedMetadata = readInterruptedMetadata(process.env.CODEX_HOME || path.join(process.env.HOME, '.codex'),
-  [...activeTurns, ...interruptedCandidates], eventState);
+  [...activeTurns, ...interruptedCandidates, ...(displayPlan.operation ? [displayPlan.operation] : [])], eventState);
 const metadataForThread = threadId => displayMetadata(eventState.displaySnapshots?.[threadId],
   interruptedMetadata[threadId]);
 const pendingCandidateKeys = new Set(pendingInterruptedTurns(eventState, resumeState)
@@ -318,8 +321,8 @@ const activityWidth = 8;
 const tableSeparatorOverhead = 6;
 const requestedTableWidth = Number(process.env.CODEX_STATUS_COLUMNS);
 const tableWidth = Number.isInteger(requestedTableWidth) && requestedTableWidth > 0
-  ? requestedTableWidth
-  : process.stdout.columns || plain(header).trimEnd().length;
+  ? Math.max(1, requestedTableWidth - 1)
+  : Math.max(1, (process.stdout.columns || plain(header).trimEnd().length) - 1);
 const accountWidth = Math.max(
   'ACCOUNT'.length,
   tableWidth - statusWidth - resetWidth - fiveHourWidth - weeklyWidth - scoreWidth - activityWidth - tableSeparatorOverhead
@@ -414,8 +417,8 @@ const informationSection = information.length > 0
   ? `\n\x1b[1;36mACCOUNT INFO:\x1b[0m\n${information.map(line => `\x1b[36m${line}\x1b[0m`).join('\n')}`
   : '';
 const labelByAccountId = new Map(rankedRows.map(row => [row.accountId, row.label]));
-const activeTurnsSection = activeTurns.length > 0
-  ? `\n\x1b[1;36mACTIVE CODEX TURNS:\x1b[0m\n${activeTurns.map(turn => {
+const activeTurnsSection = displayPlan.activeTurns.length > 0
+  ? `\n\x1b[1;36mACTIVE CODEX TURNS:\x1b[0m\n${displayPlan.activeTurns.map(turn => {
       const accountLabel = labelByAccountId.get(turn.accountId) || 'unknown account';
       const role = turn.parentThreadId
         ? ` (${turn.threadSource === 'guardian_review' ? 'guardian' : 'subagent'})`
@@ -424,8 +427,27 @@ const activeTurnsSection = activeTurns.length > 0
         metadataForThread(turn.threadId), `running${role}`, tableWidth)}\x1b[0m`;
     }).join('\n')}`
   : '';
-const interruptedTurnsSection = resumableInterruptedCandidates.length > 0
-  ? `\n\x1b[1;33mINTERRUPTED CODEX TURNS:\x1b[0m\n${resumableInterruptedCandidates.map(candidate => {
+const operation = displayPlan.operation;
+const autoSpinner = process.env.CODEX_AUTO_SPINNER_PLACEHOLDER === '1' ? 'AUTO_SPINNER' : '/';
+const operationSection = operation
+  ? `\n\x1b[1;36m${operation.mode} CONTINUATION:\x1b[0m\n\x1b[36m${autoSpinner} ${formatInterruptedCandidate(
+      operation, labelByAccountId.get(operation.targetAccountId) || 'unknown account',
+      metadataForThread(operation.threadId), operation.phase, tableWidth - 2)}\x1b[0m` +
+    (operation.sourceAccountId && operation.targetAccountId &&
+      operation.sourceAccountId !== operation.targetAccountId
+      ? `\n\x1b[36m${labelByAccountId.get(operation.sourceAccountId) || 'source'} → ${labelByAccountId.get(operation.targetAccountId) || 'target'} · ${operation.phase}\x1b[0m`
+      : '')
+  : '';
+const queuedCandidates = operation ? resumableInterruptedCandidates : [];
+const waitingCandidates = operation ? [] : resumableInterruptedCandidates;
+const queuedTurnsSection = queuedCandidates.length > 0
+  ? `\n\x1b[1;33mQUEUED INTERRUPTED TURNS:\x1b[0m\n${queuedCandidates.map(candidate =>
+      `\x1b[33m${formatInterruptedCandidate(candidate,
+        labelByAccountId.get(candidate.accountId) || 'unknown account',
+        metadataForThread(candidate.threadId), 'queued/next', tableWidth)}\x1b[0m`).join('\n')}`
+  : '';
+const interruptedTurnsSection = waitingCandidates.length > 0
+  ? `\n\x1b[1;33mINTERRUPTED CODEX TURNS:\x1b[0m\n${waitingCandidates.map(candidate => {
       const accountLabel = labelByAccountId.get(candidate.accountId) || 'unknown account';
       const state = candidate.interruptionClass === 'INTERRUPTED_AFTER_WORK'
         ? 'quota-interrupted-after-work'
@@ -449,12 +471,14 @@ const problemSection = problems.length > 0
   : '';
 const footerParts = [
   activeTurnsSection,
+  operationSection,
+  queuedTurnsSection,
   interruptedTurnsSection,
   unavailableTurnsSection,
   informationSection,
   problemSection,
   usageQualityLine,
 ].filter(Boolean).map(section => section.replace(/^\n/, ''));
-footerParts.push(`\x1b[1;35m${autoContinueStatusLine(statusPreferences, autoContinueState, nowMs)}\x1b[0m`);
+footerParts.push(`\x1b[1;35m${autoContinueStatusLine(statusPreferences, autoContinueState, nowMs, { operation })}\x1b[0m`);
 const footer = footerParts.join('\n\n');
 process.stdout.write(`${output.join('\n').trimEnd()}\n\n${renderedRecommendationLines.join('\n')}\n\n${footer}`);

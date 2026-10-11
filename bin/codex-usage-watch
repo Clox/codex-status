@@ -34,6 +34,7 @@ CODEX_QUOTA_TRANSITION_STATE=${CODEX_QUOTA_TRANSITION_STATE:-"${XDG_CACHE_HOME:-
 CODEX_QUOTA_TRANSITION_BIN=${CODEX_QUOTA_TRANSITION_BIN:-"$HOME/.local/bin/codex-quota-transition"}
 export CODEX_RESUME_STATE CODEX_MANUAL_RESUME CODEX_STATUS_PREFERENCES CODEX_STATUS_PREFERENCES_BIN
 export CODEX_AUTO_CONTINUE_STATE
+export CODEX_AUTO_SPINNER_PLACEHOLDER=1
 export CODEX_QUOTA_TRANSITION_STATE CODEX_QUOTA_TRANSITION_BIN
 USAGE_REFRESH_LOG=${USAGE_REFRESH_LOG:-"${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/usage-refresh.log"}
 loaded_script_hash=$(sha256sum "$0" | awk '{ print $1 }')
@@ -105,6 +106,8 @@ pending_source_row=''
 pending_since=0
 pending_spinner_index=0
 pending_spinner_frames=('WAIT/' 'WAIT─' 'WAIT\' 'WAIT|')
+auto_spinner_frames=('/' '-' '\' '|')
+auto_spinner_index=0
 key_map=''
 last_background_refresh=-10
 paused_rendering=0
@@ -122,6 +125,9 @@ ui_tick=0
 collector_tick=0
 last_columns=''
 force_render=0
+last_live_second=-1
+last_live_render=-10
+last_runtime_signature=''
 trap 'force_render=1' WINCH
 
 read_terminal_size() {
@@ -180,12 +186,32 @@ draw_current_frame() {
   if [[ -n $pending_source_row ]]; then
     display_frame=${display_frame//WAIT\//${pending_spinner_frames[$pending_spinner_index]}}
   fi
+  display_frame=${display_frame//AUTO_SPINNER/${auto_spinner_frames[$auto_spinner_index]}}
   read_terminal_size
   if ((!paused_rendering)) && { [[ $display_frame != "$last_drawn_input" ]] ||
       [[ $terminal_rows != "$last_drawn_rows" ]] ||
       [[ $terminal_columns != "$last_drawn_columns" ]] ||
       [[ $scroll_offset != "$last_drawn_scroll_offset" ]]; }; then
     draw_frame "$display_frame"
+  fi
+}
+
+runtime_signature() {
+  stat -c '%n:%Y:%s' "$CODEX_AUTO_CONTINUE_STATE" "$CODEX_RESUME_STATE" \
+    "$CODEX_EVENT_STATE" "$CODEX_STATUS_PREFERENCES" 2>/dev/null || true
+}
+
+refresh_local_frame() {
+  [[ -n $raw_frame ]] || return 0
+  local refreshed now_ms
+  now_ms=$(($(date +%s) * 1000))
+  if refreshed=$(printf '%s\n' "$raw_frame" |
+      CODEX_STATUS_RANKING=1 CODEX_STATUS_COLUMNS="$columns" \
+      CODEX_PENDING_SOURCE_ROW="$pending_source_row" CODEX_PENDING_STATUS='WAIT/' \
+      CODEX_STATUS_NOW_MS="$now_ms" "$USAGE_ANNOTATOR"); then
+    base_frame=$refreshed
+    last_live_render=$SECONDS
+    last_runtime_signature=$(runtime_signature)
   fi
 }
 
@@ -277,6 +303,8 @@ process_snapshot() {
       attention_json=$(printf '{"worthy":true,"immediate":true,"persistentUntilFocus":true,"fingerprint":"%s","situationClass":"quota-recovered","observationKey":"%s"}' "$recovery_fingerprint" "$recovery_fingerprint")
     fi
     base_frame=$frame
+    last_live_render=$SECONDS
+    last_runtime_signature=$(runtime_signature)
     if [[ -n $attention_fd ]]; then
       printf '%s\n' "$attention_json" >&"$attention_fd" 2>/dev/null || attention_fd=''
     fi
@@ -335,9 +363,25 @@ while true; do
     force_render=0
   fi
 
+  if ((SECONDS != last_live_second)); then
+    last_live_second=$SECONDS
+    current_runtime_signature=$(runtime_signature)
+    live_interval=5
+    if [[ $base_frame == *AUTO_SPINNER* || $base_frame == *'[X] Avbryt'* ]]; then
+      live_interval=1
+    fi
+    if [[ $current_runtime_signature != "$last_runtime_signature" ]] ||
+        ((SECONDS - last_live_render >= live_interval)); then
+      refresh_local_frame
+    fi
+  fi
+
   draw_current_frame
   if ((!paused_rendering)) && [[ -n $pending_source_row ]]; then
     pending_spinner_index=$(((pending_spinner_index + 1) % ${#pending_spinner_frames[@]}))
+  fi
+  if ((!paused_rendering)) && [[ $base_frame == *AUTO_SPINNER* ]]; then
+    auto_spinner_index=$(((auto_spinner_index + 1) % ${#auto_spinner_frames[@]}))
   fi
 
   key=''
@@ -418,6 +462,7 @@ while true; do
           if [[ -n $pending_source_row ]]; then
             frozen_frame=${frozen_frame//WAIT\//${pending_spinner_frames[$pending_spinner_index]}}
           fi
+          frozen_frame=${frozen_frame//AUTO_SPINNER/${auto_spinner_frames[$auto_spinner_index]}}
           draw_frame "$frozen_frame"
         fi
         ;;
