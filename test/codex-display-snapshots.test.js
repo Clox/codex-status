@@ -270,6 +270,15 @@ test('unavailable turns use a separate section, exact blocks, ID fallback, and r
   assert.match(result.stdout, /UNAVAILABLE INTERRUPTED TURNS:[\s\S]*Spadrig · Förbättra blankettvyn \| …bda82e93 \| rollout missing · awaiting retirement/);
   assert.doesNotMatch(result.stdout, /AUTO-CONTINUE BLOCKED[^\n]*ROLLOUT_NOT_IN_ACTIVE_CODEX_HOME/);
   assert.doesNotMatch(result.stdout.split('UNAVAILABLE INTERRUPTED TURNS:')[0], /…bda82e93/);
+  fs.writeFileSync(env.CODEX_STATUS_PREFERENCES, JSON.stringify({ version: 2, autoMode: 'HEADLESS' }));
+  fs.writeFileSync(auto, JSON.stringify({ status: 'waiting', waitingReason: 'active-turns',
+    candidateBlocks: { [oldKey]: { threadId: THREAD, failedTurnId: TURN,
+      actionRequired: true, reason: 'ROLLOUT_METADATA_UNVERIFIED' } } }));
+  result = render();
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /UNAVAILABLE INTERRUPTED TURNS:[\s\S]*rollout metadata unverified · unavailable/);
+  assert.doesNotMatch(result.stdout, /AUTO-CONTINUE BLOCKED[^\n]*ROLLOUT_METADATA_UNVERIFIED|rollout metadata unverified · action required|AUTO: HEADLESS · BLOCKED/);
+  assert.match(result.stdout, /AUTO: HEADLESS · WAIT: active-turns/);
   fs.writeFileSync(resume, JSON.stringify({ attempts: {}, retiredCandidates: {
     [oldKey]: { threadId: THREAD, turnId: TURN },
   } }));

@@ -1,0 +1,38 @@
+#!/usr/bin/env node
+'use strict';
+
+const { spawnSync } = require('node:child_process');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+
+let frame = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', chunk => { frame += chunk; });
+process.stdin.on('end', () => {
+  // Copy the logical frame before the viewport clips its middle section.
+  // Remove terminal control sequences and keep the table and line breaks.
+  const plain = frame.replace(/\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))/g, '')
+    .replace(/\r/g, '').replace(/\n*$/, '\n');
+  const commands = process.env.WAYLAND_DISPLAY
+    ? [['wl-copy', ['--type', 'text/plain;charset=utf-8']], ['xclip', ['-selection', 'clipboard']]]
+    : [['xclip', ['-selection', 'clipboard']], ['wl-copy', ['--type', 'text/plain;charset=utf-8']]];
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-status-copy-'));
+  const file = path.join(directory, 'status.txt');
+  try {
+    fs.writeFileSync(file, plain, { mode: 0o600 });
+    for (const [command, args] of commands) {
+      const input = fs.openSync(file, 'r');
+      let result;
+      try {
+        result = spawnSync(command, args, { stdio: [input, 'ignore', 'ignore'], timeout: 3000 });
+      } finally {
+        fs.closeSync(input);
+      }
+      if (!result.error && result.status === 0) return;
+    }
+    process.exitCode = 1;
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});

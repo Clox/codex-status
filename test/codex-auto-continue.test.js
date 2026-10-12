@@ -255,6 +255,33 @@ test('isolated missing rollout is informational while a genuine global blocker r
     'AUTO: HEADLESS · BLOCKED');
 });
 
+test('candidate-local unverified rollout metadata remains unavailable without global action', async () => {
+  const candidate = { threadId: 'thread-first', turnId: 'turn-first' };
+  const healthy = { threadId: 'thread-second', turnId: 'turn-second' };
+  const partition = await partitionHeadlessCandidates({ action: 'resume', candidates: [candidate, healthy] },
+    async item => item === candidate ? { ok: false, reason: 'ROLLOUT_METADATA_UNVERIFIED' } : { ok: true },
+    {}, NOW);
+  assert.deepEqual(partition.plan.candidates, [healthy]);
+  assert.equal(partition.candidateBlocks['["thread-first","turn-first"]'].actionRequired, false);
+  const local = { status: 'blocked', candidateBlocks: partition.candidateBlocks };
+  assert.deepEqual(autoContinueProblemLines(local, true), []);
+  assert.equal(autoContinueStatusLine({ autoMode: 'HEADLESS' }, local, NOW),
+    'AUTO: HEADLESS · WAIT: unavailable-candidates');
+  assert.deepEqual(autoContinueProblemLines({ ...local, status: 'waiting',
+    waitingReason: 'active-turns' }, true), []);
+  const dangerous = { ...local, actionRequired: true, errorKind: 'MANUAL_DRAFT_JOURNAL_UNVERIFIED' };
+  assert.match(autoContinueProblemLines(dangerous, true)[0], /ACTION REQUIRED/);
+  assert.equal(autoContinueStatusLine({ autoMode: 'HEADLESS' }, dangerous, NOW),
+    'AUTO: HEADLESS · BLOCKED');
+  const explicit = { status: 'blocked', candidateBlocks: {
+    '["thread-first","turn-first"]': { ...partition.candidateBlocks['["thread-first","turn-first"]'],
+      blocksAutomation: true, requiredAction: 'repair ambiguous rollout ownership' },
+  } };
+  assert.match(autoContinueProblemLines(explicit, true)[0], /ACTION REQUIRED/);
+  assert.equal(autoContinueStatusLine({ autoMode: 'HEADLESS' }, explicit, NOW),
+    'AUTO: HEADLESS · BLOCKED');
+});
+
 test('active-turn waiting reason remains visible in AUTO status', () => {
   const observed = eventState({ activeTurns: { running: { threadId: 'other' } } });
   const waiting = decide({ eventState: observed });

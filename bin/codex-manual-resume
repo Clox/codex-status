@@ -939,12 +939,14 @@ async function automaticHeadlessMain() {
     blockedCandidates = blockedCandidates.filter(candidate =>
       !retiredKeys.has(candidateKey(candidate.threadId, candidate.turnId)));
     if (lockedPlan.candidates.length === 0) {
-      const onlyMissing = blockedCandidates.length > 0 && blockedCandidates.every(candidate =>
-        partition.candidateBlocks[candidateKey(candidate.threadId, candidate.turnId)]?.reason ===
-          'ROLLOUT_NOT_IN_ACTIVE_CODEX_HOME');
-      writeAutoContinueState({ status: onlyMissing || blockedCandidates.length === 0 ? 'waiting' : 'blocked',
+      const onlyUnavailable = blockedCandidates.length > 0 && blockedCandidates.every(candidate =>
+        ['ROLLOUT_NOT_IN_ACTIVE_CODEX_HOME', 'ROLLOUT_METADATA_UNVERIFIED'].includes(
+          partition.candidateBlocks[candidateKey(candidate.threadId, candidate.turnId)]?.reason) &&
+        partition.candidateBlocks[candidateKey(candidate.threadId, candidate.turnId)]?.blocksAutomation !== true &&
+        !partition.candidateBlocks[candidateKey(candidate.threadId, candidate.turnId)]?.requiredAction);
+      writeAutoContinueState({ status: onlyUnavailable || blockedCandidates.length === 0 ? 'waiting' : 'blocked',
         waitingReason: blockedCandidates.length === 0 ? 'no-candidates' :
-          (onlyMissing ? 'unavailable-candidates' : null),
+          (onlyUnavailable ? 'unavailable-candidates' : null),
         errorKind: null, actionRequired: false, pending: null,
         candidateBlocks: blockedCandidates.length === 0 ? {} : partition.candidateBlocks,
         candidateThreadId: blockedCandidates[0]?.threadId || null,

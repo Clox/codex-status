@@ -111,8 +111,8 @@ auto_spinner_index=0
 key_map=''
 last_background_refresh=-10
 paused_rendering=0
-display_frozen=0
-freeze_indicator=0
+copy_feedback=''
+copy_feedback_until=0
 last_drawn_frame=''
 last_drawn_input=''
 last_drawn_rows=''
@@ -161,14 +161,13 @@ launch_usage_refresh() {
 }
 
 draw_frame() {
-  ((display_frozen)) && return 0
   local frame_to_draw=$1
   local layout_result rendered_frame
   read_terminal_size
   layout_result=$(printf '%s' "$frame_to_draw" |
     CODEX_STATUS_LINES="$terminal_rows" CODEX_STATUS_COLUMNS="$terminal_columns" \
       CODEX_STATUS_SCROLL_OFFSET="$scroll_offset" \
-      CODEX_STATUS_PAUSED="$paused_rendering" CODEX_STATUS_FROZEN="$freeze_indicator" \
+      CODEX_STATUS_PAUSED="$paused_rendering" CODEX_STATUS_COPY_FEEDBACK="$copy_feedback" \
       "$STATUS_VIEWPORT_BIN") || return 1
   scroll_offset=${layout_result%%$'\n'*}
   rendered_frame=${layout_result#*$'\n'}
@@ -186,7 +185,6 @@ draw_frame() {
 }
 
 draw_current_frame() {
-  ((display_frozen)) && return 0
   local force_draw=${1:-0}
   local display_frame=$base_frame
   if [[ -n $pending_source_row ]]; then
@@ -336,8 +334,7 @@ while true; do
   ui_tick=$((ui_tick + 1))
   if ((ui_tick % 5 == 0)); then
     current_script_hash=$(sha256sum "$0" 2>/dev/null | awk '{ print $1 }')
-    if ((!display_frozen)) &&
-        [[ -z $current_script_hash || $current_script_hash != "$loaded_script_hash" ]]; then
+    if [[ -z $current_script_hash || $current_script_hash != "$loaded_script_hash" ]]; then
       notify-send 'Codex-kontostatus uppdaterad' 'Statusfönstret stängs för att inte fortsätta med gammal kod. Öppna det igen.' 2>/dev/null || true
       printf '\nStatusverktyget har uppdaterats. Öppna Codex-kontostatus igen.\n'
       exit 75
@@ -345,6 +342,10 @@ while true; do
   fi
   read_terminal_size
   columns=$terminal_columns
+  if [[ -n $copy_feedback ]] && ((SECONDS >= copy_feedback_until)); then
+    copy_feedback=''
+    last_drawn_input=''
+  fi
   if [[ $columns != "$last_columns" ]]; then
     last_columns=$columns
     force_render=1
@@ -473,22 +474,24 @@ while true; do
           draw_frame "$frozen_frame"
         fi
         ;;
-      f|F)
-        if ((display_frozen)); then
-          display_frozen=0
-          freeze_indicator=0
-          last_drawn_input=''
-          refresh_local_frame
+      c|C)
+        refresh_local_frame
+        copy_frame=$base_frame
+        if [[ -n $pending_source_row ]]; then
+          copy_frame=${copy_frame//WAIT\//${pending_spinner_frames[$pending_spinner_index]}}
+        fi
+        copy_frame=${copy_frame//AUTO_SPINNER/${auto_spinner_frames[$auto_spinner_index]}}
+        if printf '%s' "$copy_frame" | "$(dirname -- "$0")/codex-status-copy"; then
+          copy_feedback='Status copied'
+        else
+          copy_feedback='Copy failed'
+        fi
+        copy_feedback_until=$((SECONDS + 2))
+        last_drawn_input=''
+        if ((!paused_rendering)); then
           draw_current_frame 1
         else
-          freeze_indicator=1
-          frozen_frame=$base_frame
-          if [[ -n $pending_source_row ]]; then
-            frozen_frame=${frozen_frame//WAIT\//${pending_spinner_frames[$pending_spinner_index]}}
-          fi
-          frozen_frame=${frozen_frame//AUTO_SPINNER/${auto_spinner_frames[$auto_spinner_index]}}
-          draw_frame "$frozen_frame"
-          display_frozen=1
+          notify-send 'Codex-kontostatus' "$copy_feedback" 2>/dev/null || true
         fi
         ;;
       '['|']'|$'\e')
@@ -508,7 +511,7 @@ while true; do
             esac
             ;;
         esac
-        if ((!paused_rendering && !display_frozen)) && ((scroll_direction != 0)); then
+        if ((!paused_rendering)) && ((scroll_direction != 0)); then
           scroll_step=1
           if ((scroll_page)); then
             read_terminal_size
