@@ -1,0 +1,18 @@
+#!/usr/bin/env node
+'use strict';
+
+const path = require('node:path');
+const { runAccountSwitch } = require(path.join(__dirname, '..', 'lib', 'codex-account-switch-core'));
+
+const [codexHome, targetAccountKey] = process.argv.slice(2);
+if (!codexHome || !targetAccountKey) {
+  process.stderr.write('Usage: codex-account-switch-core <CODEX_HOME> <account-key>\n');
+  process.exit(64);
+}
+try {
+  runAccountSwitch({ codexHome, targetAccountKey, authBin: process.env.CODEX_AUTH_BIN || 'codex-auth',
+    source: 'manual' });
+} catch (error) {
+  process.stderr.write(`Account switch failed: ${error.message}\n`);
+  process.exitCode = 3;
+}

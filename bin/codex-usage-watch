@@ -30,10 +30,12 @@ CODEX_MANUAL_RESUME=${CODEX_MANUAL_RESUME:-"$HOME/.local/bin/codex-manual-resume
 CODEX_STATUS_PREFERENCES=${CODEX_STATUS_PREFERENCES:-"${XDG_CONFIG_HOME:-$HOME/.config}/codex-account-switcher/status-preferences.json"}
 CODEX_STATUS_PREFERENCES_BIN=${CODEX_STATUS_PREFERENCES_BIN:-"$HOME/.local/bin/codex-status-preferences"}
 CODEX_AUTO_CONTINUE_STATE=${CODEX_AUTO_CONTINUE_STATE:-"${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/auto-continue.json"}
+CODEX_ACCOUNT_SWITCH_STATE=${CODEX_ACCOUNT_SWITCH_STATE:-"${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/account-switch.json"}
 CODEX_QUOTA_TRANSITION_STATE=${CODEX_QUOTA_TRANSITION_STATE:-"${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/quota-transition.json"}
 CODEX_QUOTA_TRANSITION_BIN=${CODEX_QUOTA_TRANSITION_BIN:-"$HOME/.local/bin/codex-quota-transition"}
 export CODEX_RESUME_STATE CODEX_MANUAL_RESUME CODEX_STATUS_PREFERENCES CODEX_STATUS_PREFERENCES_BIN
 export CODEX_AUTO_CONTINUE_STATE
+export CODEX_ACCOUNT_SWITCH_STATE
 export CODEX_AUTO_SPINNER_PLACEHOLDER=1
 export CODEX_QUOTA_TRANSITION_STATE CODEX_QUOTA_TRANSITION_BIN
 USAGE_REFRESH_LOG=${USAGE_REFRESH_LOG:-"${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/usage-refresh.log"}
@@ -202,7 +204,7 @@ draw_current_frame() {
 
 runtime_signature() {
   stat -c '%n:%Y:%s' "$CODEX_AUTO_CONTINUE_STATE" "$CODEX_RESUME_STATE" \
-    "$CODEX_EVENT_STATE" "$CODEX_STATUS_PREFERENCES" 2>/dev/null || true
+    "$CODEX_EVENT_STATE" "$CODEX_STATUS_PREFERENCES" "$CODEX_ACCOUNT_SWITCH_STATE" 2>/dev/null || true
 }
 
 refresh_local_frame() {

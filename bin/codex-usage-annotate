@@ -58,6 +58,8 @@ const { autoSchedulerHealth, readAutoTimerState } = require(path.join(__dirname,
 const { formatInterruptedCandidate, readInterruptedMetadata, partitionInterruptedCandidates,
   unavailableCandidateState } = require(path.join(__dirname, '..', 'lib', 'codex-interrupted-label'));
 const { displayMetadata } = require(path.join(__dirname, '..', 'lib', 'codex-display-snapshots'));
+const { resolveActiveAccount } = require(path.join(__dirname, '..', 'lib', 'codex-account-state'));
+const { displaySwitchState, readSwitchState } = require(path.join(__dirname, '..', 'lib', 'codex-account-switch-core'));
 const { autoDisplayPlan } = require(path.join(__dirname, '..', 'lib', 'codex-auto-display'));
 const {
   tableCell,
@@ -143,6 +145,7 @@ function configuredAccountNumber(account) {
 }
 
 let accounts = [];
+let verifiedActiveAccountId = null;
 let resetCreditsByAccountId = {};
 let serverUsageByAccountId = {};
 let usageCacheState = {};
@@ -159,6 +162,10 @@ try {
   accounts = Array.isArray(registry.accounts)
     ? registry.accounts
     : Object.values(registry.accounts || {});
+  try {
+    const auth = JSON.parse(fs.readFileSync(path.join(path.dirname(path.dirname(registryPath)), 'auth.json'), 'utf8'));
+    verifiedActiveAccountId = resolveActiveAccount(registry, auth).accountId;
+  } catch {}
 } catch {
   if (mappingOnly || resumeMappingOnly || attentionOnly || availabilityOnly) process.exit(1);
   process.stdout.write(input);
@@ -251,9 +258,13 @@ for (const [lineIndex, visible] of visibleLines.entries()) {
   }));
 }
 
+const switchState = displaySwitchState(readSwitchState(), nowMs);
+const shownRows = verifiedActiveAccountId
+  ? sourceRows.map(row => ({ ...row, active: row.accountId === verifiedActiveAccountId }))
+  : sourceRows;
 const rankedRows = rankingEnabled
-  ? rankAccounts(sourceRows, { nowMs })
-  : sourceRows.map((row, index) => ({
+  ? rankAccounts(shownRows, { nowMs })
+  : shownRows.map((row, index) => ({
       ...scoreAccount(row, { nowMs }),
       rank: index + 1,
     }));
@@ -357,7 +368,10 @@ const output = lines.map((line, lineIndex) => {
   const row = rankedByLineIndex.get(lineIndex);
   if (!row) return line;
 
-  const pending = pendingSourceRow === row.sourceRow ? pendingStatus : false;
+  const switching = switchState && ['preparing', 'switching', 'verifying'].includes(switchState.phase);
+  const pending = switching && row.accountId === switchState.targetAccountId
+    ? pendingStatus : pendingSourceRow === row.sourceRow && !switchState?.targetAccountId
+      ? pendingStatus : false;
   const rendered = renderAccountTableRow(row, {
     columns,
     accountWidth,
@@ -417,6 +431,13 @@ const informationSection = information.length > 0
   ? `\n\x1b[1;36mACCOUNT INFO:\x1b[0m\n${information.map(line => `\x1b[36m${line}\x1b[0m`).join('\n')}`
   : '';
 const labelByAccountId = new Map(rankedRows.map(row => [row.accountId, row.label]));
+const switchPhaseLabel = { preparing: 'preparing', switching: 'switching auth',
+  verifying: 'verifying target', completed: 'verified', failed: 'failed' };
+const switchSpinner = switchState && ['preparing', 'switching', 'verifying'].includes(switchState.phase)
+  ? `${process.env.CODEX_AUTO_SPINNER_PLACEHOLDER === '1' ? 'AUTO_SPINNER' : '/'} ` : '';
+const accountSwitchSection = switchSpinner && switchState?.sourceAccountId && switchState?.targetAccountId
+  ? `\n\x1b[1;36mACCOUNT SWITCH:\x1b[0m\n\x1b[36m${switchSpinner}${labelByAccountId.get(switchState.sourceAccountId) || 'source'} → ${labelByAccountId.get(switchState.targetAccountId) || 'target'} · ${switchPhaseLabel[switchState.phase]}\x1b[0m`
+  : '';
 const activeTurnsSection = displayPlan.activeTurns.length > 0
   ? `\n\x1b[1;36mACTIVE CODEX TURNS:\x1b[0m\n${displayPlan.activeTurns.map(turn => {
       const accountLabel = labelByAccountId.get(turn.accountId) || 'unknown account';
@@ -429,17 +450,18 @@ const activeTurnsSection = displayPlan.activeTurns.length > 0
   : '';
 const operation = displayPlan.operation;
 const autoSpinner = process.env.CODEX_AUTO_SPINNER_PLACEHOLDER === '1' ? 'AUTO_SPINNER' : '/';
+const continuationAccountId = operation?.committed && operation.phase === 'running'
+  ? (verifiedActiveAccountId || operation.targetAccountId)
+  : operation?.targetAccountId;
 const operationSection = operation
-  ? `\n\x1b[1;36m${operation.mode} CONTINUATION:\x1b[0m\n\x1b[36m${autoSpinner} ${formatInterruptedCandidate(
-      operation, labelByAccountId.get(operation.targetAccountId) || 'unknown account',
-      metadataForThread(operation.threadId), operation.phase, tableWidth - 2)}\x1b[0m` +
-    (operation.sourceAccountId && operation.targetAccountId &&
-      operation.sourceAccountId !== operation.targetAccountId
-      ? `\n\x1b[36m${labelByAccountId.get(operation.sourceAccountId) || 'source'} → ${labelByAccountId.get(operation.targetAccountId) || 'target'} · ${operation.phase}\x1b[0m`
-      : '')
+  ? `\n\x1b[1;36m${operation.mode} CONTINUATION:\x1b[0m\n\x1b[36m${operation.committed && operation.phase === 'running' ? `${autoSpinner} ` : ''}${formatInterruptedCandidate(
+      operation, labelByAccountId.get(continuationAccountId) || 'unknown account',
+      metadataForThread(operation.threadId), operation.phase, tableWidth - 2)}\x1b[0m`
   : '';
-const queuedCandidates = operation ? resumableInterruptedCandidates : [];
-const waitingCandidates = operation ? [] : resumableInterruptedCandidates;
+const batchActive = operation || (autoContinueState.status === 'running' &&
+  statusPreferences.autoMode === 'HEADLESS');
+const queuedCandidates = batchActive ? resumableInterruptedCandidates : [];
+const waitingCandidates = batchActive ? [] : resumableInterruptedCandidates;
 const queuedTurnsSection = queuedCandidates.length > 0
   ? `\n\x1b[1;33mQUEUED INTERRUPTED TURNS:\x1b[0m\n${queuedCandidates.map(candidate =>
       `\x1b[33m${formatInterruptedCandidate(candidate,
@@ -472,6 +494,7 @@ const problemSection = problems.length > 0
 const footerParts = [
   activeTurnsSection,
   operationSection,
+  accountSwitchSection,
   queuedTurnsSection,
   interruptedTurnsSection,
   unavailableTurnsSection,

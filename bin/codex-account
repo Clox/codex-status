@@ -16,6 +16,7 @@ source "$config_file"
 export CODEX_HOME
 export PATH="$NODE_BIN_DIR:${PATH:-/usr/local/bin:/usr/bin:/bin}"
 ACCOUNT_STATE_CHECKER=${ACCOUNT_STATE_CHECKER:-"$HOME/.local/bin/codex-account-state"}
+ACCOUNT_SWITCH_CORE=${ACCOUNT_SWITCH_CORE:-"$(dirname -- "$0")/codex-account-switch-core"}
 CONTINUATION_DRAFTS=${CONTINUATION_DRAFTS:-"$HOME/.local/bin/codex-continuation-drafts"}
 USAGE_REFRESHER=${USAGE_REFRESHER:-"$HOME/.local/bin/codex-usage-refresh"}
 operation_lock_dir=${CODEX_OPERATION_LOCK_DIR:-"${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/exclusive-codex-operation.lock"}
@@ -137,15 +138,8 @@ if [[ $launch_desktop == true ]] && desktop_running; then
   fi
 fi
 
-if ! "$CODEX_AUTH_BIN" switch "${upstream_selector:-$account_selector}"; then
-  message='codex-auth kunde inte byta konto. Kör codex-auth list i en terminal för detaljer.'
-  notify-send 'Codex-kontobyte misslyckades' "$message" 2>/dev/null || true
-  printf '%s\n' "$message" >&2
-  exit 1
-fi
-
-if ! "$ACCOUNT_STATE_CHECKER" verify "$CODEX_HOME" "$expected_account_id" "$expected_account_key"; then
-  message='Kontobytets postcondition misslyckades: global auth och aktiv registry-post överensstämmer inte. Desktop startas inte.'
+if ! CODEX_AUTH_BIN="$CODEX_AUTH_BIN" "$ACCOUNT_SWITCH_CORE" "$CODEX_HOME" "$expected_account_key"; then
+  message='Kontobytet eller dess auth-verifiering misslyckades. Desktop startas inte.'
   notify-send 'Codex-kontobyte stoppat' "$message" 2>/dev/null || true
   printf '%s\n' "$message" >&2
   exit 3

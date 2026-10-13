@@ -297,17 +297,23 @@ test('status shows AUTO switch progress and HEADLESS continuation without duplic
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const home = path.join(root, 'codex');
   fs.mkdirSync(path.join(home, 'accounts'), { recursive: true });
-  fs.writeFileSync(path.join(home, 'accounts', 'registry.json'), JSON.stringify({ accounts: [
+  const registryFile = path.join(home, 'accounts', 'registry.json');
+  fs.writeFileSync(registryFile, JSON.stringify({ active_account_key: 'source-key', accounts: [
     { account_key: 'source-key', chatgpt_account_id: 'source', email: 'source@example.test' },
     { account_key: 'target-key', chatgpt_account_id: 'target', email: 'target@example.test' },
+    { account_key: 'later-key', chatgpt_account_id: 'later', email: 'later@example.test' },
   ] }));
+  const authFile = path.join(home, 'auth.json');
+  fs.writeFileSync(authFile, JSON.stringify({ tokens: { account_id: 'source' } }));
+  const switchFile = path.join(root, 'switch.json');
   const events = path.join(root, 'events.json');
   const resume = path.join(root, 'resume.json');
   const auto = path.join(root, 'auto.json');
   const inputFile = path.join(root, 'input');
   fs.writeFileSync(inputFile, '     ACCOUNT           PLAN  5H USAGE     WEEKLY USAGE           LAST ACTIVITY\n'
     + '  01 source@example.test Plus  -             -               Now\n'
-    + '  02 target@example.test Plus  -             -               Now\n');
+    + '  02 target@example.test Plus  -             -               Now\n'
+    + '  03 later@example.test Plus  -             -               Now\n');
   const snapshot = updateDisplaySnapshot({}, THREAD,
     { name: 'Förbättra blankettvyn', projectName: 'Spadrig' }, 'thread-db', Date.now());
   const candidate = { threadId: THREAD, turnId: TURN, accountId: 'source',
@@ -321,7 +327,8 @@ test('status shows AUTO switch progress and HEADLESS continuation without duplic
     CODEX_EVENT_STATE: events, CODEX_RESUME_STATE: resume,
     CODEX_AUTO_CONTINUE_STATE: auto,
     CODEX_STATUS_PREFERENCES: path.join(root, 'preferences.json'),
-    CODEX_STATUS_COLUMNS: '110', CODEX_AUTO_SPINNER_PLACEHOLDER: '1' };
+    CODEX_STATUS_COLUMNS: '110', CODEX_AUTO_SPINNER_PLACEHOLDER: '1',
+    CODEX_ACCOUNT_SWITCH_STATE: switchFile };
   fs.writeFileSync(env.CODEX_STATUS_PREFERENCES, JSON.stringify({ version: 2,
     autoMode: 'HEADLESS', autoContinue: true }));
   const render = () => {
@@ -334,10 +341,39 @@ test('status shows AUTO switch progress and HEADLESS continuation without duplic
   fs.writeFileSync(auto, JSON.stringify({ status: 'running', phase: 'switching auth',
     candidateThreadId: THREAD, candidateTurnId: TURN,
     sourceAccountId: 'source', targetAccountId: 'target' }));
+  fs.writeFileSync(switchFile, JSON.stringify({ source: 'auto', phase: 'switching',
+    sourceAccountId: 'source', targetAccountId: 'target', updatedAtMs: Date.now() }));
   let frame = render();
-  assert.match(frame, /HEADLESS CONTINUATION:[\s\S]*AUTO_SPINNER [^\n]*Spadrig · Förbättra blankettvyn[^\n]*switching auth/);
-  assert.match(frame, /source@example\.tes → target@example\.tes · switching auth/);
+  assert.match(frame, /HEADLESS CONTINUATION:[\s\S]*Spadrig · Förbättra blankettvyn[^\n]*switching auth/);
+  assert.doesNotMatch(frame, /AUTO_SPINNER [^\n]*Spadrig · Förbättra blankettvyn/);
+  assert.match(frame, /ACCOUNT SWITCH:[\s\S]*AUTO_SPINNER source@example\.tes → target@example\.tes · switching auth/);
+  assert.match(frame, /WAIT\//);
   assert.doesNotMatch(frame, /INTERRUPTED CODEX TURNS:/);
+  // The observer still reports the failed turn while a journal refresh briefly
+  // removes it from the pending list. AUTO ownership keeps its display stable.
+  fs.writeFileSync(resume, JSON.stringify({ attempts: { [key]: {
+    threadId: THREAD, interruptedTurnId: TURN, status: 'PREFILL_STARTED', automatic: true,
+  } } }));
+  for (let refresh = 0; refresh < 3; refresh += 1) {
+    frame = render();
+    assert.match(frame, /HEADLESS CONTINUATION:[\s\S]*Spadrig · Förbättra blankettvyn[^\n]*switching auth/);
+    assert.doesNotMatch(frame, /QUEUED INTERRUPTED TURNS:|INTERRUPTED CODEX TURNS:/);
+  }
+  fs.writeFileSync(resume, JSON.stringify({ attempts: {} }));
+  fs.writeFileSync(switchFile, JSON.stringify({ source: 'manual', phase: 'switching',
+    sourceAccountId: 'source', targetAccountId: 'target', updatedAtMs: Date.now() }));
+  assert.match(render(), /ACCOUNT SWITCH:[\s\S]*AUTO_SPINNER source@example\.tes → target@example\.tes · switching auth/);
+  fs.writeFileSync(registryFile, JSON.stringify({ active_account_key: 'target-key', accounts: [
+    { account_key: 'source-key', chatgpt_account_id: 'source', email: 'source@example.test' },
+    { account_key: 'target-key', chatgpt_account_id: 'target', email: 'target@example.test' },
+    { account_key: 'later-key', chatgpt_account_id: 'later', email: 'later@example.test' },
+  ] }));
+  fs.writeFileSync(authFile, JSON.stringify({ tokens: { account_id: 'target' } }));
+  fs.writeFileSync(switchFile, JSON.stringify({ source: 'auto', phase: 'completed',
+    sourceAccountId: 'source', targetAccountId: 'target', updatedAtMs: Date.now() }));
+  frame = render();
+  assert.match(frame, /\*02 target@example\.tes/);
+  assert.doesNotMatch(frame, /ACCOUNT SWITCH:|Account:|source@example\.tes → target@example\.tes/);
   fs.writeFileSync(resume, JSON.stringify({ attempts: { [key]: {
     threadId: THREAD, interruptedTurnId: TURN, accountId: 'source', targetAccountId: 'target',
     committedAtMs: Date.now(), status: 'RESUME_COMMITTED', automatic: true,
@@ -346,9 +382,26 @@ test('status shows AUTO switch progress and HEADLESS continuation without duplic
     accountId: 'target', startedAtMs: Date.now() } };
   fs.writeFileSync(auto, JSON.stringify({ status: 'waiting', waitingReason: 'resume-already-running' }));
   frame = render();
-  assert.match(frame, /HEADLESS CONTINUATION:[\s\S]*Spadrig · Förbättra blankettvyn[^\n]*running/);
+  assert.match(frame, /HEADLESS CONTINUATION:[^\n]*\n\x1b\[36mAUTO_SPINNER target@example\.tes \| Spadrig · Förbättra blankettvyn[^\n]*running/);
   assert.match(frame, /AUTO: HEADLESS · RUNNING/);
-  assert.doesNotMatch(frame, /ACTIVE CODEX TURNS:|INTERRUPTED CODEX TURNS:/);
+  assert.doesNotMatch(frame, /ACTIVE CODEX TURNS:|INTERRUPTED CODEX TURNS:|ACCOUNT SWITCH:|Account:|source@example\.tes → target@example\.tes/);
+  fs.writeFileSync(switchFile, JSON.stringify({ source: 'auto', phase: 'switching',
+    sourceAccountId: 'target', targetAccountId: 'later', updatedAtMs: Date.now() }));
+  frame = render();
+  assert.match(frame, /ACCOUNT SWITCH:[\s\S]*AUTO_SPINNER target@example\.tes → later@example\.test · switching auth/);
+  assert.doesNotMatch(frame, /source@example\.tes → target@example\.tes → later|Account:/);
+  fs.writeFileSync(registryFile, JSON.stringify({ active_account_key: 'later-key', accounts: [
+    { account_key: 'source-key', chatgpt_account_id: 'source', email: 'source@example.test' },
+    { account_key: 'target-key', chatgpt_account_id: 'target', email: 'target@example.test' },
+    { account_key: 'later-key', chatgpt_account_id: 'later', email: 'later@example.test' },
+  ] }));
+  fs.writeFileSync(authFile, JSON.stringify({ tokens: { account_id: 'later' } }));
+  fs.writeFileSync(switchFile, JSON.stringify({ source: 'auto', phase: 'completed',
+    sourceAccountId: 'target', targetAccountId: 'later', updatedAtMs: Date.now() }));
+  frame = render();
+  assert.match(frame, /\*03 later@example\.test/);
+  assert.match(frame, /HEADLESS CONTINUATION:[^\n]*\n\x1b\[36mAUTO_SPINNER later@example\.test \| Spadrig · Förbättra blankettvyn[^\n]*running/);
+  assert.doesNotMatch(frame, /ACCOUNT SWITCH:|Account:|target@example\.tes → later@example\.test|source@example\.tes → later@example\.test/);
   fs.writeFileSync(resume, JSON.stringify({ attempts: { [key]: {
     threadId: THREAD, interruptedTurnId: TURN, continuationTurnId: 'continuation-turn',
     committedAtMs: Date.now(), status: 'COMPLETED',

@@ -52,6 +52,40 @@ test('manual committed attempt is not mislabeled as AUTO continuation', () => {
   assert.equal(autoDisplayPlan({ status: 'idle' }, journal, {}, [], [], 'HEADLESS').operation, null);
 });
 
+test('AUTO-owned exact turn stays in continuation across lagging observer refreshes', () => {
+  const auto = { status: 'running', phase: 'preparing', candidateThreadId: candidate.threadId,
+    candidateTurnId: candidate.turnId, sourceAccountId: 'source', targetAccountId: 'target' };
+  const event = { interruptedTurns: { stale: candidate } };
+  for (const pending of [[candidate, later], [later], [candidate, later]]) {
+    const frame = autoDisplayPlan(auto, {}, event, pending, [], 'HEADLESS');
+    assert.equal(frame.operation.threadId, candidate.threadId);
+    assert.equal(frame.operation.failedTurnId, candidate.turnId);
+    assert.equal(frame.operation.phase, 'preparing');
+    assert.deepEqual(frame.interrupted, [later]);
+  }
+  const abandoned = autoDisplayPlan({ ...auto, status: 'waiting', waitingReason: 'plan-changed' },
+    {}, event, [candidate, later], [], 'HEADLESS');
+  assert.equal(abandoned.operation, null);
+  assert.deepEqual(abandoned.interrupted, [candidate, later]);
+});
+
+test('queued candidate becomes the only running continuation after the prior turn is terminal', () => {
+  const third = { threadId: 'thread-c', turnId: 'turn-third', accountId: 'source' };
+  const journal = { attempts: {
+    first: { threadId: candidate.threadId, interruptedTurnId: candidate.turnId,
+      continuationTurnId: 'continued-a', status: 'COMPLETED', automatic: true },
+    second: { threadId: later.threadId, interruptedTurnId: later.turnId,
+      targetAccountId: 'target-b', committedAtMs: 200, status: 'RESUME_COMMITTED', automatic: true },
+  } };
+  const displayed = autoDisplayPlan({ status: 'running', phase: 'running',
+    candidateThreadId: later.threadId, candidateTurnId: later.turnId }, journal, {},
+  [later, third], [{ threadId: later.threadId, turnId: 'continued-b' }], 'HEADLESS');
+  assert.equal(displayed.operation.threadId, later.threadId);
+  assert.equal(displayed.operation.phase, 'running');
+  assert.deepEqual(displayed.interrupted, [third]);
+  assert.deepEqual(displayed.activeTurns, []);
+});
+
 test('countdown derives seconds from local deadline without usage data', () => {
   const state = { status: 'pending', pending: { fingerprint: 'plan', deadlineAtMs: 20_000 } };
   assert.match(autoContinueStatusLine({ autoMode: 'HEADLESS' }, state, 10_000), /om 10s/);

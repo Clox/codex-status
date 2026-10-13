@@ -86,6 +86,7 @@ test('AUTO animation and countdown redraw locally without extra usage refresh', 
   assert.match(source, /if \(\(SECONDS != last_live_second\)\)/);
   assert.match(source, /if \(\(!paused_rendering\)\) && \[\[ \$base_frame == \*AUTO_SPINNER\* \]\]/);
   assert.equal((source.match(/launch_usage_refresh\n/g) || []).length, 1);
+  assert.match(source, /runtime_signature\(\) \{[\s\S]*CODEX_ACCOUNT_SWITCH_STATE/);
 });
 
 test('a quota recovery event sends one labelled desktop notification and persistent attention', () => {

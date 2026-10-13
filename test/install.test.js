@@ -22,6 +22,7 @@ test('existing installation verifies and updates payload without changing privat
     [path.join(configDir, 'accounts.conf'), 'ACCOUNT_1=private\n'],
     [path.join(configDir, 'status-preferences.json'), '{"autoMode":"HEADLESS"}\n'],
     [path.join(cacheDir, 'auto-continue.json'), '{"status":"blocked"}\n'],
+    [path.join(cacheDir, 'account-switch.json'), '{"phase":"completed"}\n'],
     [path.join(cacheDir, 'manual-resume.json'), '{"attempts":{}}\n'],
     [path.join(binDir, 'codex-usage-resets'), 'legacy-local-file\n'],
   ];
@@ -40,6 +41,8 @@ test('existing installation verifies and updates payload without changing privat
   assert.match(after.stdout, /0 payload files differ/);
   assert.equal(fs.readFileSync(path.join(binDir, 'codex-status-viewport'), 'utf8'),
     fs.readFileSync(path.join(__dirname, '..', 'bin', 'codex-status-viewport'), 'utf8'));
+  assert.equal(fs.readFileSync(path.join(binDir, 'codex-account-switch-core'), 'utf8'),
+    fs.readFileSync(path.join(__dirname, '..', 'bin', 'codex-account-switch-core'), 'utf8'));
   assert.equal(fs.readFileSync(path.join(home, '.local', 'lib', 'codex-status-viewport.js'), 'utf8'),
     fs.readFileSync(path.join(__dirname, '..', 'lib', 'codex-status-viewport.js'), 'utf8'));
   assert.equal(fs.readFileSync(path.join(home, '.local', 'lib', 'codex-display-snapshots.js'), 'utf8'),

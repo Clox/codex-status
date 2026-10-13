@@ -45,6 +45,8 @@ const { headlessStoragePreflight, acquireHeadlessClientsAfterStoragePreflight } 
   require(path.join(__dirname, '..', 'lib', 'codex-headless-storage-preflight'));
 const { normalizeState, observerHealth } = require(path.join(__dirname, '..', 'lib', 'codex-turn-observer'));
 const { verifyActiveAccountState } = require(path.join(__dirname, '..', 'lib', 'codex-account-state'));
+const { runAccountSwitch } = require(path.join(__dirname, '..', 'lib', 'codex-account-switch-core'));
+const { runHeadlessBatch } = require(path.join(__dirname, '..', 'lib', 'codex-headless-batch'));
 const {
   AUTO_CONTINUE_STATE_VERSION,
   automationDecision,
@@ -842,18 +844,10 @@ function refreshUsageNow() {
 }
 
 function switchToTarget(target) {
-  const before = activeAccountState();
-  if (before.accountId === target.accountId && before.accountKey === target.accountKey) return false;
-  const result = spawnSync(codexAuthBin, ['switch', require('../lib/codex-account-state').upstreamSelector(readJson(registryPath), target.accountKey)], {
-    stdio: 'ignore',
-    timeout: 60_000,
-  });
-  if (result.error || result.status !== 0) throw new Error('AUTO_ACCOUNT_SWITCH_FAILED');
-  const after = activeAccountState();
-  if (after.accountId !== target.accountId || after.accountKey !== target.accountKey) {
-    throw new Error('AUTO_ACCOUNT_SWITCH_POSTCONDITION_FAILED');
-  }
-  return true;
+  const result = runAccountSwitch({ codexHome, targetAccountKey: target.accountKey,
+    authBin: codexAuthBin, source: 'auto' });
+  if (result.target.accountId !== target.accountId) throw new Error('AUTO_ACCOUNT_SWITCH_POSTCONDITION_FAILED');
+  return result.switched;
 }
 
 function assertAutomaticOwnership(controlledAppServerPid = null) {
@@ -920,6 +914,7 @@ async function automaticHeadlessMain() {
   let currentCandidate = null;
   let committed = false;
   let lastTerminalThreadId = null;
+  let lastTerminalFailedTurnId = null;
   let lockedPlan = initial;
   let blockedCandidates = [];
   let shouldReplan = false;
@@ -1035,79 +1030,124 @@ async function automaticHeadlessMain() {
       () => acquireExclusiveClients({ autoMode: true }));
     writeAutoContinueState(clearExclusivityBlock(readAutoContinueState()));
     assertAutomaticOwnership();
-    const ownedPlan = autoDecisionSnapshot();
-    if (!sameHeadlessDecisionPlan(lockedPlan, ownedPlan, blockedCandidates)) throw new Error('AUTO_PLAN_CHANGED_BEFORE_SWITCH');
-    writeAutoContinueState({ phase: 'switching auth' });
-    switchToTarget(ownedPlan.target);
-    writeAutoContinueState({ phase: 'verifying target' });
-    refreshUsageNow();
-    const switchedPlan = autoDecisionSnapshot();
-    if (!sameHeadlessDecisionPlan(lockedPlan, switchedPlan, blockedCandidates)) throw new Error('AUTO_PLAN_CHANGED_AFTER_SWITCH');
-
-    const plannedCandidates = [...lockedPlan.candidates];
-    for (let index = 0; index < plannedCandidates.length; index += 1) {
-      currentCandidate = plannedCandidates[index];
-      committed = false;
-      writeAutoContinueState({ phase: 'starting continuation',
-        candidateThreadId: currentCandidate.threadId, candidateTurnId: currentCandidate.turnId });
-      await waitForObserverIdleAfterTurn();
-      refreshUsageNow();
-      const remainingPlan = autoDecisionSnapshot();
-      const expectedPlan = { ...switchedPlan, candidates: plannedCandidates.slice(index) };
-      if (!sameHeadlessDecisionPlan(expectedPlan, remainingPlan, blockedCandidates)) throw new Error('AUTO_PLAN_CHANGED_BEFORE_RESUME');
-      const target = activeAccountState();
-      if (target.accountId !== remainingPlan.target.accountId || target.accountKey !== remainingPlan.target.accountKey) {
-        throw new Error('ACTIVE_ACCOUNT_CHANGED');
-      }
-      assertFreshUsableTarget(target.accountId);
-      const freshEventState = normalizeState(readJson(eventStatePath, {}), Date.now());
-      const persisted = assertObserverIdle(freshEventState, currentCandidate);
-
-      const result = await runResume(persisted, target.accountId, async (controlledAppServerPid, continuation) => {
-        assertAutomaticOwnership(controlledAppServerPid);
+    await runHeadlessBatch({
+      nextPlan: async () => {
+        writeAutoContinueState({ status: 'running', phase: 'replanning',
+          candidateThreadId: null, candidateTurnId: null });
+        await waitForObserverIdleAfterTurn();
         refreshUsageNow();
-        const commitPlan = autoDecisionSnapshot();
-        if (!sameHeadlessDecisionPlan(expectedPlan, commitPlan, blockedCandidates)) throw new Error('AUTO_PLAN_CHANGED_BEFORE_COMMIT');
-        const commitTarget = activeAccountState();
-        if (commitTarget.accountId !== target.accountId || commitTarget.accountKey !== target.accountKey) {
-          throw new Error('ACTIVE_ACCOUNT_CHANGED_BEFORE_COMMIT');
+        assertAutomaticOwnership();
+        const decision = autoDecisionSnapshot();
+        if (decision.action === 'blocked') throw new Error(decision.reason || 'AUTO_PLAN_BLOCKED');
+        if (decision.action !== 'resume') return decision;
+        const partitioned = await partitionHeadlessCandidates(decision,
+          candidate => headlessStoragePreflight(codexHome, [candidate]),
+          readAutoContinueState().candidateBlocks);
+        lockedPlan = partitioned.plan;
+        blockedCandidates = partitioned.blocked;
+        writeAutoContinueState({ candidateBlocks: partitioned.candidateBlocks });
+        const retired = await retireBlockedCandidates(blockedCandidates,
+          partitioned.candidateBlocks, { lockHeld: true });
+        const retiredKeys = new Set(retired.map(candidate => candidateKey(candidate.threadId, candidate.turnId)));
+        blockedCandidates = blockedCandidates.filter(candidate =>
+          !retiredKeys.has(candidateKey(candidate.threadId, candidate.turnId)));
+        if (!lockedPlan.candidates.length) return { action: 'waiting',
+          reason: 'unavailable-candidates', candidates: [] };
+        return lockedPlan;
+      },
+      switchTarget: async plan => {
+        const active = activeAccountState();
+        if (active.accountId === plan.target.accountId && active.accountKey === plan.target.accountKey) return false;
+        writeAutoContinueState({ phase: 'switching auth', sourceAccountId: active.accountId,
+          targetAccountId: plan.target.accountId,
+          candidateThreadId: plan.candidates[0].threadId,
+          candidateTurnId: plan.candidates[0].turnId });
+        switchToTarget(plan.target);
+        refreshUsageNow();
+        return true;
+      },
+      runCandidate: async (candidate, plan) => {
+        currentCandidate = candidate;
+        committed = false;
+        writeAutoContinueState({ phase: 'starting continuation',
+          candidateThreadId: candidate.threadId, candidateTurnId: candidate.turnId,
+          targetAccountId: plan.target.accountId });
+        try {
+          refreshUsageNow();
+          if (!sameHeadlessDecisionPlan(plan, autoDecisionSnapshot(), blockedCandidates)) {
+            throw new Error('AUTO_PLAN_CHANGED_BEFORE_RESUME');
+          }
+          const target = activeAccountState();
+          if (target.accountId !== plan.target.accountId || target.accountKey !== plan.target.accountKey) {
+            throw new Error('ACTIVE_ACCOUNT_CHANGED');
+          }
+          assertFreshUsableTarget(target.accountId);
+          let persisted;
+          try {
+            persisted = assertObserverIdle(normalizeState(readJson(eventStatePath, {}), Date.now()), candidate);
+          } catch (error) {
+            if (error.message === 'CANDIDATE_NO_LONGER_RESUMABLE') {
+              throw new Error('AUTO_PLAN_CHANGED_BEFORE_RESUME');
+            }
+            throw error;
+          }
+          const storage = await headlessStoragePreflight(codexHome, [persisted]);
+          if (!storage.ok) throw new Error('AUTO_PLAN_CHANGED_BEFORE_RESUME');
+          const result = await runResume(persisted, target.accountId,
+            async (controlledAppServerPid, continuation) => {
+              assertAutomaticOwnership(controlledAppServerPid);
+              refreshUsageNow();
+              if (!sameHeadlessDecisionPlan(plan, autoDecisionSnapshot(), blockedCandidates)) {
+                throw new Error('AUTO_PLAN_CHANGED_BEFORE_COMMIT');
+              }
+              const commitTarget = activeAccountState();
+              if (commitTarget.accountId !== target.accountId || commitTarget.accountKey !== target.accountKey) {
+                throw new Error('ACTIVE_ACCOUNT_CHANGED_BEFORE_COMMIT');
+              }
+              let journal = normalizeResumeState(readJson(resumeStatePath, emptyResumeState()));
+              journal = markResumeCommitted(journal, persisted, {
+                targetAccountId: target.accountId, automatic: true, continuation,
+              });
+              atomicWriteJson(resumeStatePath, journal);
+              committed = true;
+              writeAutoContinueState({ phase: 'running' });
+            }, { automatic: true });
+          const finalTarget = activeAccountState();
+          if (finalTarget.accountId !== target.accountId || finalTarget.accountKey !== target.accountKey) {
+            throw new Error('ACTIVE_ACCOUNT_CHANGED_AFTER_COMMIT');
+          }
+          let journal = normalizeResumeState(readJson(resumeStatePath, emptyResumeState()));
+          journal = markResumeTerminal(journal, persisted, result);
+          atomicWriteJson(resumeStatePath, journal);
+          lastTerminalThreadId = persisted.threadId;
+          lastTerminalFailedTurnId = persisted.turnId;
+          await waitForObserverIdleAfterTurn();
+          if (result.status !== 'completed') throw new Error('AUTO_RESUME_TERMINAL_FAILED');
+          currentCandidate = null;
+          committed = false;
+        } catch (error) {
+          if (!committed && shouldReplanAutomaticError(error, false)) {
+            writeAutoContinueState(recordPrecommitPlanChange(readAutoContinueState(), error.message, {
+              threadId: candidate.threadId, failedTurnId: candidate.turnId,
+              targetAccountId: plan.target.accountId,
+            }));
+            currentCandidate = null;
+            return 'replan';
+          }
+          throw error;
         }
-        let journal = normalizeResumeState(readJson(resumeStatePath, emptyResumeState()));
-        journal = markResumeCommitted(journal, persisted, {
-          targetAccountId: target.accountId,
-          automatic: true,
-          continuation,
-        });
-        atomicWriteJson(resumeStatePath, journal);
-        committed = true;
-        writeAutoContinueState({ phase: 'running' });
-      }, { automatic: true });
-
-      const finalTarget = activeAccountState();
-      if (finalTarget.accountId !== target.accountId || finalTarget.accountKey !== target.accountKey) {
-        throw new Error('ACTIVE_ACCOUNT_CHANGED_AFTER_COMMIT');
-      }
-      let journal = normalizeResumeState(readJson(resumeStatePath, emptyResumeState()));
-      journal = markResumeTerminal(journal, persisted, result);
-      atomicWriteJson(resumeStatePath, journal);
-      lastTerminalThreadId = persisted.threadId;
-      await waitForObserverIdleAfterTurn();
-      if (result.status !== 'completed') throw new Error('AUTO_RESUME_TERMINAL_FAILED');
-    }
-
-    writeAutoContinueState({
-      status: 'completed',
-      phase: null,
-      sourceAccountId: null,
-      lastSuccessAtMs: Date.now(),
-      errorKind: null,
-      actionRequired: false,
-      candidateThreadId: null,
-      candidateTurnId: null,
-      targetAccountId: switchedPlan.target.accountId,
-      pending: null,
-      restoreRetryHalt: false,
-      restoreRetryHaltGeneration: null,
+      },
+      onNoWork: async (plan, completedCount) => {
+        const active = activeAccountState();
+        writeAutoContinueState({ status: plan.action === 'idle' && completedCount > 0 ? 'completed' : 'waiting',
+          phase: null, sourceAccountId: null,
+          waitingReason: plan.action === 'idle' ? 'no-candidates' : (plan.reason || 'unavailable-candidates'),
+          lastSuccessAtMs: completedCount > 0 ? Date.now() : readAutoContinueState().lastSuccessAtMs,
+          errorKind: null, actionRequired: false,
+          candidateThreadId: null, candidateTurnId: null,
+          targetAccountId: active.accountId, pending: null,
+          restoreRetryHalt: false, restoreRetryHaltGeneration: null });
+      },
     });
   } catch (error) {
     const precommitPlanChange = shouldReplanAutomaticError(error, committed);
@@ -1190,7 +1230,7 @@ async function automaticHeadlessMain() {
                 })),
               })).diagnostics,
               onState: desktopNavigation => writeAutoContinueState({ desktopNavigation: {
-                ...desktopNavigation, failedTurnId: currentCandidate?.turnId || null,
+                ...desktopNavigation, failedTurnId: lastTerminalFailedTurnId,
               } }),
             });
           } finally {
@@ -1201,7 +1241,7 @@ async function automaticHeadlessMain() {
         if (navigationPhase && readAutoContinueState().desktopRestore?.status === 'ready') {
           const navigationFailure = { desktopNavigation: {
             status: 'failed', threadId: lastTerminalThreadId,
-            failedTurnId: currentCandidate?.turnId || null,
+            failedTurnId: lastTerminalFailedTurnId,
             errorKind: error?.message || 'DESKTOP_NAVIGATION_FAILED', completedAtMs: Date.now(),
           } };
           writeAutoContinueState(archiveTerminalDesktopNavigation({
