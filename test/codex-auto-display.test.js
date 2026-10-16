@@ -52,6 +52,17 @@ test('manual committed attempt is not mislabeled as AUTO continuation', () => {
   assert.equal(autoDisplayPlan({ status: 'idle' }, journal, {}, [], [], 'HEADLESS').operation, null);
 });
 
+test('legacy GUI Send attempt cannot become a HEADLESS continuation row', () => {
+  const journal = { attempts: { old: { threadId: candidate.threadId,
+    interruptedTurnId: candidate.turnId, committedAtMs: 123,
+    status: 'RESUME_COMMITTED', strategy: 'DESKTOP', automatic: true } } };
+  const frame = autoDisplayPlan({ status: 'idle' }, journal, {}, [later], [], 'HEADLESS');
+  assert.equal(frame.operation, null);
+  assert.deepEqual(frame.interrupted, [later]);
+  assert.equal(autoContinueStatusLine({ autoMode: 'DESKTOP' }, { status: 'idle' }),
+    'AUTO: HEADLESS [A] mode');
+});
+
 test('AUTO-owned exact turn stays in continuation across lagging observer refreshes', () => {
   const auto = { status: 'running', phase: 'preparing', candidateThreadId: candidate.threadId,
     candidateTurnId: candidate.turnId, sourceAccountId: 'source', targetAccountId: 'target' };

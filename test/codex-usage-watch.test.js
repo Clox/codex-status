@@ -58,7 +58,8 @@ test('recommendation precedes dynamic sections and magenta auto-continue remains
   const outputExpression = annotateSource.slice(outputStatement, outputStatement + 220);
   assert.ok(outputExpression.indexOf('renderedRecommendationLines') < outputExpression.indexOf('${footer}'));
   const footerStatement = annotateSource.indexOf('const footerParts = [');
-  const footerExpression = annotateSource.slice(footerStatement, footerStatement + 420);
+  const footerExpression = annotateSource.slice(footerStatement,
+    annotateSource.indexOf('const footer =', footerStatement));
   assert.ok(footerExpression.indexOf('activeTurnsSection') < footerExpression.indexOf('autoContinueStatusLine'));
   assert.ok(footerExpression.indexOf('interruptedTurnsSection') < footerExpression.indexOf('autoContinueStatusLine'));
   assert.ok(footerExpression.indexOf('problemSection') < footerExpression.indexOf('autoContinueStatusLine'));

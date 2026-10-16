@@ -17,6 +17,7 @@ const {
   cancelPendingAction,
   emptyAutoContinueState,
   normalizeAutoContinueState,
+  migrateLegacyDesktopAutoState,
   resetAutoContinueForToggle,
   writeAutoContinueStateFile,
 } = require(path.join(__dirname, '..', 'lib', 'codex-auto-continue'));
@@ -74,8 +75,15 @@ try {
     preferences = readStatusPreferences(statePath);
   } else if (command === 'migrate') {
     preferences = withOperationLock(() => {
+      let rawPreferences;
+      try { rawPreferences = JSON.parse(fs.readFileSync(statePath, 'utf8')); }
+      catch (error) { if (error?.code !== 'ENOENT') throw error; }
       const migrated = readStatusPreferences(statePath);
       if (migrated.autoMode !== 'OFF') ensureAutoTimerRunning();
+      if (rawPreferences?.autoMode === 'DESKTOP') {
+        writeAutoContinueStateFile(autoStatePath,
+          migrateLegacyDesktopAutoState(readAutoState()));
+      }
       return writeStatusPreferences(statePath, migrated);
     });
   } else if (command === 'toggle-auto-continue') {

@@ -35,6 +35,20 @@ test('AT-SPI helper protocol can start and close without touching Desktop', () =
   assert.deepEqual(JSON.parse(result.stdout.trim()), { ok: true });
 });
 
+test('post-HEADLESS AT-SPI helper has no prefill or Send command', () => {
+  const helper = path.join(__dirname, '..', 'bin', 'codex-desktop-atspi');
+  const result = spawnSync(helper, [], {
+    input: '{"command":"verify-prefill"}\n{"command":"send"}\n{"command":"close"}\n',
+    encoding: 'utf8',
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(result.stdout.trim().split('\n').map(JSON.parse), [
+    { ok: false, errorKind: 'AT_SPI_COMMAND_UNSUPPORTED' },
+    { ok: false, errorKind: 'AT_SPI_COMMAND_UNSUPPORTED' },
+    { ok: true },
+  ]);
+});
+
 test('AT-SPI helper binds roots to the verified Desktop PID and diagnoses missing renderer trees', () => {
   const helper = path.join(__dirname, '..', 'bin', 'codex-desktop-atspi');
   const source = String.raw`

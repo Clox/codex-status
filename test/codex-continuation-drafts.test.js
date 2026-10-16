@@ -213,11 +213,9 @@ test('HEADLESS owns every exact interrupted candidate during a manual switch', (
   assert.deepEqual(continuationDeepLinks(plan.candidates), []);
 });
 
-test('DESKTOP owns AUTO candidates while OFF retains manual draft semantics', () => {
-  const desktop = buildContinuationPlan(planInput({ preferences: { autoMode: 'DESKTOP' } }));
-  assert.equal(desktop.action, 'none');
-  assert.deepEqual(desktop.candidates.map(candidate => candidate.owner), ['desktop', 'desktop']);
-  assert.deepEqual(continuationDeepLinks(desktop.candidates), []);
+test('retired DESKTOP mode cannot create claims; OFF retains manual draft semantics', () => {
+  assert.throws(() => buildContinuationPlan(planInput({ preferences: { autoMode: 'DESKTOP' } })),
+    /CONTINUATION_MODE_UNVERIFIED/);
   const off = buildContinuationPlan(planInput());
   assert.equal(off.action, 'prefill');
   assert.equal(continuationDeepLinks(off.candidates).length, 2);

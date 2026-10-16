@@ -47,6 +47,41 @@ test('existing installation verifies and updates payload without changing privat
     fs.readFileSync(path.join(__dirname, '..', 'lib', 'codex-status-viewport.js'), 'utf8'));
   assert.equal(fs.readFileSync(path.join(home, '.local', 'lib', 'codex-display-snapshots.js'), 'utf8'),
     fs.readFileSync(path.join(__dirname, '..', 'lib', 'codex-display-snapshots.js'), 'utf8'));
+  assert.equal(fs.readFileSync(path.join(home, '.local', 'lib', 'codex-desktop-attempt-history.js'), 'utf8'),
+    fs.readFileSync(path.join(__dirname, '..', 'lib', 'codex-desktop-attempt-history.js'), 'utf8'));
   for (const [file, content] of privateFiles) assert.equal(fs.readFileSync(file, 'utf8'), content);
   assert.equal(fs.existsSync(path.join(home, '.local', 'state', 'codex-auth-setup-backups')), false);
+});
+
+test('state-preserving update migrates an old DESKTOP preference to HEADLESS', t => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-status-mode-update-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const config = path.join(home, '.config', 'codex-account-switcher');
+  const cache = path.join(home, '.cache', 'codex-account-switcher');
+  fs.mkdirSync(config, { recursive: true });
+  fs.mkdirSync(cache, { recursive: true });
+  fs.writeFileSync(path.join(config, 'accounts.conf'), 'ACCOUNT_1=private\n');
+  fs.writeFileSync(path.join(config, 'status-preferences.json'),
+    JSON.stringify({ version: 2, autoMode: 'DESKTOP' }));
+  fs.writeFileSync(path.join(cache, 'auto-continue.json'), JSON.stringify({
+    status: 'desktop-preflight', phase: 'semantic-readiness', pending: { fingerprint: 'old' },
+    desktopAttemptHistory: [{ outcome: 'fallback-headless', errorKind: 'CHAT_ACTIONS_COUNT_0' }],
+  }));
+  const resume = path.join(cache, 'manual-resume.json');
+  const committed = '{"attempts":{"old":{"strategy":"DESKTOP","status":"SEND_UNCONFIRMED"}}}\n';
+  fs.writeFileSync(resume, committed);
+  const result = spawnSync('bash', [installer, '--update'], {
+    env: { ...process.env, HOME: home, XDG_CONFIG_HOME: path.join(home, '.config'),
+      XDG_CACHE_HOME: path.join(home, '.cache'),
+      CODEX_SYSTEMCTL_BIN: path.join(__dirname, 'fixtures', 'systemctl-test') },
+    encoding: 'utf8',
+  });
+  assert.equal(result.status, 0, result.stderr || result.error?.message);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(config, 'status-preferences.json'))).autoMode,
+    'HEADLESS');
+  const state = JSON.parse(fs.readFileSync(path.join(cache, 'auto-continue.json')));
+  assert.equal(state.status, 'idle');
+  assert.equal(state.pending, null);
+  assert.equal(state.desktopAttemptHistory.length, 1);
+  assert.equal(fs.readFileSync(resume, 'utf8'), committed);
 });

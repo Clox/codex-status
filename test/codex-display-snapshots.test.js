@@ -338,6 +338,14 @@ test('status shows AUTO switch progress and HEADLESS continuation without duplic
   fs.writeFileSync(resume, JSON.stringify({ attempts: {} }));
   fs.writeFileSync(auto, JSON.stringify({ status: 'idle' }));
   assert.match(render(), /INTERRUPTED CODEX TURNS:[\s\S]*Spadrig · Förbättra blankettvyn/);
+  fs.writeFileSync(env.CODEX_STATUS_PREFERENCES, JSON.stringify({ version: 2,
+    autoMode: 'DESKTOP', autoContinue: true }));
+  fs.writeFileSync(auto, JSON.stringify({ status: 'waiting', waitingReason: 'no-candidates',
+    desktopAttemptHistory: [{ outcome: 'fallback-headless', errorKind: 'SEND_CONTROL_COUNT_0' }] }));
+  assert.match(render(), /AUTO: HEADLESS · WAIT: no-candidates/);
+  assert.doesNotMatch(render(), /DESKTOP CONTINUATION|last fallback|AUTO: DESKTOP/);
+  fs.writeFileSync(env.CODEX_STATUS_PREFERENCES, JSON.stringify({ version: 2,
+    autoMode: 'HEADLESS', autoContinue: true }));
   fs.writeFileSync(auto, JSON.stringify({ status: 'running', phase: 'switching auth',
     candidateThreadId: THREAD, candidateTurnId: TURN,
     sourceAccountId: 'source', targetAccountId: 'target' }));

@@ -64,6 +64,12 @@ if [[ $mode == --verify || $mode == --update ]]; then
       mv -f -- "$temporary_file" "$destination_file"
     fi
   done < <(payload_files)
+  if [[ $mode == --update && -f $config_dir/status-preferences.json ]] &&
+    node -e 'try { process.exit(require(process.argv[1]).autoMode === "DESKTOP" ? 0 : 1); } catch { process.exit(1); }' \
+      "$config_dir/status-preferences.json"; then
+    "$local_bin/codex-status-preferences" migrate >/dev/null ||
+      fail 'legacy AUTO: DESKTOP migration failed; inspect the operation lock/timer before using AUTO'
+  fi
   if [[ $mode == --verify && $changed -ne 0 ]]; then
     printf '%s installed payload files differ from this checkout\n' "$changed" >&2
     exit 1
@@ -78,7 +84,7 @@ for command_name in node npm python3 gnome-terminal gsettings dconf script setsi
   command -v "$command_name" >/dev/null 2>&1 || fail "required command is missing: $command_name"
 done
 python3 -c 'import gi; gi.require_version("Gtk", "3.0"); gi.require_version("Gdk", "3.0"); from gi.repository import Gtk, Gdk; import pyatspi' >/dev/null 2>&1 ||
-  fail 'python3-pyatspi and GTK 3 Python bindings are required for AUTO: DESKTOP'
+  fail 'python3-pyatspi and GTK 3 Python bindings are required for post-HEADLESS Desktop navigation'
 [[ -x /usr/libexec/gnome-terminal-server && -x /usr/bin/gnome-terminal.real ]] ||
   fail 'the GNOME Terminal server/client binaries are required for the status window'
 
@@ -169,6 +175,7 @@ backup_if_present "$local_lib/codex-headless-storage-preflight.js"
 backup_if_present "$local_lib/codex-continuation-drafts.js"
 backup_if_present "$local_lib/codex-continuation-ownership.js"
 backup_if_present "$local_lib/codex-desktop-auto.js"
+backup_if_present "$local_lib/codex-desktop-attempt-history.js"
 backup_if_present "$local_lib/codex-auth-repair.js"
 backup_if_present "$local_lib/codex-reset-credits.js"
 backup_if_present "$local_lib/codex-status-render.js"
@@ -232,6 +239,7 @@ install -m 0644 "$lib_source/codex-headless-storage-preflight.js" "$local_lib/co
 install -m 0644 "$lib_source/codex-continuation-drafts.js" "$local_lib/codex-continuation-drafts.js"
 install -m 0644 "$lib_source/codex-continuation-ownership.js" "$local_lib/codex-continuation-ownership.js"
 install -m 0644 "$lib_source/codex-desktop-auto.js" "$local_lib/codex-desktop-auto.js"
+install -m 0644 "$lib_source/codex-desktop-attempt-history.js" "$local_lib/codex-desktop-attempt-history.js"
 install -m 0644 "$lib_source/codex-auth-repair.js" "$local_lib/codex-auth-repair.js"
 install -m 0644 "$lib_source/codex-reset-credits.js" "$local_lib/codex-reset-credits.js"
 install -m 0644 "$lib_source/codex-status-render.js" "$local_lib/codex-status-render.js"

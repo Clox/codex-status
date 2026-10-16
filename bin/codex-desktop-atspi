@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Single-use semantic ChatGPT Desktop Send controller.
+"""Semantic readiness helper for post-HEADLESS Desktop navigation.
 
-The process keeps the exact verified AT-SPI Send object alive across the
-caller-owned crash-safe commit boundary. It accepts JSON lines on stdin and
-emits credential-free JSON lines on stdout. It never retries an action.
+Thread verification uses the Desktop Copy deeplink action and restores the
+clipboard; this helper has no continuation prefill or Send command.
 """
 
 import json
@@ -207,11 +206,6 @@ def editable_nodes(root):
     return result
 
 
-def text_value(node):
-    text = node.queryText()
-    return text.getText(0, text.characterCount)
-
-
 def composer(root):
     nodes = editable_nodes(root)
     if len(nodes) != 1:
@@ -234,15 +228,12 @@ def send_controls(root, require_enabled):
     return candidates
 
 
-def snapshot(expected_thread_id, expected_process_id, expected_text=None, require_enabled=False):
+def snapshot(expected_thread_id, expected_process_id):
     root = unique_root(expected_process_id)
     require_renderer_tree(root)
     verify_thread(root, expected_thread_id)
     editor = composer(root)
-    value = text_value(editor)
-    if expected_text is not None and value != expected_text:
-        raise CapabilityError("COMPOSER_TEXT_MISMATCH")
-    sends = send_controls(root, require_enabled)
+    sends = send_controls(root, False)
     if len(sends) != 1:
         raise CapabilityError(f"SEND_CONTROL_COUNT_{len(sends)}")
     return {
@@ -280,9 +271,6 @@ def same_identity(left, right):
 def main():
     expected_thread_id = None
     expected_process_id = None
-    expected_text = None
-    verified_send = None
-    send_invoked = False
     for raw in sys.stdin:
         try:
             request = json.loads(raw)
@@ -306,26 +294,6 @@ def main():
                 respond(ok=True, verified=True, **{
                     key: second[key] for key in ("desktopIdentity", "rendererIdentity", "atspiIdentity")
                 })
-            elif command == "verify-prefill":
-                expected_thread_id = request["threadId"]
-                if request["desktopPid"] != expected_process_id:
-                    raise CapabilityError("DESKTOP_ATSPI_PID_CHANGED")
-                expected_text = request["text"]
-                first = snapshot(expected_thread_id, expected_process_id, expected_text, require_enabled=True)
-                time.sleep(0.25)
-                second = snapshot(expected_thread_id, expected_process_id, expected_text, require_enabled=True)
-                if not same_identity(first, second):
-                    raise CapabilityError("AT_SPI_IDENTITY_UNSTABLE")
-                verified_send = second["send"]
-                respond(ok=True, verified=True, **{
-                    key: second[key] for key in ("desktopIdentity", "rendererIdentity", "atspiIdentity")
-                })
-            elif command == "send":
-                if verified_send is None or send_invoked:
-                    raise CapabilityError("SEND_OBJECT_NOT_AVAILABLE")
-                send_invoked = True
-                invoke_action(verified_send)
-                respond(ok=True, invoked=True)
             elif command == "close":
                 respond(ok=True)
                 return

@@ -74,7 +74,7 @@ history remain in the shared `CODEX_HOME` (normally `~/.codex`). None of those
 paths should be copied into Git.
 
 The observer classifies exact interrupted `(threadId, failedTurnId)` pairs.
-`OFF`, `DESKTOP`, and `HEADLESS` select one continuation owner per pair. AUTO
+`OFF` and `HEADLESS` select one continuation owner per pair. AUTO
 checks quota and account identity, uses a shared operation lock, and persists
 retry barriers. HEADLESS additionally checks local thread availability and
 requires verified App Server exclusivity before its controller or commit. A

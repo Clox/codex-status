@@ -31,17 +31,16 @@ test('AUTO-CONTINUE toggle persists across independent reads with private permis
   const statePath = path.join(root, 'config', 'status-preferences.json');
 
   const enabled = toggleAutoContinue(statePath);
-  assert.equal(enabled.autoMode, AUTO_MODE.DESKTOP);
-  assert.equal(readStatusPreferences(statePath).autoMode, AUTO_MODE.DESKTOP);
-  assert.equal(autoContinueLine(enabled), 'AUTO: DESKTOP [A] mode');
+  assert.equal(enabled.autoMode, AUTO_MODE.HEADLESS);
+  assert.equal(readStatusPreferences(statePath).autoMode, AUTO_MODE.HEADLESS);
+  assert.equal(autoContinueLine(enabled), 'AUTO: HEADLESS [A] mode');
   assert.equal(fs.statSync(statePath).mode & 0o777, 0o600);
   assert.equal(fs.statSync(path.dirname(statePath)).mode & 0o777, 0o700);
 
-  const headless = toggleAutoContinue(statePath);
-  assert.equal(headless.autoMode, AUTO_MODE.HEADLESS);
   const disabled = toggleAutoContinue(statePath);
   assert.equal(disabled.autoMode, AUTO_MODE.OFF);
   assert.equal(readStatusPreferences(statePath).autoContinue, false);
+  assert.equal(toggleAutoContinue(statePath).autoMode, AUTO_MODE.HEADLESS);
 });
 
 test('legacy ON migrates only to HEADLESS and never implicitly enables DESKTOP', () => {
@@ -61,6 +60,36 @@ test('legacy ON migrates only to HEADLESS and never implicitly enables DESKTOP',
   assert.deepEqual(JSON.parse(fs.readFileSync(statePath, 'utf8')), {
     version: 2, autoMode: AUTO_MODE.HEADLESS,
   });
+});
+
+test('persisted DESKTOP mode migrates to HEADLESS and discards only transient DESKTOP work', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-desktop-migration-'));
+  const preferencesPath = path.join(root, 'preferences.json');
+  const autoStatePath = path.join(root, 'auto.json');
+  fs.writeFileSync(preferencesPath, JSON.stringify({ version: 2, autoMode: 'DESKTOP' }));
+  fs.writeFileSync(autoStatePath, JSON.stringify({ status: 'desktop-preflight',
+    phase: 'semantic-readiness', pending: { fingerprint: 'old-desktop-plan' },
+    candidateThreadId: 'thread-a', candidateTurnId: 'turn-a', targetAccountId: 'target',
+    errorKind: 'CHAT_ACTIONS_COUNT_0', actionRequired: true,
+    desktopPreflight: { status: 'waiting' },
+    desktopAttemptHistory: [{ outcome: 'fallback-headless', errorKind: 'CHAT_ACTIONS_COUNT_0' }],
+  }));
+  assert.equal(readStatusPreferences(preferencesPath).autoMode, AUTO_MODE.HEADLESS);
+  const result = spawnSync(process.execPath,
+    [path.join(__dirname, '..', 'bin', 'codex-status-preferences'), 'migrate'], {
+      env: { ...process.env, CODEX_STATUS_PREFERENCES: preferencesPath,
+        CODEX_AUTO_CONTINUE_STATE: autoStatePath, CODEX_SYSTEMCTL_BIN: fakeSystemctl },
+      encoding: 'utf8',
+    });
+  assert.equal(result.status, 0, result.stderr || result.error?.message);
+  assert.equal(JSON.parse(fs.readFileSync(preferencesPath)).autoMode, AUTO_MODE.HEADLESS);
+  const state = JSON.parse(fs.readFileSync(autoStatePath));
+  assert.equal(state.status, 'idle');
+  assert.equal(state.pending, null);
+  assert.equal(state.candidateThreadId, null);
+  assert.equal(state.errorKind, null);
+  assert.equal(state.desktopPreflight, undefined);
+  assert.equal(state.desktopAttemptHistory.length, 1);
 });
 
 test('invalid persistent state never silently enables AUTO-CONTINUE', () => {
@@ -103,7 +132,6 @@ test('status control cancels only pending AUTO and OFF to ON clears suppression'
 
   assert.equal(spawnSync(process.execPath, [command, 'toggle-auto-continue'], { env }).status, 0);
   assert.equal(spawnSync(process.execPath, [command, 'toggle-auto-continue'], { env }).status, 0);
-  assert.equal(spawnSync(process.execPath, [command, 'toggle-auto-continue'], { env }).status, 0);
   autoState = JSON.parse(fs.readFileSync(autoStatePath, 'utf8'));
   assert.equal(autoState.suppression, null);
   assert.equal(autoState.status, 'idle');
@@ -113,7 +141,7 @@ test('toggle refuses HEADLESS when timer stays inactive and keeps the previous m
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-status-timer-'));
   const preferencesPath = path.join(root, 'preferences.json');
   const autoStatePath = path.join(root, 'auto.json');
-  fs.writeFileSync(preferencesPath, JSON.stringify({ version: 2, autoMode: 'DESKTOP' }));
+  fs.writeFileSync(preferencesPath, JSON.stringify({ version: 2, autoMode: 'OFF' }));
   const result = spawnSync(process.execPath,
     [path.join(__dirname, '..', 'bin', 'codex-status-preferences'), 'toggle-auto-continue'], {
       env: { ...process.env, CODEX_STATUS_PREFERENCES: preferencesPath,
@@ -123,7 +151,7 @@ test('toggle refuses HEADLESS when timer stays inactive and keeps the previous m
     });
   assert.equal(result.status, 1);
   assert.match(result.stderr, /AUTO_CONTROLLER_TIMER_INACTIVE/);
-  assert.equal(readStatusPreferences(preferencesPath).autoMode, 'DESKTOP');
+  assert.equal(readStatusPreferences(preferencesPath).autoMode, 'OFF');
 });
 
 test('AUTO mode toggle cannot race an account switch or continuation controller', () => {

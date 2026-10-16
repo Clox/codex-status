@@ -43,7 +43,7 @@ test('timer dying after an earlier healthy controller run is detected', () => {
 });
 
 test('normal disabled and inactive oneshot service has no bearing on scheduler health', () => {
-  assert.equal(autoSchedulerHealth({ autoMode: 'DESKTOP' }, { heartbeatAtMs: NOW },
+  assert.equal(autoSchedulerHealth({ autoMode: 'HEADLESS' }, { heartbeatAtMs: NOW },
     { ...timer, serviceActiveState: 'inactive', serviceUnitFileState: 'disabled' }, NOW).healthy, true);
 });
 

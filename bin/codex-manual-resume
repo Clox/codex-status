@@ -61,9 +61,12 @@ const {
   isAutoPlanSuppressed,
   normalizeAutoContinueState,
   pendingCountdownDecision,
-  partitionHeadlessCandidates,
+  partitionAutomaticCandidates,
+  automaticCandidateEligibility,
+  isolatedUnavailableReason,
   recordExclusivityBlock,
   recordPrecommitPlanChange,
+  waitForResumeOperationLock,
   shouldReplanAutomaticError,
   resolveDesktopRestoreFailure,
   reconcileFailedAutomaticAttempt,
@@ -76,23 +79,10 @@ const {
   unresolvedExclusivityBlockerPresent,
 } = require(path.join(__dirname, '..', 'lib', 'codex-auto-continue'));
 const {
-  DESKTOP_SEND_CONFIRM_TIMEOUT_MS,
-  committedDesktopAttempts,
-  desktopPreflightFallbackRecord,
-  desktopPlan,
-  desktopPrecommitFailureAction,
-  desktopQueueMayContinue,
-  markDesktopPrefillStarted,
-  markDesktopSendCommitted,
-  markDesktopSendInvoked,
-  reconcileDesktopSend,
-  waitForDesktopReadiness,
-} = require(path.join(__dirname, '..', 'lib', 'codex-desktop-auto'));
-const {
-  AUTO_MODE,
   defaultStatusPreferencesPath,
   readStatusPreferences,
 } = require(path.join(__dirname, '..', 'lib', 'codex-status-preferences'));
+const { waitForDesktopReadiness } = require(path.join(__dirname, '..', 'lib', 'codex-desktop-readiness'));
 
 const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
 const cacheDirectory = path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache'), 'codex-account-switcher');
@@ -396,28 +386,6 @@ function assertObserverIdle(eventState, candidate) {
   if (Object.keys(eventState.activeTurns || {}).length > 0) throw new Error('CODEX_TURNS_STILL_ACTIVE');
   const persisted = eventState.interruptedTurns?.[candidateKey(candidate.threadId, candidate.turnId)];
   if (!persisted?.resumable || persisted.threadIdentityVerified !== true) throw new Error('CANDIDATE_NO_LONGER_RESUMABLE');
-  return persisted;
-}
-
-function assertDesktopCandidate(eventState, candidate, target) {
-  if (!observerHealth(eventState, Date.now()).healthy) throw new Error('TURN_OBSERVER_UNVERIFIED');
-  const key = candidateKey(candidate.threadId, candidate.turnId);
-  const persisted = eventState.interruptedTurns?.[key];
-  if (!persisted?.resumable || persisted.threadIdentityVerified !== true ||
-      persisted.classificationVerified !== true) throw new Error('CANDIDATE_NO_LONGER_RESUMABLE');
-  if (persisted.accountId !== candidate.accountId) throw new Error('CANDIDATE_ACCOUNT_CHANGED');
-  const expected = desktopPlan(candidate, target);
-  const actual = desktopPlan(persisted, target);
-  if (expected.inputHash !== actual.inputHash || expected.interruptionClass !== actual.interruptionClass) {
-    throw new Error('CANDIDATE_EVIDENCE_CHANGED');
-  }
-  if (Object.values(eventState.activeTurns || {}).some(turn => turn.threadId === candidate.threadId)) {
-    throw new Error('THREAD_STILL_ACTIVE');
-  }
-  const exhaustion = eventState.exhaustions?.[candidate.accountId];
-  if (exhaustion?.verified !== true || exhaustion?.errorKind !== 'usageLimitExceeded') {
-    throw new Error('SOURCE_EXHAUSTION_CHANGED');
-  }
   return persisted;
 }
 
@@ -743,6 +711,21 @@ function autoDecisionSnapshot(nowMs = Date.now()) {
   });
 }
 
+async function inspectAutomaticCandidate(candidate) {
+  const storage = await headlessStoragePreflight(codexHome, [candidate]);
+  if (!storage.ok) return storage;
+  const eventState = normalizeState(readJson(eventStatePath, {}), Date.now());
+  if (!observerHealth(eventState, Date.now()).healthy) {
+    return { ok: false, reason: 'TURN_OBSERVER_UNVERIFIED', blocksAutomation: true,
+      requiredAction: 'wait for observer recovery' };
+  }
+  return automaticCandidateEligibility(candidate, eventState, storage);
+}
+
+async function partitionAutomaticPlan(decision, previousBlocks) {
+  return partitionAutomaticCandidates(decision, inspectAutomaticCandidate, previousBlocks);
+}
+
 function writeAutoContinueState(patch) {
   const previous = normalizeAutoContinueState(readJson(autoContinueStatePath, emptyAutoContinueState()));
   const resolved = patch.desktopRestore?.status === 'ready'
@@ -815,6 +798,7 @@ function sendPendingNotification(pending) {
   const state = readAutoContinueState();
   if (state.pending?.fingerprint !== pending.fingerprint) return;
   writeAutoContinueState({
+    lastNotifiedPendingFingerprint: pending.fingerprint,
     pending: {
       ...state.pending,
       notificationDeliveredAtMs: deliveredAtMs,
@@ -876,7 +860,12 @@ async function waitForObserverIdleAfterTurn(timeoutMs = 15_000) {
 async function automaticHeadlessMain() {
   const initial = autoDecisionSnapshot();
   if (initial.action !== 'resume') {
-    const previous = reconcileSuppression(readAutoContinueState(), initial);
+    const observed = readAutoContinueState();
+    const previous = reconcileSuppression(observed.errorKind === 'SOURCE_EXHAUSTION_CHANGED'
+      ? recordPrecommitPlanChange(observed, observed.errorKind, {
+        threadId: observed.candidateThreadId, failedTurnId: observed.candidateTurnId,
+        targetAccountId: observed.targetAccountId,
+      }) : observed, initial);
     const reconciled = initial.reason === 'no-candidates' || initial.reason === 'disabled'
       ? clearExclusivityBlock(previous) : previous;
     let candidateBlocks = reconciled.candidateBlocks;
@@ -887,8 +876,7 @@ async function automaticHeadlessMain() {
         const eventState = normalizeState(readJson(eventStatePath, {}), Date.now());
         const resumeState = normalizeResumeState(readJson(resumeStatePath, emptyResumeState()));
         const candidates = headlessDiagnosticCandidates(eventState, resumeState, manualDraftJournal);
-        const diagnostics = await partitionHeadlessCandidates({ candidates },
-          candidate => headlessStoragePreflight(codexHome, [candidate]), candidateBlocks);
+        const diagnostics = await partitionAutomaticPlan({ candidates }, candidateBlocks);
         candidateBlocks = diagnostics.candidateBlocks;
         await retireBlockedCandidates(diagnostics.blocked, candidateBlocks);
       }
@@ -896,6 +884,8 @@ async function automaticHeadlessMain() {
     writeAutoContinueState({
       ...reconciled,
       status: initial.action,
+      phase: null,
+      sourceAccountId: null,
       waitingReason: initial.action === 'waiting' ? initial.reason : null,
       lastAttemptAtMs: Date.now(),
       errorKind: initial.action === 'blocked' ? initial.reason : null,
@@ -923,9 +913,7 @@ async function automaticHeadlessMain() {
     lock = acquireLock();
     const fullPlan = autoDecisionSnapshot();
     if (!sameDecisionPlan(initial, fullPlan)) throw new Error('AUTO_PLAN_CHANGED_BEFORE_OWNERSHIP');
-    const partition = await partitionHeadlessCandidates(fullPlan,
-      candidate => headlessStoragePreflight(codexHome, [candidate]),
-      readAutoContinueState().candidateBlocks);
+    const partition = await partitionAutomaticPlan(fullPlan, readAutoContinueState().candidateBlocks);
     lockedPlan = partition.plan;
     blockedCandidates = partition.blocked;
     writeAutoContinueState({ candidateBlocks: partition.candidateBlocks });
@@ -935,17 +923,18 @@ async function automaticHeadlessMain() {
       !retiredKeys.has(candidateKey(candidate.threadId, candidate.turnId)));
     if (lockedPlan.candidates.length === 0) {
       const onlyUnavailable = blockedCandidates.length > 0 && blockedCandidates.every(candidate =>
-        ['ROLLOUT_NOT_IN_ACTIVE_CODEX_HOME', 'ROLLOUT_METADATA_UNVERIFIED'].includes(
+        isolatedUnavailableReason(
           partition.candidateBlocks[candidateKey(candidate.threadId, candidate.turnId)]?.reason) &&
         partition.candidateBlocks[candidateKey(candidate.threadId, candidate.turnId)]?.blocksAutomation !== true &&
         !partition.candidateBlocks[candidateKey(candidate.threadId, candidate.turnId)]?.requiredAction);
       writeAutoContinueState({ status: onlyUnavailable || blockedCandidates.length === 0 ? 'waiting' : 'blocked',
+        phase: null, sourceAccountId: null,
         waitingReason: blockedCandidates.length === 0 ? 'no-candidates' :
           (onlyUnavailable ? 'unavailable-candidates' : null),
         errorKind: null, actionRequired: false, pending: null,
         candidateBlocks: blockedCandidates.length === 0 ? {} : partition.candidateBlocks,
-        candidateThreadId: blockedCandidates[0]?.threadId || null,
-        candidateTurnId: blockedCandidates[0]?.turnId || null,
+        candidateThreadId: onlyUnavailable ? null : blockedCandidates[0]?.threadId || null,
+        candidateTurnId: onlyUnavailable ? null : blockedCandidates[0]?.turnId || null,
         targetAccountId: fullPlan.target.accountId });
       return;
     }
@@ -1024,7 +1013,7 @@ async function automaticHeadlessMain() {
       targetAccountId: lockedPlan.target.accountId,
       pending: null,
     });
-    writeAutoContinueState({ ...attemptState, desktopPreflight: null });
+    writeAutoContinueState(attemptState);
 
     lease = await acquireHeadlessClientsAfterStoragePreflight(codexHome, lockedPlan.candidates,
       () => acquireExclusiveClients({ autoMode: true }));
@@ -1040,9 +1029,7 @@ async function automaticHeadlessMain() {
         const decision = autoDecisionSnapshot();
         if (decision.action === 'blocked') throw new Error(decision.reason || 'AUTO_PLAN_BLOCKED');
         if (decision.action !== 'resume') return decision;
-        const partitioned = await partitionHeadlessCandidates(decision,
-          candidate => headlessStoragePreflight(codexHome, [candidate]),
-          readAutoContinueState().candidateBlocks);
+        const partitioned = await partitionAutomaticPlan(decision, readAutoContinueState().candidateBlocks);
         lockedPlan = partitioned.plan;
         blockedCandidates = partitioned.blocked;
         writeAutoContinueState({ candidateBlocks: partitioned.candidateBlocks });
@@ -1119,6 +1106,9 @@ async function automaticHeadlessMain() {
           let journal = normalizeResumeState(readJson(resumeStatePath, emptyResumeState()));
           journal = markResumeTerminal(journal, persisted, result);
           atomicWriteJson(resumeStatePath, journal);
+          const historyState = readAutoContinueState();
+          const withFallbackResult = finishHeadlessFallbackHistory(historyState, persisted, result);
+          if (withFallbackResult !== historyState) writeAutoContinueState(withFallbackResult);
           lastTerminalThreadId = persisted.threadId;
           lastTerminalFailedTurnId = persisted.turnId;
           await waitForObserverIdleAfterTurn();
@@ -1165,6 +1155,12 @@ async function automaticHeadlessMain() {
         diagnostics: error?.diagnostics || null,
       });
       atomicWriteJson(resumeStatePath, journal);
+      const historyState = readAutoContinueState();
+      const withFallbackFailure = finishHeadlessFallbackHistory(historyState, currentCandidate, {
+        turnId: journal.attempts[candidateKey(currentCandidate.threadId, currentCandidate.turnId)]?.continuationTurnId,
+        status: 'failed',
+      });
+      if (withFallbackFailure !== historyState) writeAutoContinueState(withFallbackFailure);
     }
     const preCommitExclusivity = !committed && error?.message === 'APP_SERVER_EXCLUSIVITY_FAILED';
     const transient = error?.message === 'RESUME_ALREADY_RUNNING';
@@ -1274,12 +1270,6 @@ async function automaticHeadlessMain() {
   return shouldReplan ? 'replan' : 'done';
 }
 
-function launchDesktopDeepLink(url) {
-  const child = spawn(desktopBinary, [url], { detached: true, stdio: 'ignore' });
-  child.unref();
-  return child.pid;
-}
-
 function launchDesktopDeepLinkObserved(url) {
   return new Promise((resolve, reject) => {
     const sequence = Date.now();
@@ -1317,12 +1307,6 @@ function launchDesktopDeepLinkObserved(url) {
   });
 }
 
-function desktopLink(threadId, prompt = null) {
-  const url = new URL(desktopThreadLink(threadId));
-  if (prompt !== null) url.searchParams.set('prompt', prompt);
-  return url.toString();
-}
-
 function desktopCapability(response) {
   const entries = processEntries();
   const roots = entries.filter(isDesktopRoot).map(entry => entry.pid);
@@ -1352,344 +1336,6 @@ function desktopCapability(response) {
   };
 }
 
-async function reconcileOutstandingDesktopAttempts() {
-  let journal = normalizeResumeState(readJson(resumeStatePath, emptyResumeState()));
-  const attempts = committedDesktopAttempts(journal);
-  if (attempts.length === 0) return false;
-  const eventState = normalizeState(readJson(eventStatePath, {}), Date.now());
-  let pending = false;
-  for (const attempt of attempts) {
-    const candidate = { threadId: attempt.threadId, turnId: attempt.interruptedTurnId };
-    const result = reconcileDesktopSend(journal, candidate, eventState, Date.now());
-    journal = result.state;
-    if (result.outcome === 'pending') pending = true;
-  }
-  atomicWriteJson(resumeStatePath, journal);
-  if (pending) {
-    writeAutoContinueState({ status: 'reconciling', errorKind: null, actionRequired: false });
-  }
-  return pending;
-}
-
-async function awaitDesktopSendReconciliation(candidate) {
-  const deadline = Date.now() + DESKTOP_SEND_CONFIRM_TIMEOUT_MS;
-  while (true) {
-    const eventState = normalizeState(readJson(eventStatePath, {}), Date.now());
-    let journal = normalizeResumeState(readJson(resumeStatePath, emptyResumeState()));
-    const result = reconcileDesktopSend(journal, candidate, eventState, Date.now());
-    journal = result.state;
-    if (result.outcome !== 'pending') {
-      atomicWriteJson(resumeStatePath, journal);
-      return result;
-    }
-    if (Date.now() >= deadline) {
-      const finalResult = reconcileDesktopSend(journal, candidate, eventState,
-        Date.now() + DESKTOP_SEND_CONFIRM_TIMEOUT_MS);
-      atomicWriteJson(resumeStatePath, finalResult.state);
-      return finalResult;
-    }
-    await sleep(200);
-  }
-}
-
-async function automaticDesktopMain() {
-  const initial = autoDecisionSnapshot();
-  if (initial.action !== 'resume') {
-    const previous = reconcileSuppression(readAutoContinueState(), initial);
-    const reconciled = initial.reason === 'no-candidates' || initial.reason === 'disabled'
-      ? clearExclusivityBlock(previous) : previous;
-    writeAutoContinueState({
-      ...reconciled,
-      status: initial.action,
-      waitingReason: initial.action === 'waiting' ? initial.reason : null,
-      lastAttemptAtMs: Date.now(),
-      errorKind: initial.action === 'blocked' ? initial.reason : null,
-      actionRequired: initial.actionRequired === true,
-      candidateThreadId: null,
-      candidateTurnId: null,
-      targetAccountId: null,
-      pending: null,
-    });
-    return 'done';
-  }
-
-  if (restoreFailureBlocksAuto(readAutoContinueState(), initial)) {
-    const blocked = readAutoContinueState();
-    writeAutoContinueState({ status: 'blocked', errorKind: blocked.errorKind ||
-      blocked.desktopRestore?.errorKind || 'AUTO_ATTEMPT_RETRY_HALTED', actionRequired: true,
-      candidateThreadId: initial.candidates[0]?.threadId || null,
-      candidateTurnId: initial.candidates[0]?.turnId || null,
-      targetAccountId: initial.target?.accountId || null, pending: null });
-    return 'done';
-  }
-
-  if (hasMatchingExclusivityBlock(readAutoContinueState(), {
-    threadId: initial.candidates[0]?.threadId || null,
-    failedTurnId: initial.candidates[0]?.turnId || null,
-    targetAccountId: initial.target?.accountId || null,
-  }) && unresolvedExclusivityBlockerPresent(readAutoContinueState(), processEntries())) {
-    writeAutoContinueState({ lastAttemptAtMs: Date.now() });
-    return 'done';
-  }
-
-  // A structured BEFORE_WORK input cannot be represented losslessly in the
-  // Desktop composer. This check happens before any navigation/prefill, so the
-  // existing headless controller is still a safe fallback.
-  try {
-    for (const candidate of initial.candidates) desktopPlan(candidate, initial.target);
-  } catch (error) {
-    if (error.safeHeadlessFallback) return 'fallback-headless';
-    throw error;
-  }
-
-  let lock = null;
-  let lease = null;
-  let currentCandidate = null;
-  let promptInjected = false;
-  let anyCommitted = false;
-  let safeFallback = false;
-  try {
-    lock = acquireLock();
-    const lockedPlan = autoDecisionSnapshot();
-    if (!sameDecisionPlan(initial, lockedPlan)) throw new Error('AUTO_PLAN_CHANGED_BEFORE_OWNERSHIP');
-    if (isAutoPlanSuppressed(readAutoContinueState(), lockedPlan)) {
-      writeAutoContinueState({ status: 'suppressed', pending: null, errorKind: null, actionRequired: false });
-      return 'done';
-    }
-    const processSnapshot = processEntries();
-    const autoBlocker = automaticClientBlocker(processSnapshot);
-    if (autoBlocker) throw Object.assign(new Error(autoBlocker.errorKind), { diagnostics: autoBlocker });
-    const desktopRunning = processSnapshot.some(isDesktopRoot);
-    const exclusivityContext = {
-      threadId: lockedPlan.candidates[0]?.threadId || null,
-      failedTurnId: lockedPlan.candidates[0]?.turnId || null,
-      targetAccountId: lockedPlan.target.accountId,
-    };
-    const retryingExclusivity = hasMatchingExclusivityBlock(readAutoContinueState(), exclusivityContext);
-    if (!retryingExclusivity && requiresPendingCountdown(lockedPlan, desktopRunning)) {
-      const prepared = createOrResumePending(readAutoContinueState(), lockedPlan);
-      writeAutoContinueState(prepared.state);
-      if (prepared.notificationClaimed) sendPendingNotification(prepared.state.pending);
-      if (prepared.outcome === 'suppressed') return 'done';
-      const outcome = await awaitPendingCountdown(lockedPlan);
-      if (outcome === 'canceled') return 'done';
-      if (outcome !== 'execute') return 'done';
-      if (!sameDecisionPlan(lockedPlan, autoDecisionSnapshot())) return 'done';
-    }
-    const attemptState = beginExclusivityAttempt(adoptAutomaticPlan(readAutoContinueState()), exclusivityContext, {
-      status: 'desktop-preparing', lastAttemptAtMs: Date.now(), errorKind: null,
-      phase: 'preparing', sourceAccountId: initial.active?.accountId || null,
-      actionRequired: false, candidateThreadId: lockedPlan.candidates[0]?.threadId || null,
-      candidateTurnId: lockedPlan.candidates[0]?.turnId || null,
-      targetAccountId: lockedPlan.target.accountId, pending: null,
-    });
-    writeAutoContinueState(attemptState);
-
-    lease = await acquireExclusiveClients({ autoMode: true });
-    writeAutoContinueState(clearExclusivityBlock(readAutoContinueState()));
-    assertAutomaticOwnership();
-    const ownedPlan = autoDecisionSnapshot();
-    if (!sameDecisionPlan(lockedPlan, ownedPlan)) throw new Error('AUTO_PLAN_CHANGED_BEFORE_SWITCH');
-    writeAutoContinueState({ phase: 'switching auth' });
-    switchToTarget(ownedPlan.target);
-    writeAutoContinueState({ phase: 'verifying target' });
-    refreshUsageNow();
-    const switchedPlan = autoDecisionSnapshot();
-    if (!sameDecisionPlan(ownedPlan, switchedPlan)) throw new Error('AUTO_PLAN_CHANGED_AFTER_SWITCH');
-
-    const restored = await restoreClients(lease, {
-      forceDesktop: true,
-      forceRendererAccessibility: true,
-    });
-    lease = null;
-    const desktopRootPid = Number(restored.desktopRestore?.desktopPid);
-    if (!Number.isInteger(desktopRootPid) || desktopRootPid <= 0) {
-      throw new Error('DESKTOP_ROOT_PID_UNVERIFIED');
-    }
-    writeAutoContinueState({
-      desktopRestore: restored.desktopRestore ? {
-        status: 'ready', completedAtMs: Date.now(), ...restored.desktopRestore,
-      } : null,
-    });
-
-    const plannedCandidates = [...switchedPlan.candidates];
-    for (let index = 0; index < plannedCandidates.length; index += 1) {
-      currentCandidate = plannedCandidates[index];
-      promptInjected = false;
-      writeAutoContinueState({ phase: 'starting continuation',
-        candidateThreadId: currentCandidate.threadId, candidateTurnId: currentCandidate.turnId });
-      const target = activeAccountState();
-      if (target.accountId !== switchedPlan.target.accountId || target.accountKey !== switchedPlan.target.accountKey) {
-        throw new Error('ACTIVE_ACCOUNT_CHANGED');
-      }
-      assertFreshUsableTarget(target.accountId);
-      let eventState = normalizeState(readJson(eventStatePath, {}), Date.now());
-      const persisted = assertDesktopCandidate(eventState, currentCandidate, target);
-      const plan = desktopPlan(persisted, target);
-
-      launchDesktopDeepLink(desktopLink(plan.threadId));
-      const atspi = new DesktopAtspiController();
-      try {
-        let capability;
-        try {
-          const readiness = await waitForDesktopReadiness({
-            attempt: async () => desktopCapability(await atspi.request({
-              command: 'preflight', threadId: plan.threadId, desktopPid: desktopRootPid,
-            })),
-            onObservation: desktopPreflight => writeAutoContinueState({
-              status: desktopPreflight.status === 'ready' ? 'desktop-ready' : 'desktop-preflight',
-              errorKind: null,
-              actionRequired: false,
-              candidateThreadId: persisted.threadId,
-              candidateTurnId: persisted.turnId,
-              targetAccountId: target.accountId,
-              desktopPreflight: {
-                ...desktopPreflight,
-                threadId: persisted.threadId,
-                failedTurnId: persisted.turnId,
-                targetAccountId: target.accountId,
-                desktopRootPid,
-              },
-            }),
-          });
-          capability = readiness.capability;
-        } catch (error) {
-          if (desktopPrecommitFailureAction({ promptInjected, anyCommitted, candidateIndex: index }) === 'fallback-headless') {
-            const previous = readAutoContinueState().desktopPreflight || {};
-            writeAutoContinueState({
-              status: 'desktop-fallback-headless',
-              errorKind: null,
-              actionRequired: false,
-              candidateThreadId: persisted.threadId,
-              candidateTurnId: persisted.turnId,
-              targetAccountId: target.accountId,
-              desktopPreflight: desktopPreflightFallbackRecord(previous, error, {
-                threadId: persisted.threadId,
-                failedTurnId: persisted.turnId,
-                targetAccountId: target.accountId,
-                desktopRootPid,
-              }),
-            });
-            safeFallback = true;
-            break;
-          }
-          throw error;
-        }
-
-        let journal = normalizeResumeState(readJson(resumeStatePath, emptyResumeState()));
-        journal = markDesktopPrefillStarted(journal, persisted, plan);
-        atomicWriteJson(resumeStatePath, journal);
-        launchDesktopDeepLink(desktopLink(plan.threadId, plan.prompt));
-        promptInjected = true;
-        const verified = await atspi.request({
-          command: 'verify-prefill', threadId: plan.threadId, text: plan.prompt,
-          desktopPid: desktopRootPid,
-        });
-        capability = desktopCapability(verified);
-
-        refreshUsageNow();
-        const commitTarget = activeAccountState();
-        if (commitTarget.accountId !== target.accountId || commitTarget.accountKey !== target.accountKey) {
-          throw new Error('ACTIVE_ACCOUNT_CHANGED_BEFORE_COMMIT');
-        }
-        assertFreshUsableTarget(target.accountId);
-        eventState = normalizeState(readJson(eventStatePath, {}), Date.now());
-        const commitCandidate = assertDesktopCandidate(eventState, persisted, target);
-        const commitPlan = desktopPlan(commitCandidate, target);
-        if (commitPlan.fingerprint !== plan.fingerprint) throw new Error('DESKTOP_PLAN_CHANGED_BEFORE_COMMIT');
-
-        journal = normalizeResumeState(readJson(resumeStatePath, emptyResumeState()));
-        journal = markDesktopSendCommitted(journal, commitCandidate, commitPlan, capability, eventState);
-        atomicWriteJson(resumeStatePath, journal);
-        anyCommitted = true;
-        writeAutoContinueState({ phase: 'running' });
-
-        // Claim the one permitted action before writing to the long-lived
-        // helper. If either process dies now, reconciliation may only observe.
-        journal = markDesktopSendInvoked(journal, commitCandidate);
-        atomicWriteJson(resumeStatePath, journal);
-        let actionReliable = true;
-        try {
-          await atspi.request({ command: 'send' }, 5_000);
-        } catch {
-          actionReliable = false;
-        }
-        const reconciliation = await awaitDesktopSendReconciliation(commitCandidate);
-        if (reconciliation.outcome === 'conflict') throw new Error('DESKTOP_SEND_CONFLICT');
-        if (!desktopQueueMayContinue({ outcome: reconciliation.outcome, capabilityReliable: actionReliable })) {
-          throw new Error('DESKTOP_SEND_UNCONFIRMED_CAPABILITY_FAILED');
-        }
-      } finally {
-        await atspi.close();
-      }
-      if (safeFallback) break;
-    }
-
-    if (safeFallback) {
-      writeAutoContinueState({ restoreRetryHalt: false, restoreRetryHaltGeneration: null });
-      return 'fallback-headless';
-    }
-    writeAutoContinueState({
-      status: 'completed', lastSuccessAtMs: Date.now(), errorKind: null,
-      phase: null, sourceAccountId: null,
-      actionRequired: false, candidateThreadId: null, candidateTurnId: null,
-      targetAccountId: switchedPlan.target.accountId, pending: null,
-      restoreRetryHalt: false, restoreRetryHaltGeneration: null,
-    });
-    return 'done';
-  } catch (error) {
-    const committedAttempt = currentCandidate
-      ? normalizeResumeState(readJson(resumeStatePath, emptyResumeState())).attempts[
-          candidateKey(currentCandidate.threadId, currentCandidate.turnId)
-        ]
-      : null;
-    const afterCommit = committedAttempt?.strategy === 'DESKTOP' && committedAttempt?.committedAtMs;
-    if (!afterCommit && !promptInjected && error?.message === 'APP_SERVER_EXCLUSIVITY_FAILED') {
-      const blocked = recordExclusivityBlock(readAutoContinueState(), error.diagnostics, {
-        threadId: currentCandidate?.threadId || initial.candidates[0]?.threadId || null,
-        failedTurnId: currentCandidate?.turnId || initial.candidates[0]?.turnId || null,
-        targetAccountId: initial.target?.accountId || null,
-      });
-      writeAutoContinueState({ ...blocked, lastAttemptAtMs: Date.now() });
-      if (blocked.actionRequired) process.exitCode = 1;
-      return 'done';
-    }
-    writeAutoContinueState({
-      status: 'blocked', lastAttemptAtMs: Date.now(),
-      errorKind: error?.message || 'AUTO_DESKTOP_FAILED', actionRequired: true,
-      diagnostics: error?.diagnostics || null,
-      candidateThreadId: currentCandidate?.threadId || initial.candidates[0]?.threadId || null,
-      candidateTurnId: currentCandidate?.turnId || initial.candidates[0]?.turnId || null,
-      targetAccountId: initial.target?.accountId || null, pending: null,
-      ...(isDesktopRestoreError(error) ? { desktopRestore: {
-        status: 'failed', completedAtMs: Date.now(), errorKind: error.message,
-        diagnostics: error.diagnostics || null,
-      } } : {}),
-    });
-    if (afterCommit || promptInjected) return 'done';
-    throw error;
-  } finally {
-    if (lease) {
-      try {
-        await restoreClients(lease, {
-          forceDesktop: true,
-          forceRendererAccessibility: true,
-        });
-      } catch (error) {
-        writeAutoContinueState({
-          status: 'blocked', errorKind: error?.message || 'AUTO_CLIENT_RESTORE_FAILED',
-          actionRequired: true,
-          desktopRestore: { status: 'failed', completedAtMs: Date.now(),
-            errorKind: error?.message || 'AUTO_CLIENT_RESTORE_FAILED',
-            diagnostics: error?.diagnostics || null },
-        });
-        process.exitCode = 1;
-      }
-    }
-    if (lock) releaseLock(lock);
-  }
-}
-
 async function automaticMain() {
   const navigationState = readAutoContinueState();
   const archivedNavigation = archiveTerminalDesktopNavigation(navigationState,
@@ -1715,30 +1361,14 @@ async function automaticMain() {
   if (readAutoContinueState().exclusivityBlock && appServerExclusivityReport(processEntries(), {
     ignoredPids: [process.pid],
   }).exclusive) writeAutoContinueState(clearExclusivityBlock(readAutoContinueState()));
-  if (await reconcileOutstandingDesktopAttempts()) return 'reconciling';
-  const preferences = readStatusPreferences(statusPreferencesPath);
-  if (preferences.autoMode !== AUTO_MODE.DESKTOP) {
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      const result = await automaticHeadlessMain();
-      if (result !== 'replan') return result;
-      refreshUsageNow();
-    }
-    writeAutoContinueState({ status: 'waiting', waitingReason: 'plan-changing',
-      errorKind: null, actionRequired: false, pending: null });
-    return 'waiting';
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const result = await automaticHeadlessMain();
+    if (result !== 'replan') return result;
+    refreshUsageNow();
   }
-  const beforeRetry = readAutoContinueState();
-  const retryPlan = autoDecisionSnapshot();
-  const reconciledFailure = reconcileFailedAutomaticAttempt(beforeRetry, retryPlan);
-  if (reconciledFailure.restoreRetryHalt && !beforeRetry.restoreRetryHalt) {
-    writeAutoContinueState({ ...reconciledFailure, status: 'blocked', actionRequired: true });
-    return 'restore-blocked';
-  }
-  // A restore failure belongs to the whole controller plan. Repeating the
-  // timer run must not quiesce the Desktop it just launched and restore again.
-  const outcome = await automaticDesktopMain();
-  if (outcome === 'fallback-headless') return automaticHeadlessMain();
-  return outcome;
+  writeAutoContinueState({ status: 'waiting', waitingReason: 'plan-changing',
+    errorKind: null, actionRequired: false, pending: null });
+  return 'waiting';
 }
 
 async function main() {

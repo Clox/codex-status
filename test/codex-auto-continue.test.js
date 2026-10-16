@@ -25,6 +25,8 @@ const {
   pendingAttentionDecision,
   pendingCountdownDecision,
   partitionHeadlessCandidates,
+  partitionAutomaticCandidates,
+  automaticCandidateEligibility,
   headlessDiagnosticCandidates,
   recordExclusivityBlock,
   clearExclusivityBlock,
@@ -32,6 +34,7 @@ const {
   archiveDesktopNavigation,
   archiveTerminalDesktopNavigation,
   recordPrecommitPlanChange,
+  waitForResumeOperationLock,
   adoptAutomaticPlan,
   shouldReplanAutomaticError,
   armAutomaticAttemptRetryHalt,
@@ -159,6 +162,36 @@ test('HEADLESS missing active-home rollout blocks before Desktop quiesce or rest
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }
+});
+
+test('HEADLESS partitions unavailable and eligible exact candidates', async () => {
+  const stale = { ...eventState().interruptedTurns.first };
+  const healthy = { ...eventState().interruptedTurns.second };
+  const decision = { action: 'resume', strategy: 'HEADLESS', candidates: [stale, healthy] };
+  const observed = eventState({ interruptedTurns: {
+    [JSON.stringify([stale.threadId, stale.turnId])]: stale,
+    [JSON.stringify([healthy.threadId, healthy.turnId])]: healthy,
+  } });
+  const inspect = async item => automaticCandidateEligibility(item, observed,
+    item.threadId === stale.threadId
+      ? { ok: false, reason: 'ROLLOUT_METADATA_UNVERIFIED' } : { ok: true });
+  const result = await partitionAutomaticCandidates(decision, inspect);
+  assert.deepEqual(result.plan.candidates, [healthy]);
+  assert.deepEqual(result.blocked, [stale]);
+  assert.equal(result.candidateBlocks[JSON.stringify([stale.threadId, stale.turnId])].actionRequired, false);
+  delete observed.exhaustions['account-a'];
+  assert.deepEqual(automaticCandidateEligibility(healthy, observed, { ok: true }),
+    { ok: false, reason: 'SOURCE_EXHAUSTION_CHANGED', actionRequired: false });
+  assert.deepEqual(autoContinueProblemLines({ status: 'waiting', candidateBlocks: {
+    [JSON.stringify([healthy.threadId, healthy.turnId])]: {
+      threadId: healthy.threadId, failedTurnId: healthy.turnId,
+      reason: 'SOURCE_EXHAUSTION_CHANGED', actionRequired: false,
+    },
+  } }, true), []);
+  assert.deepEqual(automaticCandidateEligibility({ ...healthy, turnId: 'other-turn' }, observed,
+    { ok: true }), { ok: false, reason: 'CANDIDATE_NO_LONGER_RESUMABLE', actionRequired: false });
+  assert.equal(shouldReplanAutomaticError(new Error('SOURCE_EXHAUSTION_CHANGED'), false), true);
+  assert.equal(shouldReplanAutomaticError(new Error('SOURCE_EXHAUSTION_CHANGED'), true), false);
 });
 
 test('HEADLESS storage preflight checks every exact candidate and failed turn', async () => {
@@ -844,4 +877,59 @@ test('countdown expiry hands the unchanged plan to existing execution while chan
   assert.equal(requiresPendingCountdown(decision, true), true);
   assert.equal(requiresPendingCountdown(decision, false), false);
   assert.equal(requiresPendingCountdown({ ...decision, target: { ...decision.target, accountId: 'account-a' } }, true), false);
+});
+
+test('DESKTOP countdown keeps a separate unavailable candidate outside the locked plan', () => {
+  const raw = decide();
+  const unavailable = raw.candidates[0];
+  const locked = { ...raw, candidates: raw.candidates.slice(1) };
+  const pending = createOrResumePending({}, locked, NOW).state;
+  assert.equal(sameHeadlessDecisionPlan(locked, raw, [unavailable]), true);
+  assert.equal(pendingCountdownDecision(pending,
+    { ...raw, candidates: raw.candidates.filter(candidate => candidate !== unavailable) },
+    NOW + 10_000).action, 'execute');
+  assert.equal(pendingCountdownDecision(pending, raw, NOW + 10_000).action, 'changed');
+});
+
+test('changed expired countdown clears pending, replans, and does not notify the same plan again', () => {
+  const plan = decide();
+  const pending = createOrResumePending({}, plan, NOW).state;
+  const changed = { ...plan, candidates: plan.candidates.slice(1) };
+  assert.equal(pendingCountdownDecision(pending, changed, NOW + 10_000).action, 'changed');
+  const replanning = recordPrecommitPlanChange(pending,
+    'AUTO_PLAN_CHANGED_DURING_COUNTDOWN', {}, NOW + 10_000);
+  assert.equal(replanning.pending, null);
+  assert.equal(replanning.status, 'waiting');
+  assert.match(autoContinueStatusLine({ autoMode: 'HEADLESS' }, pending, NOW + 10_000),
+    /WAIT: countdown-expired/);
+  assert.doesNotMatch(autoContinueStatusLine({ autoMode: 'HEADLESS' }, pending, NOW + 10_000), /Restart om 0s/);
+  assert.doesNotMatch(autoContinueStatusLine({ autoMode: 'HEADLESS' }, replanning, NOW + 10_000), /Restart om 0s/);
+  const notified = { ...replanning, lastNotifiedPendingFingerprint: autoPlanFingerprint(plan) };
+  assert.equal(createOrResumePending(notified, plan, NOW + 10_001).notificationClaimed, false);
+  assert.equal(createOrResumePending(notified, changed, NOW + 10_001).notificationClaimed, true);
+});
+
+test('short operation lock contention remains a retryable wait', () => {
+  const waiting = waitForResumeOperationLock({ status: 'pending', pending: { fingerprint: 'old' },
+    errorKind: 'RESUME_ALREADY_RUNNING', actionRequired: true }, NOW);
+  assert.equal(waiting.status, 'waiting');
+  assert.equal(waiting.waitingReason, 'resume-already-running');
+  assert.equal(waiting.pending, null);
+  assert.equal(waiting.actionRequired, false);
+  assert.deepEqual(autoContinueProblemLines(waiting, true), []);
+});
+
+test('historical observer timeout does not become an active AUTO problem for a new candidate', () => {
+  const oldKey = JSON.stringify(['old-thread', 'old-failed']);
+  const state = { status: 'blocked', actionRequired: true,
+    errorKind: 'TURN_OBSERVER_DID_NOT_SETTLE', candidateThreadId: 'old-thread',
+    candidateTurnId: 'old-failed' };
+  const resumeState = { attempts: { [oldKey]: { threadId: 'old-thread',
+    interruptedTurnId: 'old-failed', continuationTurnId: 'old-continuation',
+    status: 'MANUAL_REQUIRED_AFTER_COMMIT', errorKind: 'TURN_OBSERVER_DID_NOT_SETTLE',
+    committedAtMs: 100, completedAtMs: 200, terminalStatus: 'completed' } } };
+  assert.deepEqual(autoContinueProblemLines(state, true, { resumeState }), []);
+  assert.deepEqual(autoContinueProblemLines(state, true,
+    { candidateKeys: new Set([JSON.stringify(['new-thread', 'new-failed'])]) }), []);
+  assert.equal(autoContinueProblemLines(state, true, { candidateKeys: new Set([oldKey]) }).length, 1);
 });

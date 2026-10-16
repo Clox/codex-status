@@ -53,6 +53,31 @@ test('status problems omit stale pre-commit failures but retain uncertain post-c
   ]);
 });
 
+test('exact completed continuation clears historical observer timeout without hiding another attempt', () => {
+  const threadId = '01a102f4-32ec-7bf1-8817-5186a08a86a9';
+  const failedTurnId = '01a13180-d734-7b33-bbac-11531b2b3984';
+  const continuationTurnId = '01a13182-7375-7853-8e0f-757399c747f1';
+  const old = { threadId, interruptedTurnId: failedTurnId, continuationTurnId,
+    status: 'MANUAL_REQUIRED_AFTER_COMMIT', errorKind: 'TURN_OBSERVER_DID_NOT_SETTLE',
+    committedAtMs: 100, completedAtMs: 200, terminalStatus: 'completed' };
+  const other = { ...old, threadId: 'independent-thread', interruptedTurnId: 'other-failed',
+    continuationTurnId: 'other-continuation', completedAtMs: null, terminalStatus: null };
+  const state = { attempts: { [candidateKey(threadId, failedTurnId)]: old,
+    [candidateKey(other.threadId, other.interruptedTurnId)]: other } };
+  assert.deepEqual(currentResumeProblemLines(state), [
+    'MANUAL RESUME / ACTION REQUIRED: …t-thread was committed; no automatic retry (TURN_OBSERVER_DID_NOT_SETTLE).',
+  ]);
+  const unverified = { attempts: { [candidateKey(threadId, failedTurnId)]:
+    { ...old, terminalStatus: null } } };
+  assert.equal(currentResumeProblemLines(unverified).length, 1);
+  assert.deepEqual(currentResumeProblemLines(unverified, { terminalTurns: [{
+    threadId, turnId: continuationTurnId, status: 'completed', threadIdentityVerified: true,
+  }] }), []);
+  assert.equal(currentResumeProblemLines(unverified, { terminalTurns: [{
+    threadId, turnId: 'different-turn', status: 'completed', threadIdentityVerified: true,
+  }] }).length, 1);
+});
+
 const candidate = {
   threadId: 'thread-a', turnId: 'turn-failed', accountId: 'account-a',
   status: 'failed', errorKind: 'usagelimitexceeded', resumable: true,
