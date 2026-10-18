@@ -45,6 +45,8 @@ printf '\033]0;Codex-kontostatus\007'
 status_runtime_dir=${XDG_CACHE_HOME:-"$HOME/.cache"}/codex-account-switcher
 mkdir -p "$status_runtime_dir"
 chmod 700 "$status_runtime_dir"
+"$HOME/.local/bin/codex-instance" pool-migrate >/dev/null 2>>"$status_runtime_dir/status-launch.log" || true
+pool_switch_state_path=$("$HOME/.local/bin/codex-instance" switch-state-path 2>/dev/null || true)
 exec {status_lock_fd}>"$status_runtime_dir/status-window-v2.lock"
 if ! flock -n "$status_lock_fd"; then
   printf '%s status singleton already held\n' "$(date --iso-8601=seconds)" >>"$status_runtime_dir/status-launch.log"
@@ -123,6 +125,8 @@ last_drawn_scroll_offset=''
 scroll_offset=0
 base_frame=''
 raw_frame=''
+selected_instance_id=''
+export CODEX_SELECTED_INSTANCE_ID=''
 attention_json='{"worthy":false,"observationKey":null}'
 active_source_row=''
 ui_tick=0
@@ -204,7 +208,8 @@ draw_current_frame() {
 
 runtime_signature() {
   stat -c '%n:%Y:%s' "$CODEX_AUTO_CONTINUE_STATE" "$CODEX_RESUME_STATE" \
-    "$CODEX_EVENT_STATE" "$CODEX_STATUS_PREFERENCES" "$CODEX_ACCOUNT_SWITCH_STATE" 2>/dev/null || true
+    "$CODEX_EVENT_STATE" "$CODEX_STATUS_PREFERENCES" "$CODEX_ACCOUNT_SWITCH_STATE" \
+    "$pool_switch_state_path" 2>/dev/null || true
 }
 
 refresh_local_frame() {
@@ -398,8 +403,17 @@ while true; do
   if IFS= read -rsn 1 -t 0.2 key </dev/tty; then
     case "$key" in
       1|2|3|4|5|6|7|8|9)
-        if pgrep -f "^${ACCOUNT_SWITCHER} ([123]|--key [A-Za-z0-9_-]+) --desktop( |$)" >/dev/null 2>&1; then
-          notify-send 'Codex-kontobyte pågår' 'Vänta tills det pågående kontobytet är klart.' 2>/dev/null || true
+        if [[ -z $selected_instance_id ]]; then
+          selected_instance_id=$("$HOME/.local/bin/codex-instance" resolve-index "$key" 2>/dev/null || true)
+          if [[ -z $selected_instance_id ]]; then
+            copy_feedback='No instance at this number'
+            copy_feedback_until=$((SECONDS + 3))
+          else
+            CODEX_SELECTED_INSTANCE_ID=$selected_instance_id
+            export CODEX_SELECTED_INSTANCE_ID
+            refresh_local_frame
+          fi
+          last_drawn_input=''
         else
           source_row=$(printf '%s\n' "$key_map" | awk -v rank="$key" '$1 == rank { print $2; exit }')
           launcher_account=$(printf '%s\n' "$key_map" | awk -v rank="$key" '$1 == rank { print $4; exit }')
@@ -411,25 +425,29 @@ while true; do
             notify-send 'Codex-kontobyte stoppat' 'Kunde inte entydigt identifiera kontot. Öppna kontomenyn med K.' 2>/dev/null || true
             continue
           fi
-          if [[ $source_row == "$active_source_row" ]]; then
-            launch_detached "$CHATGPT_LAUNCHER"
-            continue
-          fi
-          pending_source_row=$source_row
-          pending_since=$SECONDS
-          pending_spinner_index=0
-          base_frame=$(printf '%s\n' "$raw_frame" |
-            CODEX_STATUS_RANKING=1 CODEX_STATUS_COLUMNS="$columns" CODEX_PENDING_SOURCE_ROW="$pending_source_row" CODEX_PENDING_STATUS='WAIT/' CODEX_STATUS_NOW_MS="$status_now_ms" "$USAGE_ANNOTATOR")
-          if ((!paused_rendering)); then
-            last_drawn_input=''
-            draw_current_frame
-            pending_spinner_index=$(((pending_spinner_index + 1) % ${#pending_spinner_frames[@]}))
-          fi
-          launch_detached "$ACCOUNT_SWITCHER" --key "$launcher_account" --desktop
+          availability=$("$HOME/.local/bin/codex-instance" availability "$selected_instance_id" "$launcher_account" 2>/dev/null || true)
+          case "$availability" in
+            already-active) copy_feedback='Account already active; no change' ;;
+            in-use:*) copy_feedback="Account in use by ${availability#in-use:}" ;;
+            available)
+              launch_detached "$HOME/.local/bin/codex-instance" switch-key "$selected_instance_id" "$launcher_account"
+              copy_feedback='Account switch started'
+              ;;
+            *) copy_feedback='Account state unverified; no switch' ;;
+          esac
+          copy_feedback_until=$((SECONDS + 4))
+          selected_instance_id=''
+          CODEX_SELECTED_INSTANCE_ID=''
+          export CODEX_SELECTED_INSTANCE_ID
+          refresh_local_frame
+          last_drawn_input=''
         fi
         ;;
       k|K)
         launch_detached "$(command -v gnome-terminal)" --hide-menubar --title='Codex-konton' -- "$HOME/.local/bin/codex-account-manager" --hold
+        ;;
+      i|I)
+        launch_detached "$(command -v gnome-terminal)" --hide-menubar --title='Codex-instanser' -- "$HOME/.local/bin/codex-instance" menu
         ;;
       r|R)
         if printf '%s\n' "$base_frame" | grep -Fq 'Press [R] to repair authentication'; then
@@ -450,6 +468,16 @@ while true; do
         fi
         ;;
       x|X)
+        if [[ -n $selected_instance_id ]]; then
+          selected_instance_id=''
+          CODEX_SELECTED_INSTANCE_ID=''
+          export CODEX_SELECTED_INSTANCE_ID
+          copy_feedback='Instance selection cancelled'
+          copy_feedback_until=$((SECONDS + 3))
+          refresh_local_frame
+          last_drawn_input=''
+          continue
+        fi
         if printf '%s\n' "$base_frame" | grep -Fq '[X] Avbryt'; then
           if ! "$CODEX_STATUS_PREFERENCES_BIN" cancel-auto-pending >/dev/null 2>>"$status_runtime_dir/status-launch.log"; then
             notify-send 'Codex auto-continue' 'Den väntande åtgärden kunde inte avbrytas säkert.' 2>/dev/null || true
@@ -497,6 +525,16 @@ while true; do
         fi
         ;;
       '['|']'|$'\e')
+        if [[ $key == $'\e' && -n $selected_instance_id ]]; then
+          selected_instance_id=''
+          CODEX_SELECTED_INSTANCE_ID=''
+          export CODEX_SELECTED_INSTANCE_ID
+          copy_feedback='Instance selection cancelled'
+          copy_feedback_until=$((SECONDS + 3))
+          refresh_local_frame
+          last_drawn_input=''
+          continue
+        fi
         scroll_direction=0
         scroll_page=0
         case "$key" in

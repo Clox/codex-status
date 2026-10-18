@@ -1,4 +1,5 @@
 'use strict';
+require('./test-isolation');
 
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -35,7 +36,18 @@ function frame({ active = 8, interrupted = 8, problems = 8 } = {}) {
   ].join('\n');
 }
 
-test('small terminal pins table, recommendation, AUTO and help while scrolling crowded middle', () => {
+test('instance section follows the account list and scrolls without changing account table width', () => {
+  const input = frame({ active: 0, interrupted: 0, problems: 0 })
+    .replace('\x1b[1mRECOMMENDATION:',
+      'INSTANCES:\n1  Spadrig · running\n2  Rosetta · stopped\n\n\x1b[1mRECOMMENDATION:');
+  const parts = splitStatusFrame(input);
+  assert.equal(parts.table.length, 4);
+  assert.match(parts.middle.join('\n'), /INSTANCES:\n1  Spadrig · running\n2  Rosetta · stopped/);
+  const rendered = layoutStatusFrame(input, { rows: 24, columns: 79 });
+  assert.match(rendered.lines.map(plain).join('\n'), /Spadrig · running/);
+});
+
+test('small terminal pins table, legacy recommendation, AUTO and help while scrolling crowded middle', () => {
   const rendered = layoutStatusFrame(frame(), { rows: 13 });
   const lines = rendered.lines.map(plain);
   assert.equal(lines.length, 13);
@@ -43,7 +55,7 @@ test('small terminal pins table, recommendation, AUTO and help while scrolling c
     'ACCOUNT │ STATUS', '────────┼───────', 'account-a │ OK', 'account-b │ EXHAU',
     'RECOMMENDATION: Switch to account-a',
   ]);
-  assert.match(lines.at(-3), /^AUTO: HEADLESS/);
+  assert.match(lines.at(-2), /^AUTO: HEADLESS/);
   assert.match(lines.at(-1), /scroll.*P pause/);
   assert.match(lines.join('\n'), /↓ more/);
   assert.equal(lines.includes('problem-7'), false);
@@ -135,7 +147,7 @@ test('copy and pause help stays on one physical line at 77–79 columns', () => 
     const layout = layoutStatusFrame(frame({ active: 0, interrupted: 0, problems: 0 }),
       { rows: 24, columns });
     const help = layout.lines.at(-1);
-    assert.match(plain(help), /C copy status · P pause view/);
+    assert.match(plain(help), /1–9 inst.*C copy status · P pause/);
     assert.equal(physicalLines([help], columns).length, 1);
   }
 });
@@ -145,14 +157,15 @@ test('one middle row shows actual content and moves overflow notice into fixed h
   const first = layoutStatusFrame(content, { rows: 9, offset: 0 });
   assert.equal(first.lines.length, 9);
   assert.match(plain(first.lines[5]), /ACTIVE CODEX TURNS/);
-  assert.match(plain(first.lines.at(-1)), /↓ .*more/);
+  assert.ok(first.below > 0);
+  assert.match(plain(first.lines.join('\n')), /↓ .*more/);
   const moved = layoutStatusFrame(content, { rows: 9, offset: 999 });
   assert.match(plain(moved.lines[5]), /problem-1/);
-  assert.match(plain(moved.lines.at(-1)), /↑ .*more/);
+  assert.match(plain(moved.lines.join('\n')), /↑ .*more/);
   const noMiddleRoom = layoutStatusFrame(content, { rows: 8, offset: moved.offset });
   assert.equal(noMiddleRoom.lines.length, 8);
-  assert.match(plain(noMiddleRoom.lines.at(-2)), /^PRIOR/);
-  assert.match(plain(noMiddleRoom.lines.at(-1)), /more/);
+  assert.match(plain(noMiddleRoom.lines.at(-2)), /^AUTO:/);
+  assert.doesNotMatch(plain(noMiddleRoom.lines.join('\n')), /PRIOR = weekly/);
 });
 
 test('physically undersized terminals never receive more rows than they have', () => {

@@ -18,14 +18,27 @@ export PATH="$NODE_BIN_DIR:${PATH:-/usr/local/bin:/usr/bin:/bin}"
 ACCOUNT_STATE_CHECKER=${ACCOUNT_STATE_CHECKER:-"$HOME/.local/bin/codex-account-state"}
 ACCOUNT_SWITCH_CORE=${ACCOUNT_SWITCH_CORE:-"$(dirname -- "$0")/codex-account-switch-core"}
 CONTINUATION_DRAFTS=${CONTINUATION_DRAFTS:-"$HOME/.local/bin/codex-continuation-drafts"}
+INSTANCE_MANAGER=${CODEX_INSTANCE_MANAGER:-"$HOME/.local/bin/codex-instance"}
 USAGE_REFRESHER=${USAGE_REFRESHER:-"$HOME/.local/bin/codex-usage-refresh"}
 operation_lock_dir=${CODEX_OPERATION_LOCK_DIR:-"${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/exclusive-codex-operation.lock"}
 operation_lock_helper="$(dirname -- "$0")/../lib/codex-operation-lock.js"
 operation_lock_generation=''
+assignment_lock_generation=''
+account_lock_generation=''
+assignment_lock_dir=''
+account_lock_dir=''
 operation_pid=$BASHPID
 continuation_plan=''
 
 cleanup_operation() {
+  if [[ -n $account_lock_generation ]]; then
+    node "$operation_lock_helper" release "$account_lock_dir" "$operation_pid" "$account_lock_generation"
+    account_lock_generation=''
+  fi
+  if [[ -n $assignment_lock_generation ]]; then
+    node "$operation_lock_helper" release "$assignment_lock_dir" "$operation_pid" "$assignment_lock_generation"
+    assignment_lock_generation=''
+  fi
   if [[ -n $operation_lock_generation ]]; then
     node "$operation_lock_helper" release "$operation_lock_dir" "$operation_pid" "$operation_lock_generation"
     operation_lock_generation=''
@@ -91,6 +104,13 @@ expected_state=$("$ACCOUNT_STATE_CHECKER" "$resolve_mode" "$CODEX_HOME" "$accoun
 IFS=$'\t' read -r expected_account_id expected_account_key upstream_selector <<<"$expected_state"
 [[ -n $expected_account_id && -n $expected_account_key ]] || usage
 
+"$INSTANCE_MANAGER" pool-migrate >/dev/null || exit 75
+assignment_lock_dir=$("$INSTANCE_MANAGER" assignment-lock-path) || exit 75
+assignment_lock_generation=$(node "$operation_lock_helper" acquire "$assignment_lock_dir" "$operation_pid") || exit 75
+account_lock_dir=$("$INSTANCE_MANAGER" account-lock-path "$expected_account_key") || exit 75
+account_lock_generation=$(node "$operation_lock_helper" acquire "$account_lock_dir" "$operation_pid") || exit 75
+"$INSTANCE_MANAGER" check-account default "$expected_account_key" || exit 75
+
 launch_desktop=false
 if [[ ${1:-} == '--desktop' ]]; then
   launch_desktop=true
@@ -118,21 +138,21 @@ if [[ $launch_desktop == true && -x $CONTINUATION_DRAFTS ]]; then
 fi
 
 desktop_running() {
-  pgrep -x ChatGPT >/dev/null 2>&1 ||
-    pgrep -f "^${CHATGPT_BINARY_PATTERN}( |$)" >/dev/null 2>&1
+  local result
+  if "$INSTANCE_MANAGER" is-running default >/dev/null 2>&1; then return 0; else result=$?; fi
+  if ((result == 1)); then return 1; fi
+  printf 'Default Desktop kunde inte identifieras säkert; kontobytet avbröts.\n' >&2
+  exit 75
 }
+
+if [[ $launch_desktop == true && ! -x $INSTANCE_MANAGER ]]; then
+  printf 'Instance manager saknas; kontobytet avbröts.\n' >&2
+  exit 78
+fi
 
 if [[ $launch_desktop == true ]] && desktop_running; then
   notify-send 'Codex-kontobyte' 'Avslutar Codex Desktop innan kontobytet.' 2>/dev/null || true
-  pkill -TERM -x ChatGPT >/dev/null 2>&1 || true
-  if desktop_running; then
-    pkill -TERM -f "^${CHATGPT_BINARY_PATTERN}( |$)" >/dev/null 2>&1 || true
-  fi
-
-  for ((attempt = 0; attempt < 75; attempt++)); do
-    desktop_running || break
-    sleep 0.2
-  done
+  "$INSTANCE_MANAGER" stop default >/dev/null 2>&1 || true
 
   if desktop_running; then
     message='Codex Desktop stängdes inte inom 15 sekunder. Kontobytet avbröts; avsluta appen manuellt och försök igen.'
@@ -142,6 +162,7 @@ if [[ $launch_desktop == true ]] && desktop_running; then
   fi
 fi
 
+"$INSTANCE_MANAGER" record-release default >/dev/null || exit 75
 if ! CODEX_AUTH_BIN="$CODEX_AUTH_BIN" "$ACCOUNT_SWITCH_CORE" "$CODEX_HOME" "$expected_account_key"; then
   message='Kontobytet eller dess auth-verifiering misslyckades. Desktop startas inte.'
   notify-send 'Codex-kontobyte stoppat' "$message" 2>/dev/null || true

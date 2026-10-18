@@ -1,4 +1,5 @@
 'use strict';
+require('./test-isolation');
 
 const assert = require('node:assert/strict');
 const path = require('node:path');

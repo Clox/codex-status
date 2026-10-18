@@ -84,6 +84,11 @@ const {
   readStatusPreferences,
 } = require(path.join(__dirname, '..', 'lib', 'codex-status-preferences'));
 const { waitForDesktopReadiness } = require(path.join(__dirname, '..', 'lib', 'codex-desktop-readiness'));
+const { locations: instanceLocations, readRegistry: readInstanceRegistry,
+  processEntries: instanceProcessEntries, ownedRoots: ownedInstanceRoots } =
+  require(path.join(__dirname, '..', 'lib', 'codex-instances'));
+const { poolPaths, migrateDefault, readPool, assertCredentialAvailable, acquireAccountLock, recordRelease } =
+  require(path.join(__dirname, '..', 'lib', 'codex-account-pool'));
 
 const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
 const cacheDirectory = path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache'), 'codex-account-switcher');
@@ -302,6 +307,17 @@ function startWatchdog(lease) {
 
 async function acquireExclusiveClients({ autoMode = false } = {}) {
   const discovered = discoverClientProcesses();
+  // This controller still owns only the legacy default instance. Never stop
+  // another profile while per-instance HEADLESS is outside this release.
+  if (discovered.desktopRoots.length) {
+    const instances = readInstanceRegistry(instanceLocations());
+    const primary = instances.instances.find(instance => instance.instanceId === 'default');
+    const allowed = new Set(ownedInstanceRoots(primary, instanceProcessEntries(), desktopBinary)
+      .map(root => root.pid));
+    if (discovered.desktopRoots.some(pid => !allowed.has(pid))) {
+      throw new Error('OTHER_DESKTOP_INSTANCE_RUNNING_OR_UNVERIFIED');
+    }
+  }
   const autoBlocker = autoMode ? automaticClientBlocker(processEntries()) : null;
   if (autoBlocker) {
     const error = new Error(autoBlocker.errorKind);
@@ -820,10 +836,21 @@ function refreshUsageNow() {
 }
 
 function switchToTarget(target) {
-  const result = runAccountSwitch({ codexHome, targetAccountKey: target.accountKey,
-    authBin: codexAuthBin, source: 'auto' });
-  if (result.target.accountId !== target.accountId) throw new Error('AUTO_ACCOUNT_SWITCH_POSTCONDITION_FAILED');
-  return result.switched;
+  const loc = instanceLocations();
+  migrateDefault(loc);
+  const pool = readPool(loc);
+  if (!pool) throw new Error('ACCOUNT_POOL_NOT_MIGRATED');
+  const releaseAssignment = acquireOperationLock(poolPaths(loc).assignmentLock);
+  let releaseAccount;
+  try {
+    releaseAccount = acquireAccountLock(loc, target.accountKey);
+    assertCredentialAvailable(target.accountKey, 'default', readInstanceRegistry(loc), pool, loc);
+    recordRelease('default', loc);
+    const result = runAccountSwitch({ codexHome, targetAccountKey: target.accountKey,
+      authBin: codexAuthBin, source: 'auto' });
+    if (result.target.accountId !== target.accountId) throw new Error('AUTO_ACCOUNT_SWITCH_POSTCONDITION_FAILED');
+    return result.switched;
+  } finally { if (releaseAccount) releaseAccount(); releaseAssignment(); }
 }
 
 function assertAutomaticOwnership(controlledAppServerPid = null) {

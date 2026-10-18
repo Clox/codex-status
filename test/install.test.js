@@ -1,4 +1,5 @@
 'use strict';
+require('./test-isolation');
 
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -18,6 +19,13 @@ test('existing installation verifies and updates payload without changing privat
   fs.mkdirSync(configDir, { recursive: true });
   fs.mkdirSync(cacheDir, { recursive: true });
   fs.mkdirSync(binDir, { recursive: true });
+  const fakeBin = path.join(home, 'fake-bin');
+  fs.mkdirSync(fakeBin);
+  const launched = path.join(home, 'unexpected-launch');
+  for (const name of ['chatgpt', 'systemd-run', 'codex-auth']) {
+    const executable = path.join(fakeBin, name);
+    fs.writeFileSync(executable, `#!/bin/sh\nprintf '%s\\n' '${name}' >> '${launched}'\nexit 90\n`, { mode: 0o755 });
+  }
   const privateFiles = [
     [path.join(configDir, 'accounts.conf'), 'ACCOUNT_1=private\n'],
     [path.join(configDir, 'status-preferences.json'), '{"autoMode":"HEADLESS"}\n'],
@@ -25,12 +33,22 @@ test('existing installation verifies and updates payload without changing privat
     [path.join(cacheDir, 'account-switch.json'), '{"phase":"completed"}\n'],
     [path.join(cacheDir, 'manual-resume.json'), '{"attempts":{}}\n'],
     [path.join(binDir, 'codex-usage-resets'), 'legacy-local-file\n'],
+    [path.join(home, '.codex', 'auth.json'), '{"tokens":{"account_id":"test-a"}}\n'],
+    [path.join(home, '.codex', 'accounts', 'registry.json'), '{"active_account_key":"test-key"}\n'],
+    [path.join(home, '.codex', 'sessions', 'one.json'), 'session\n'],
+    [path.join(home, '.codex', 'state_5.sqlite'), 'sqlite\n'],
+    [path.join(home, '.codex', 'rollout.jsonl'), 'rollout\n'],
   ];
-  for (const [file, content] of privateFiles) fs.writeFileSync(file, content);
+  for (const [file, content] of privateFiles) {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, content);
+  }
   const env = { ...process.env, NODE_TEST_CONTEXT: undefined,
     CODEX_STATUS_PREFERENCES: undefined, CODEX_AUTO_CONTINUE_STATE: undefined,
     HOME: home, XDG_CONFIG_HOME: path.join(home, '.config'),
-    XDG_CACHE_HOME: path.join(home, '.cache') };
+    XDG_CACHE_HOME: path.join(home, '.cache'),
+    CHATGPT_LAUNCHER: path.join(fakeBin, 'chatgpt'),
+    PATH: `${fakeBin}:${process.env.PATH}` };
   const run = mode => spawnSync('bash', [installer, mode], { env, encoding: 'utf8' });
 
   const before = run('--verify');
@@ -41,6 +59,9 @@ test('existing installation verifies and updates payload without changing privat
   const after = run('--verify');
   assert.equal(after.status, 0, after.stderr);
   assert.match(after.stdout, /0 payload files differ/);
+  const repeated = run('--update');
+  assert.equal(repeated.status, 0, repeated.stderr);
+  assert.match(repeated.stdout, /0 payload files differ/);
   assert.equal(fs.readFileSync(path.join(binDir, 'codex-status-viewport'), 'utf8'),
     fs.readFileSync(path.join(__dirname, '..', 'bin', 'codex-status-viewport'), 'utf8'));
   assert.equal(fs.readFileSync(path.join(binDir, 'codex-account-switch-core'), 'utf8'),
@@ -53,6 +74,10 @@ test('existing installation verifies and updates payload without changing privat
     fs.readFileSync(path.join(__dirname, '..', 'lib', 'codex-desktop-attempt-history.js'), 'utf8'));
   for (const [file, content] of privateFiles) assert.equal(fs.readFileSync(file, 'utf8'), content);
   assert.equal(fs.existsSync(path.join(home, '.local', 'state', 'codex-auth-setup-backups')), false);
+  assert.equal(fs.existsSync(path.join(home, '.config', 'codex-status', 'account-pool')), false);
+  assert.equal(fs.existsSync(path.join(home, '.config', 'codex-status', 'instances.json')), false);
+  assert.equal(fs.existsSync(path.join(home, '.local', 'share', 'codex-status', 'instances')), false);
+  assert.equal(fs.existsSync(launched), false);
 });
 
 test('state-preserving update migrates an old DESKTOP preference to HEADLESS', t => {

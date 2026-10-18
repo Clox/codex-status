@@ -25,7 +25,6 @@ const {
 const {
   accountIdentifiers,
   normalizeAccountRow,
-  recommendationLines,
   renderAccountTableRow,
 } = require(path.join(__dirname, '..', 'lib', 'codex-status-render'));
 const { quotaAvailabilitySnapshot } = require(path.join(__dirname, '..', 'lib', 'codex-quota-transition'));
@@ -61,6 +60,10 @@ const { displayMetadata } = require(path.join(__dirname, '..', 'lib', 'codex-dis
 const { resolveActiveAccount } = require(path.join(__dirname, '..', 'lib', 'codex-account-state'));
 const { displaySwitchState, readSwitchState } = require(path.join(__dirname, '..', 'lib', 'codex-account-switch-core'));
 const { autoDisplayPlan } = require(path.join(__dirname, '..', 'lib', 'codex-auto-display'));
+const { readRegistry: readInstanceRegistry, runningInstances, locations: instanceLocations } =
+  require(path.join(__dirname, '..', 'lib', 'codex-instances'));
+const { readPool, instanceActive, readProvisioned, readSwitchState: readPoolSwitchState } =
+  require(path.join(__dirname, '..', 'lib', 'codex-account-pool'));
 const {
   tableCell,
   activationObservationHoldLine,
@@ -258,7 +261,11 @@ for (const [lineIndex, visible] of visibleLines.entries()) {
   }));
 }
 
-const switchState = displaySwitchState(readSwitchState(), nowMs);
+const switchState = [displaySwitchState(readSwitchState(), nowMs), readPoolSwitchState(instanceLocations())]
+  .filter(Boolean).sort((left, right) =>
+    Number(['preparing', 'switching', 'verifying'].includes(right.phase)) -
+      Number(['preparing', 'switching', 'verifying'].includes(left.phase)) ||
+    Number(right.updatedAtMs) - Number(left.updatedAtMs))[0] || null;
 const shownRows = verifiedActiveAccountId
   ? sourceRows.map(row => ({ ...row, active: row.accountId === verifiedActiveAccountId }))
   : sourceRows;
@@ -366,13 +373,13 @@ const output = lines.map((line, lineIndex) => {
   }
 
   const row = rankedByLineIndex.get(lineIndex);
-  if (!row) return line;
+  if (!row) return line.replace(/^(\s*)\*/, '$1 ');
 
   const switching = switchState && ['preparing', 'switching', 'verifying'].includes(switchState.phase);
   const pending = switching && row.accountId === switchState.targetAccountId
     ? pendingStatus : pendingSourceRow === row.sourceRow && !switchState?.targetAccountId
       ? pendingStatus : false;
-  const rendered = renderAccountTableRow(row, {
+  const rendered = renderAccountTableRow({ ...row, active: false }, {
     columns,
     accountWidth,
     statusWidth,
@@ -385,8 +392,6 @@ const output = lines.map((line, lineIndex) => {
   });
   return rendered;
 });
-
-const renderedRecommendationLines = recommendationLines(recommendation);
 
 const usageQualityNotes = [];
 if (rankedRows.some(row => row.usageQuality === 'stale')) {
@@ -435,8 +440,9 @@ const switchPhaseLabel = { preparing: 'preparing', switching: 'switching auth',
   verifying: 'verifying target', completed: 'verified', failed: 'failed' };
 const switchSpinner = switchState && ['preparing', 'switching', 'verifying'].includes(switchState.phase)
   ? `${process.env.CODEX_AUTO_SPINNER_PLACEHOLDER === '1' ? 'AUTO_SPINNER' : '/'} ` : '';
-const accountSwitchSection = switchSpinner && switchState?.sourceAccountId && switchState?.targetAccountId
-  ? `\n\x1b[1;36mACCOUNT SWITCH:\x1b[0m\n\x1b[36m${switchSpinner}${labelByAccountId.get(switchState.sourceAccountId) || 'source'} → ${labelByAccountId.get(switchState.targetAccountId) || 'target'} · ${switchPhaseLabel[switchState.phase]}\x1b[0m`
+const sourceSwitchId = switchState?.sourceAccountId || accounts.find(value => value.account_key === switchState?.sourceAccountKey)?.chatgpt_account_id;
+const accountSwitchSection = switchSpinner && switchState?.targetAccountId
+  ? `\n\x1b[1;36mACCOUNT SWITCH: ${switchState.instanceName || 'Spadrig'}\x1b[0m\n\x1b[36m${switchSpinner}${sourceSwitchId ? `${labelByAccountId.get(sourceSwitchId) || 'source'} → ` : ''}${labelByAccountId.get(switchState.targetAccountId) || 'target'} · ${switchPhaseLabel[switchState.phase]}\x1b[0m`
   : '';
 const activeTurnsSection = displayPlan.activeTurns.length > 0
   ? `\n\x1b[1;36mACTIVE CODEX TURNS:\x1b[0m\n${displayPlan.activeTurns.map(turn => {
@@ -504,4 +510,35 @@ const footerParts = [
 ].filter(Boolean).map(section => section.replace(/^\n/, ''));
 footerParts.push(`\x1b[1;35m${autoContinueStatusLine(statusPreferences, autoContinueState, nowMs, { operation })}\x1b[0m`);
 const footer = footerParts.join('\n\n');
-process.stdout.write(`${output.join('\n').trimEnd()}\n\n${renderedRecommendationLines.join('\n')}\n\n${footer}`);
+let instancesSection;
+let accountSelectionLines = [];
+try {
+  const loc = instanceLocations();
+  const pool = readPool(loc);
+  const provisioned = readProvisioned(loc);
+  const instances = runningInstances(readInstanceRegistry(loc));
+  instancesSection = `\x1b[1;36mINSTANCES:\x1b[0m\n${instances.map((instance, index) =>
+    { let active;
+      try { active = instanceActive(instance, pool); } catch { active = { accountKey: 'unverified' }; }
+      const account = active?.accountKey === 'unverified' ? 'unverified' :
+        pool?.accounts.find(value => value.accountKey === active?.accountKey)?.email ||
+        (active ? active.accountKey : 'not signed in');
+      const staleEntries = Object.entries(provisioned.instances[instance.instanceId] || {})
+        .filter(([key, value]) => {
+          const expected = pool?.accounts.find(item => item.accountKey === key)?.generation;
+          return value.stale === true || (expected && value.generation < expected);
+        });
+      const stale = staleEntries.length ? ` · ${staleEntries.length} credential${staleEntries.length === 1 ? '' : 's'} stale` : '';
+      const turns = instance.instanceId === 'default' && activeTurns.length ? ` · ${activeTurns.length} turns` : '';
+      return `${index + 1}  ${instance.displayName} · ${account} · ${instance.roots.length ? 'running' : 'stopped'}${turns}${stale}` +
+        `${instance.enabled ? '' : ' · disabled'}`;
+    }).join('\n')}`;
+  const selected = instances.find(value => value.instanceId === process.env.CODEX_SELECTED_INSTANCE_ID);
+  if (selected) accountSelectionLines = [
+    `\x1b[1;33mSelected instance: ${selected.displayName}\x1b[0m`,
+    `\x1b[1;33mChoose account [1-${Math.min(9, rankedRows.length)}] · Esc cancel\x1b[0m`,
+  ];
+} catch (error) {
+  instancesSection = `\x1b[1;31mINSTANCES: ${error.message}\x1b[0m`;
+}
+process.stdout.write(`${output.join('\n').trimEnd()}\n\n${instancesSection}${accountSelectionLines.length ? `\n\n${accountSelectionLines.join('\n')}` : ''}\n\n${footer}`);

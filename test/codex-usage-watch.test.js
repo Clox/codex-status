@@ -1,4 +1,5 @@
 'use strict';
+require('./test-isolation');
 
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -52,11 +53,12 @@ test('startup renders cached or loading state before asynchronous local collecti
   assert.match(source, /CODEX_STATUS_READY_FILE/);
 });
 
-test('recommendation precedes dynamic sections and magenta auto-continue remains last before help', () => {
+test('selection prompt is conditional and magenta auto-continue remains last before help', () => {
   const outputStatement = annotateSource.indexOf('process.stdout.write(`${output.join');
   assert.notEqual(outputStatement, -1);
-  const outputExpression = annotateSource.slice(outputStatement, outputStatement + 220);
-  assert.ok(outputExpression.indexOf('renderedRecommendationLines') < outputExpression.indexOf('${footer}'));
+  const outputExpression = annotateSource.slice(outputStatement, outputStatement + 300);
+  assert.match(outputExpression, /accountSelectionLines\.length \? .*accountSelectionLines\.join/);
+  assert.doesNotMatch(outputExpression, /renderedRecommendationLines/);
   const footerStatement = annotateSource.indexOf('const footerParts = [');
   const footerExpression = annotateSource.slice(footerStatement,
     annotateSource.indexOf('const footer =', footerStatement));
@@ -74,6 +76,17 @@ test('pending AUTO renders countdown attention and exposes an isolated X cancel 
   assert.match(source, /x\|X\)/);
   assert.match(source, /grep -Fq '\[X\] Avbryt'/);
   assert.match(source, /cancel-auto-pending/);
+});
+
+test('status keys select an instance before an account and Esc or X cancels selection', () => {
+  const keyBranch = source.slice(source.indexOf('      1|2|3|4|5|6|7|8|9)'), source.indexOf('      k|K)'));
+  assert.match(keyBranch, /if \[\[ -z \$selected_instance_id \]\]; then[\s\S]*resolve-index "\$key"/);
+  assert.match(keyBranch, /else[\s\S]*availability "\$selected_instance_id" "\$launcher_account"/);
+  assert.match(keyBranch, /already-active\) copy_feedback='Account already active; no change'/);
+  assert.match(keyBranch, /in-use:\*\) copy_feedback="Account in use by/);
+  assert.match(keyBranch, /switch-key "\$selected_instance_id" "\$launcher_account"/);
+  assert.match(source, /x\|X\)[\s\S]*if \[\[ -n \$selected_instance_id \]\]; then[\s\S]*Instance selection cancelled/);
+  assert.match(source, /\$'\\e'\)[\s\S]*if \[\[ \$key == \$'\\e' && -n \$selected_instance_id \]\]; then/);
 });
 
 test('AUTO animation and countdown redraw locally without extra usage refresh', () => {

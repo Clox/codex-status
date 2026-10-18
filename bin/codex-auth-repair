@@ -21,6 +21,9 @@ const {
   validateStagedIdentity,
 } = require(path.join(__dirname, '..', 'lib', 'codex-auth-repair'));
 const { acquireOperationLock } = require(path.join(__dirname, '..', 'lib', 'codex-operation-lock'));
+const { locations: instanceLocations, readRegistry: readInstances } = require(path.join(__dirname, '..', 'lib', 'codex-instances'));
+const { poolPaths, migrateDefault, readPool, assignments, acquireAccountLock,
+  updateCredentialLocked } = require(path.join(__dirname, '..', 'lib', 'codex-account-pool'));
 
 const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
 const codexAuthBin = process.env.CODEX_AUTH_BIN || 'codex-auth';
@@ -29,7 +32,6 @@ const usageCachePath = process.env.USAGE_CACHE || path.join(os.homedir(), '.cach
 const codexLoginBin = process.env.CODEX_LOGIN_BIN || '/usr/lib/chatgpt/resources/codex';
 const registryPath = path.join(codexHome, 'accounts', 'registry.json');
 const globalAuthPath = path.join(codexHome, 'auth.json');
-const lockPath = `${usageCachePath}.auth-repair.lock`;
 const operationLockPath = process.env.CODEX_OPERATION_LOCK_DIR || path.join(path.dirname(usageCachePath), 'exclusive-codex-operation.lock');
 const activationLockDirectory = path.join(path.dirname(usageCachePath), 'activation-locks');
 
@@ -109,29 +111,12 @@ function verifyFreshUsage(cachePath, wantedAccountId) {
   }
 }
 
-function acquireLock() {
-  fs.mkdirSync(path.dirname(lockPath), { recursive: true, mode: 0o700 });
-  try {
-    const fd = fs.openSync(lockPath, 'wx', 0o600);
-    fs.writeFileSync(fd, `${process.pid}\n`);
-    return fd;
-  } catch (error) {
-    if (error.code !== 'EEXIST') throw error;
-    let pid = null;
-    try { pid = Number(fs.readFileSync(lockPath, 'utf8').trim()); } catch {}
-    try {
-      if (Number.isInteger(pid) && pid > 0) process.kill(pid, 0);
-      fail('Another authentication repair is already running.');
-    } catch (processError) {
-      if (processError.code !== 'ESRCH') throw processError;
-      fs.unlinkSync(lockPath);
-      return acquireLock();
-    }
-  }
-}
-
 let releaseHeldOperation = null;
+let releasePoolAssignment = null;
+let releasePoolAccount = null;
 function cleanupOperation() {
+  if (releasePoolAccount) { const release = releasePoolAccount; releasePoolAccount = null; release(); }
+  if (releasePoolAssignment) { const release = releasePoolAssignment; releasePoolAssignment = null; release(); }
   if (!releaseHeldOperation) return;
   const release = releaseHeldOperation;
   releaseHeldOperation = null;
@@ -162,7 +147,8 @@ async function chooseTarget(accounts) {
 
 async function main() {
   releaseHeldOperation = acquireOperationLock(operationLockPath);
-  let lockFd = null;
+  const poolLoc = instanceLocations();
+  migrateDefault(poolLoc);
   let stagingRoot = null;
   let rollbackRoot = null;
   let mutationStarted = false;
@@ -176,13 +162,21 @@ async function main() {
   let accountActivationLock = null;
 
   try {
-    lockFd = acquireLock();
     const beforeRegistry = readJson(registryPath);
     const beforeGlobalAuth = readJson(globalAuthPath);
     const usageCache = readJson(usageCachePath);
     const candidates = repairableAccounts(beforeRegistry, usageCache);
     if (candidates.length === 0) fail('No account currently has a repairable authentication error.', 2);
     const target = await chooseTarget(candidates);
+    releasePoolAssignment = acquireOperationLock(poolPaths(poolLoc).assignmentLock);
+    releasePoolAccount = acquireAccountLock(poolLoc, target.account_key);
+    const pool = readPool(poolLoc);
+    if (!pool?.accounts.some(value => value.accountKey === target.account_key && value.accountId === accountId(target))) {
+      fail('The selected account is not in the verified shared pool.', 3);
+    }
+    const holder = assignments(readInstances(poolLoc), pool).find(value =>
+      value.active?.accountKey === target.account_key);
+    if (holder) fail(`The selected account is active in ${holder.instance.displayName}; switch it away before repair.`, 3);
     const precondition = validateInactivePrecondition({ target, registry: beforeRegistry, globalAuth: beforeGlobalAuth });
     if (!precondition.ok) {
       if (precondition.errors.includes('target-is-active')) {
@@ -286,6 +280,7 @@ async function main() {
       },
     });
     verifyFreshUsage(usageCachePath, accountId(target));
+    updateCredentialLocked(target.account_key, afterTargetSnapshot, poolLoc, { verified: true });
     mutationStarted = false;
     process.stdout.write(`\nAuthentication repaired and server-verified for ${targetLabel}.\n`);
     process.stdout.write('Desktop remained on the previously active account. The status window will update automatically.\n');
@@ -316,10 +311,6 @@ async function main() {
     if (stagingRoot) fs.rmSync(stagingRoot, { recursive: true, force: true });
     if (rollbackRoot) fs.rmSync(rollbackRoot, { recursive: true, force: true });
     releaseAccountActivationLock(accountActivationLock);
-    if (lockFd !== null) {
-      try { fs.closeSync(lockFd); } catch {}
-      try { fs.unlinkSync(lockPath); } catch {}
-    }
     cleanupOperation();
   }
 }

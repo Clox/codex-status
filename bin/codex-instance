@@ -1,0 +1,170 @@
+#!/usr/bin/env node
+'use strict';
+
+const readline = require('node:readline/promises');
+const { spawnSync } = require('node:child_process');
+const { stdin, stdout } = require('node:process');
+const path = require('node:path');
+const {
+  locations, readRegistry, createInstance, renameInstance, setInstanceEnabled,
+  runningInstances, startInstance, waitForRoot, stopInstance, clearStalePending,
+} = require(path.join(__dirname, '..', 'lib', 'codex-instances'));
+const { readPool, migrateDefault, instanceActive, provisionAccount, poolPaths,
+  accountLockPath, recordRelease, deleteInstanceWithAccounts, assignments,
+  assertCredentialAvailable } = require(path.join(__dirname, '..', 'lib', 'codex-account-pool'));
+
+const loc = locations();
+const [command = 'menu', instanceId, ...rest] = process.argv.slice(2);
+
+function list() {
+  return runningInstances(readRegistry(loc));
+}
+
+function showList() {
+  const pool = readPool(loc);
+  for (const [index, instance] of list().entries()) {
+    let active = null;
+    try { active = instanceActive(instance, pool); } catch { active = { accountKey: 'unverified' }; }
+    const account = active?.accountKey === 'unverified' ? 'unverified' :
+      pool?.accounts.find(value => value.accountKey === active?.accountKey)?.email ||
+      (active ? active.accountKey : 'not signed in');
+    stdout.write(`${index + 1}  ${instance.displayName} (${instance.instanceId}) · ` +
+      `${account} · ${instance.roots.length ? 'running' : 'stopped'}${instance.enabled ? '' : ' · disabled'}\n`);
+  }
+}
+
+async function switchAccount(id, key) {
+  if (id === 'default') {
+    const pool = readPool(loc);
+    const instance = readRegistry(loc).instances.find(value => value.instanceId === id);
+    if (!instance) throw new Error('INSTANCE_NOT_FOUND');
+    if (instanceActive(instance, pool)?.accountKey === key) return { unchanged: true };
+    const result = spawnSync(path.join(__dirname, 'codex-account'), ['--key', Buffer.from(key).toString('base64url'), '--desktop'],
+      { stdio: 'inherit' });
+    if (result.error || result.status !== 0) throw new Error('DEFAULT_ACCOUNT_SWITCH_FAILED');
+    return { unchanged: false };
+  }
+  return provisionAccount(id, key, loc);
+}
+
+async function menu() {
+  const terminal = readline.createInterface({ input: stdin, output: stdout });
+  try {
+    while (true) {
+      stdout.write('\nINSTANCES:\n');
+      showList();
+      const action = (await terminal.question('\n[L] List  [C] Create  [N] Rename  [A] Change account  [S] Start  [T] Stop  [E] Enable  [B] Disable  [U] Clear stale launch  [D] Delete  [Enter] Exit: ')).trim().toLowerCase();
+      if (!action) return;
+      if (action === 'l') continue;
+      const id = (await terminal.question('Instance ID: ')).trim();
+      if (action === 'c') {
+        const name = await terminal.question('Display name: ');
+        createInstance(id, name, loc);
+      } else if (action === 'n') {
+        const name = await terminal.question('New display name: ');
+        renameInstance(id, name, loc);
+      } else if (action === 'a') {
+        const pool = migrateDefault(loc);
+        pool.accounts.forEach((account, index) => stdout.write(`${index + 1}  ${account.displayName}\n`));
+        const choice = await terminal.question('Account number: ');
+        const account = /^\d+$/.test(choice) ? pool.accounts[Number(choice) - 1] : null;
+        if (!account) throw new Error('INVALID_ACCOUNT_NUMBER');
+        const outcome = await switchAccount(id, account.accountKey);
+        stdout.write(outcome.unchanged ? 'Account already active; no change.\n' : 'Account switched and verified.\n');
+      } else if (action === 's') {
+        const launch = startInstance(id, loc);
+        const root = await waitForRoot(launch.record);
+        stdout.write(`Started ${id}: PID ${root.pid}, start ${root.startTicks}\n`);
+      } else if (action === 't') {
+        const root = await stopInstance(id, loc);
+        stdout.write(`Stopped ${id}: PID ${root.pid}\n`);
+      } else if (action === 'e' || action === 'b') {
+        setInstanceEnabled(id, action === 'e', loc);
+      } else if (action === 'u') {
+        stdout.write(clearStalePending(id, loc) ? 'Cleared stale launch.\n' : 'No pending launch.\n');
+      } else if (action === 'd') {
+        const phrase = await terminal.question(`Permanently delete only ${id}'s local state? Type DELETE ${id}: `);
+        deleteInstanceWithAccounts(id, phrase, loc);
+      } else stdout.write('Unknown action.\n');
+    }
+  } finally { terminal.close(); }
+}
+
+async function main() {
+  if (command === 'menu') {
+    if (!stdin.isTTY) throw new Error('INSTANCE_MENU_REQUIRES_TTY');
+    return menu();
+  }
+  if (command === 'list') return showList();
+  if (command === 'pool-migrate') return void stdout.write(`Pool accounts: ${migrateDefault(loc).accounts.length}\n`);
+  if (command === 'pool-paths') return void stdout.write(`${JSON.stringify(poolPaths(loc))}\n`);
+  if (command === 'assignment-lock-path') return void stdout.write(`${poolPaths(loc).assignmentLock}\n`);
+  if (command === 'switch-state-path') return void stdout.write(`${poolPaths(loc).switchState}\n`);
+  if (command === 'account-lock-path') return void stdout.write(`${accountLockPath(loc, instanceId)}\n`);
+  if (command === 'record-release') return void stdout.write(`${JSON.stringify(recordRelease(instanceId, loc))}\n`);
+  if (command === 'resolve-index') {
+    const value = readRegistry(loc).instances[Number(instanceId) - 1];
+    if (!value || !/^[1-9]$/.test(instanceId)) throw new Error('INSTANCE_NOT_FOUND');
+    return void stdout.write(`${value.instanceId}\n`);
+  }
+  if (command === 'check-account') {
+    const pool = readPool(loc);
+    if (!pool) throw new Error('ACCOUNT_POOL_NOT_MIGRATED');
+    const registry = readRegistry(loc);
+    assertCredentialAvailable(rest[0], instanceId, registry, pool, loc);
+    return;
+  }
+  if (command === 'availability') {
+    if (!rest[0] || !/^[A-Za-z0-9_-]+$/.test(rest[0])) throw new Error('INVALID_ACCOUNT_KEY_ENCODING');
+    const key = Buffer.from(rest[0], 'base64url').toString('utf8');
+    const pool = readPool(loc);
+    if (!pool) throw new Error('ACCOUNT_POOL_NOT_MIGRATED');
+    const registry = readRegistry(loc);
+    const target = pool.accounts.find(value => value.accountKey === key);
+    if (!target) throw new Error('POOL_ACCOUNT_NOT_FOUND');
+    const items = assignments(registry, pool);
+    const holder = items.find(value => value.instance.instanceId !== instanceId && value.active?.accountKey === key);
+    const local = items.find(value => value.instance.instanceId === instanceId);
+    if (!local) throw new Error('INSTANCE_NOT_FOUND');
+    if (!holder && local.active?.accountKey !== key) assertCredentialAvailable(key, instanceId, registry, pool, loc);
+    return void stdout.write(`${holder ? `in-use:${holder.instance.displayName}` : local.active?.accountKey === key ? 'already-active' : 'available'}\n`);
+  }
+  if (command === 'switch-key') {
+    if (!rest[0] || !/^[A-Za-z0-9_-]+$/.test(rest[0])) throw new Error('INVALID_ACCOUNT_KEY_ENCODING');
+    const key = Buffer.from(rest[0], 'base64url').toString('utf8');
+    migrateDefault(loc);
+    const outcome = await switchAccount(instanceId, key);
+    return void stdout.write(outcome.unchanged ? 'Account already active; no change.\n' : 'Account switched and verified.\n');
+  }
+  if (command === 'is-running') {
+    const entry = list().find(value => value.instanceId === instanceId);
+    if (!entry) throw new Error('INSTANCE_NOT_FOUND');
+    if (!entry.roots.length) process.exitCode = 1;
+    return;
+  }
+  if (command === 'create') return void stdout.write(`${JSON.stringify(createInstance(instanceId, rest.join(' '), loc))}\n`);
+  if (command === 'rename') return void stdout.write(`${JSON.stringify(renameInstance(instanceId, rest.join(' '), loc))}\n`);
+  if (command === 'enable' || command === 'disable') {
+    return void stdout.write(`${JSON.stringify(setInstanceEnabled(instanceId, command === 'enable', loc))}\n`);
+  }
+  if (command === 'clear-stale-launch') {
+    return void stdout.write(clearStalePending(instanceId, loc) ? 'Cleared stale launch.\n' : 'No pending launch.\n');
+  }
+  if (command === 'delete') {
+    if (rest[0] !== '--confirm' || rest.length !== 2) throw new Error('INSTANCE_DELETE_CONFIRMATION_REQUIRED');
+    deleteInstanceWithAccounts(instanceId, rest[1], loc);
+    return void stdout.write(`Deleted ${instanceId}\n`);
+  }
+  if (command === 'start') {
+    const launch = startInstance(instanceId, loc);
+    const root = await waitForRoot(launch.record);
+    return void stdout.write(`Started ${instanceId}: PID ${root.pid}, start ${root.startTicks}\n`);
+  }
+  if (command === 'stop') {
+    const root = await stopInstance(instanceId, loc);
+    return void stdout.write(`Stopped ${instanceId}: PID ${root.pid}\n`);
+  }
+  throw new Error('Usage: codex-instance list|is-running ID|create ID NAME|rename ID NAME|enable ID|disable ID|start ID|stop ID|clear-stale-launch ID|delete ID --confirm "DELETE ID"');
+}
+
+main().catch(error => { process.stderr.write(`${error.message}\n`); process.exitCode = command === 'is-running' ? 2 : 1; });

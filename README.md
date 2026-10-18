@@ -66,6 +66,62 @@ an inherited value when running the suite from inside the live status window.
 
 ## Runtime and safety boundaries
 
+### Desktop instances (manual management)
+
+`codex-instance list` shows the discovered primary instance (`default`, initially
+named Spadrig) even before an instance registry exists. Its paths remain
+`~/.codex`, `~/.config/Codex`, `~/.config/codex-account-switcher`, and
+`~/.cache/codex-account-switcher`. The first registry change writes
+`~/.config/codex-status/instances.json`; it does not move legacy files.
+
+`codex-instance create rosetta Rosetta` creates empty, private directories for
+Codex data and the Desktop profile under
+`~/.local/share/codex-status/instances/rosetta`, plus separate status config
+and runtime directories under `~/.config/codex-status/instances/rosetta` and
+`~/.cache/codex-status/instances/rosetta`. The runtime directory reserves its
+own status window lock, state and journal namespace. `codex-instance start
+rosetta` launches the installed Desktop binary with explicit `CODEX_HOME`,
+`CODEX_ELECTRON_USER_DATA_PATH` and `--user-data-dir` in a transient user
+systemd unit. `codex-instance stop rosetta` signals only a root verified by
+profile path, Codex home, PID and process start identity. It verifies that the
+instance's helper processes have exited before reporting success. `I` in the
+status window opens the interactive instance manager. The instance list in the
+status window shows Desktop running state.
+
+Use `codex-instance rename rosetta "New name"`, `enable`, `disable`, `stop`,
+and `delete rosetta --confirm "DELETE rosetta"` for management. Delete refuses
+the primary instance, a running instance, or a launch whose outcome has not
+been verified. A launch marker can be cleared with `clear-stale-launch` only
+after systemd confirms its unit is inactive. Delete removes only the named
+instance's derived directories. It never deletes shared accounts or primary
+data.
+
+The first status launch, account-management action, or explicit
+`codex-instance pool-migrate` creates a shared account pool under
+`~/.config/codex-status/account-pool` and
+`~/.local/share/codex-status/account-pool`. It copies the default account
+snapshots byte-for-byte without changing default auth, registry, threads or
+rollouts. The pool has account identities, metadata and monotonic credential
+generations; it has no global active account. Each instance keeps its own
+`CODEX_HOME/auth.json` and active account in its local codex-auth registry.
+
+In the status window, press `1`–`9` to select an instance, then `1`–`9` to
+select an account; Esc or X cancels. `codex-instance switch-key rosetta
+<base64url-account-key>` and the instance manager's Change account action use
+the same import → switch → verify path. A secondary instance starts with no
+auth and no copied default session. An account already active in another
+instance is blocked with that instance's name. Operations use a global
+assignment lock and a robust per-account lock. A local credential that differs
+from the pool is held back from another instance until repair or a future
+verified refresh handoff updates the pool. Auth repair updates the pool only
+after server verification and increments the generation; older provisioned
+copies are marked for reprovisioning rather than changed silently.
+
+Secondary instances still do not have status collectors, observers or
+AUTO/HEADLESS schedulers. The existing account and AUTO flows belong to
+`default`; HEADLESS refuses to stop another Desktop instance. The existing
+systemd timer and observer units remain unchanged.
+
 Installed programs load sibling libraries from `~/.local/lib`. They do not load
 source files from this checkout. Configuration lives in
 `~/.config/codex-account-switcher`; observer, usage, AUTO, retry and continuation

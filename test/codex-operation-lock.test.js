@@ -1,4 +1,5 @@
 'use strict';
+require('./test-isolation');
 
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -94,12 +95,16 @@ test('SIGTERM during codex-auth-repair --hold leaves no exclusive lock', async t
   const active = { account_key: 'active', chatgpt_account_id: 'id-active', email: 'active@example.test' };
   fs.writeFileSync(path.join(home, 'accounts', 'registry.json'), JSON.stringify({ active_account_key: 'active', accounts: [inactive, active] }));
   fs.writeFileSync(path.join(home, 'auth.json'), JSON.stringify({ tokens: { account_id: 'id-active' } }));
+  fs.writeFileSync(path.join(home, 'accounts', 'inactive.auth.json'), JSON.stringify({ tokens: { account_id: 'id-inactive' } }));
+  fs.writeFileSync(path.join(home, 'accounts', 'active.auth.json'), JSON.stringify({ tokens: { account_id: 'id-active' } }));
   const usage = path.join(root, 'usage.json');
   fs.writeFileSync(usage, JSON.stringify({ accounts: { 'id-inactive': { refresh: { errorKind: 'auth-401' } } } }));
   const repair = path.join(__dirname, '..', 'bin', 'codex-auth-repair');
   const command = `exec ${process.execPath} ${repair} --preflight --hold`;
   const child = spawn('script', ['-qefc', command, '/dev/null'], {
-    env: { ...process.env, NODE_TEST_CONTEXT: undefined, CODEX_HOME: home, USAGE_CACHE: usage,
+    env: { ...process.env, NODE_TEST_CONTEXT: undefined, HOME: root, CODEX_HOME: home,
+      XDG_CONFIG_HOME: path.join(root, 'config'), XDG_CACHE_HOME: path.join(root, 'cache'),
+      XDG_DATA_HOME: path.join(root, 'data'), USAGE_CACHE: usage,
       CODEX_OPERATION_LOCK_DIR: lock }, stdio: ['pipe', 'pipe', 'pipe'],
   });
   t.after(() => { try { child.kill('SIGKILL'); } catch {} });

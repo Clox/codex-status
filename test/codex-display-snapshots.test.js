@@ -1,4 +1,5 @@
 'use strict';
+require('./test-isolation');
 
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -11,6 +12,7 @@ const { displayMetadata, pruneDisplaySnapshots, updateDisplaySnapshot } =
 const { formatInterruptedCandidate, partitionInterruptedCandidates } =
   require('../lib/codex-interrupted-label');
 const { turnKey } = require('../lib/codex-turn-observer');
+const { locations, createInstance } = require('../lib/codex-instances');
 
 const THREAD = '01a0e2d5-e5e2-74e1-9ad1-3194bda82e93';
 const TURN = '01a0e463-9851-7ed2-9c87-52290cf748a9';
@@ -324,11 +326,14 @@ test('status shows AUTO switch progress and HEADLESS continuation without duplic
     files: {}, activeTurns: {}, interruptedTurns: { [key]: candidate }, terminalTurns: [],
     pendingErrors: {}, exhaustions: {}, displaySnapshots: snapshot.displaySnapshots };
   const env = { ...process.env, HOME: root, CODEX_HOME: home,
+    XDG_CONFIG_HOME: path.join(root, 'config'), XDG_CACHE_HOME: path.join(root, 'cache'),
+    XDG_DATA_HOME: path.join(root, 'data'),
     CODEX_EVENT_STATE: events, CODEX_RESUME_STATE: resume,
     CODEX_AUTO_CONTINUE_STATE: auto,
     CODEX_STATUS_PREFERENCES: path.join(root, 'preferences.json'),
     CODEX_STATUS_COLUMNS: '110', CODEX_AUTO_SPINNER_PLACEHOLDER: '1',
     CODEX_ACCOUNT_SWITCH_STATE: switchFile };
+  createInstance('rosetta', 'Rosetta', locations(env), env);
   fs.writeFileSync(env.CODEX_STATUS_PREFERENCES, JSON.stringify({ version: 2,
     autoMode: 'HEADLESS', autoContinue: true }));
   const render = () => {
@@ -337,7 +342,14 @@ test('status shows AUTO switch progress and HEADLESS continuation without duplic
   };
   fs.writeFileSync(resume, JSON.stringify({ attempts: {} }));
   fs.writeFileSync(auto, JSON.stringify({ status: 'idle' }));
-  assert.match(render(), /INTERRUPTED CODEX TURNS:[\s\S]*Spadrig · Förbättra blankettvyn/);
+  const normalFrame = render();
+  assert.match(normalFrame, /INTERRUPTED CODEX TURNS:[\s\S]*Spadrig · Förbättra blankettvyn/);
+  assert.match(normalFrame, /Rosetta · not signed in · stopped/);
+  assert.match(normalFrame, /PRIOR/);
+  assert.doesNotMatch(normalFrame, /RECOMMENDATION:|Select instance \[1\], then account|Choose account \[1-3\]|PRIOR = weekly/);
+  const normalViewport = require('../lib/codex-status-viewport').layoutStatusFrame(normalFrame,
+    { rows: 28, columns: 110 }).lines.join('\n');
+  assert.doesNotMatch(normalViewport, /RECOMMENDATION:|Select instance \[1\], then account|PRIOR = weekly/);
   fs.writeFileSync(env.CODEX_STATUS_PREFERENCES, JSON.stringify({ version: 2,
     autoMode: 'DESKTOP', autoContinue: true }));
   fs.writeFileSync(auto, JSON.stringify({ status: 'waiting', waitingReason: 'no-candidates',
@@ -352,6 +364,7 @@ test('status shows AUTO switch progress and HEADLESS continuation without duplic
   fs.writeFileSync(switchFile, JSON.stringify({ source: 'auto', phase: 'switching',
     sourceAccountId: 'source', targetAccountId: 'target', updatedAtMs: Date.now() }));
   let frame = render();
+  assert.doesNotMatch(frame, /\*0[1-9] /);
   assert.match(frame, /HEADLESS CONTINUATION:[\s\S]*Spadrig · Förbättra blankettvyn[^\n]*switching auth/);
   assert.doesNotMatch(frame, /AUTO_SPINNER [^\n]*Spadrig · Förbättra blankettvyn/);
   assert.match(frame, /ACCOUNT SWITCH:[\s\S]*AUTO_SPINNER source@example\.tes → target@example\.tes · switching auth/);
@@ -368,6 +381,14 @@ test('status shows AUTO switch progress and HEADLESS continuation without duplic
     assert.doesNotMatch(frame, /QUEUED INTERRUPTED TURNS:|INTERRUPTED CODEX TURNS:/);
   }
   fs.writeFileSync(resume, JSON.stringify({ attempts: {} }));
+  env.CODEX_SELECTED_INSTANCE_ID = 'default';
+  const selectedFrame = render();
+  assert.match(selectedFrame.replace(/\x1b\[[0-9;]*m/g, ''),
+    /Selected instance: Spadrig\nChoose account \[1-3\] · Esc cancel/);
+  assert.doesNotMatch(selectedFrame, /RECOMMENDATION:|Select instance \[1\], then account/);
+  assert.match(require('../lib/codex-status-viewport').layoutStatusFrame(selectedFrame,
+    { rows: 28, columns: 110 }).lines.join('\n'), /Selected instance: Spadrig/);
+  delete env.CODEX_SELECTED_INSTANCE_ID;
   fs.writeFileSync(switchFile, JSON.stringify({ source: 'manual', phase: 'switching',
     sourceAccountId: 'source', targetAccountId: 'target', updatedAtMs: Date.now() }));
   assert.match(render(), /ACCOUNT SWITCH:[\s\S]*AUTO_SPINNER source@example\.tes → target@example\.tes · switching auth/);
@@ -380,7 +401,8 @@ test('status shows AUTO switch progress and HEADLESS continuation without duplic
   fs.writeFileSync(switchFile, JSON.stringify({ source: 'auto', phase: 'completed',
     sourceAccountId: 'source', targetAccountId: 'target', updatedAtMs: Date.now() }));
   frame = render();
-  assert.match(frame, /\*02 target@example\.tes/);
+  assert.match(frame, / 02 target@example\.tes/);
+  assert.doesNotMatch(frame, /\*02 target@example\.tes/);
   assert.doesNotMatch(frame, /ACCOUNT SWITCH:|Account:|source@example\.tes → target@example\.tes/);
   fs.writeFileSync(resume, JSON.stringify({ attempts: { [key]: {
     threadId: THREAD, interruptedTurnId: TURN, accountId: 'source', targetAccountId: 'target',
@@ -407,7 +429,8 @@ test('status shows AUTO switch progress and HEADLESS continuation without duplic
   fs.writeFileSync(switchFile, JSON.stringify({ source: 'auto', phase: 'completed',
     sourceAccountId: 'target', targetAccountId: 'later', updatedAtMs: Date.now() }));
   frame = render();
-  assert.match(frame, /\*03 later@example\.test/);
+  assert.match(frame, / 03 later@example\.test/);
+  assert.doesNotMatch(frame, /\*03 later@example\.test/);
   assert.match(frame, /HEADLESS CONTINUATION:[^\n]*\n\x1b\[36mAUTO_SPINNER later@example\.test \| Spadrig · Förbättra blankettvyn[^\n]*running/);
   assert.doesNotMatch(frame, /ACCOUNT SWITCH:|Account:|target@example\.tes → later@example\.test|source@example\.tes → later@example\.test/);
   fs.writeFileSync(resume, JSON.stringify({ attempts: { [key]: {

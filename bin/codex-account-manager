@@ -10,6 +10,9 @@ const { accountsFromRegistry, accountId } = require('../lib/codex-auth-repair');
 const { resolveActiveAccount, upstreamSelector } = require('../lib/codex-account-state');
 const { acquireAccountActivationLock, releaseAccountActivationLock } = require('../lib/codex-activation-lock');
 const { acquireOperationLock, validateAddition, validateRemoval, verifyMutation, safeLabel } = require('../lib/codex-account-manager');
+const { locations: instanceLocations } = require('../lib/codex-instances');
+const { poolPaths, migrateDefault, addPoolAccount, assertAccountRemovable,
+  removePoolAccountLocked, acquireAccountLock } = require('../lib/codex-account-pool');
 
 const home = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
 const cache = path.dirname(process.env.USAGE_CACHE || path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache'), 'codex-account-switcher', 'usage.json'));
@@ -23,8 +26,12 @@ let terminal;
 let release;
 let staging;
 let activationLock;
+let poolAssignmentRelease;
+let poolAccountRelease;
 
 function cleanup() {
+  if (poolAccountRelease) { poolAccountRelease(); poolAccountRelease = null; }
+  if (poolAssignmentRelease) { poolAssignmentRelease(); poolAssignmentRelease = null; }
   releaseAccountActivationLock(activationLock);
   activationLock = null;
   if (staging) fs.rmSync(staging, { recursive: true, force: true });
@@ -47,11 +54,13 @@ async function ask(prompt) {
 async function main() {
   if (!process.stdin.isTTY) throw new Error('Kontohanteringen behöver en interaktiv terminal.');
   release = acquireOperationLock(process.env.CODEX_OPERATION_LOCK_DIR || path.join(cache, 'exclusive-codex-operation.lock'));
+  const poolLoc = instanceLocations();
+  migrateDefault(poolLoc);
   const registry = readRegistry();
   const accounts = accountsFromRegistry(registry);
   process.stdout.write('Codex-konton\n\n');
-  accounts.forEach((a, i) => process.stdout.write(`${i + 1}. ${safeLabel(a)}${a.account_key === registry.active_account_key ? ' (aktivt)' : ''}\n`));
-  const action = (await ask('\n[L] Lägg till  [T] Ta bort  [B] Byt konto  [Enter] Avbryt: ')).toLowerCase();
+  accounts.forEach((a, i) => process.stdout.write(`${i + 1}. ${safeLabel(a)}\n`));
+  const action = (await ask('\n[L] Lägg till  [T] Ta bort  [B] Byt Spadrig-konto  [Enter] Avbryt: ')).toLowerCase();
   if (!['l', 't', 'b'].includes(action)) return;
   if (action === 'l') {
     resolveActiveAccount(registry, JSON.parse(readAuth()));
@@ -74,6 +83,7 @@ async function main() {
     if (!readAuth().equals(globalBefore) || JSON.stringify(readRegistry()) !== JSON.stringify(before)) throw new Error('Kontoläget ändrades. Försök igen.');
     run(['import', path.join(staging, 'auth.json')]);
     verifyMutation(before, readRegistry(), target.account_key, 'add', globalBefore, readAuth());
+    addPoolAccount(target.account_key, poolLoc);
     process.stdout.write('\nKontot har lagts till. Statuslistan uppdateras automatiskt.\n');
   } else {
     const choice = await ask('Kontonummer (Enter avbryter): ');
@@ -89,13 +99,18 @@ async function main() {
       return;
     }
     validateRemoval(readRegistry(), JSON.parse(readAuth()), target.account_key);
+    assertAccountRemovable(target.account_key, poolLoc);
     if ((await ask(`Ta bort \x1b[1m${safeLabel(target)}\x1b[0m från sparade konton? [j/N]: `)).toLowerCase() !== 'j') return;
+    poolAssignmentRelease = acquireOperationLock(poolPaths(poolLoc).assignmentLock);
+    poolAccountRelease = acquireAccountLock(poolLoc, target.account_key);
+    assertAccountRemovable(target.account_key, poolLoc);
     activationLock = acquireAccountActivationLock(path.join(cache, 'activation-locks'), accountId(target));
     const before = readRegistry();
     const globalBefore = readAuth();
     validateRemoval(before, JSON.parse(globalBefore), target.account_key);
     run(['remove', upstreamSelector(before, target.account_key)]);
     verifyMutation(before, readRegistry(), target.account_key, 'remove', globalBefore, readAuth());
+    removePoolAccountLocked(target.account_key, poolLoc);
     process.stdout.write('\nKontot har tagits bort från listan. Samtalshistoriken finns kvar.\n');
   }
 }

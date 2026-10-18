@@ -2,7 +2,7 @@ import os, tempfile, json, base64, subprocess, pty, select, time, pathlib, shlex
 root = pathlib.Path(tempfile.mkdtemp(prefix='codex-manager-integration-'))
 authbin = subprocess.check_output(['which','codex-auth'], text=True).strip()
 repo = pathlib.Path(__file__).resolve().parent.parent
-env = dict(os.environ, CODEX_HOME=str(root/'home'), XDG_CACHE_HOME=str(root/'cache'), USAGE_CACHE=str(root/'cache'/'usage.json'), CODEX_OPERATION_LOCK_DIR=str(root/'cache'/'exclusive-codex-operation.lock'), CODEX_AUTH_BIN=authbin, CODEX_AUTH_SKIP_SERVICE_RECONCILE='1', CODEX_AUTH_DISABLE_BACKGROUND_ACCOUNT_NAME_REFRESH='1')
+env = dict(os.environ, HOME=str(root), CODEX_STATUS_TEST_ROOT=str(root), CODEX_HOME=str(root/'home'), XDG_CONFIG_HOME=str(root/'config'), XDG_CACHE_HOME=str(root/'cache'), XDG_DATA_HOME=str(root/'data'), USAGE_CACHE=str(root/'cache'/'usage.json'), CODEX_OPERATION_LOCK_DIR=str(root/'cache'/'exclusive-codex-operation.lock'), CODEX_AUTH_BIN=authbin, CODEX_INSTANCE_MANAGER=str(repo/'bin'/'codex-instance'), CODEX_AUTH_SKIP_SERVICE_RECONCILE='1', CODEX_AUTH_DISABLE_BACKGROUND_ACCOUNT_NAME_REFRESH='1')
 (root/'home').mkdir()
 (root/'fakebin').mkdir()
 # Deliberately invalid synthetic credentials: no real account or network login.

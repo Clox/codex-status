@@ -1,4 +1,5 @@
 'use strict';
+require('./test-isolation');
 
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -7,6 +8,8 @@ const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const test = require('node:test');
 const { lockPathForAccount } = require('../lib/codex-activation-lock');
+const { locations } = require('../lib/codex-instances');
+const { readPool } = require('../lib/codex-account-pool');
 const {
   repairableAccounts,
   validateInactivePrecondition,
@@ -153,6 +156,8 @@ fs.writeFileSync(process.env.USAGE_CACHE,JSON.stringify({accounts:entries}));
     env: {
       ...process.env,
       NODE_TEST_CONTEXT: undefined,
+      HOME: root, XDG_CONFIG_HOME: path.join(root, 'config'),
+      XDG_CACHE_HOME: path.join(root, 'cache'), XDG_DATA_HOME: path.join(root, 'data'),
       CODEX_HOME: home,
       CODEX_AUTH_BIN: fakeCodexAuth,
       USAGE_REFRESHER: fakeRefresher,
@@ -165,6 +170,10 @@ fs.writeFileSync(process.env.USAGE_CACHE,JSON.stringify({accounts:entries}));
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(home, 'auth.json'), 'utf8')), globalAuth);
   assert.deepEqual(JSON.parse(fs.readFileSync(accountBSnapshot, 'utf8')), globalAuth);
   assert.equal(JSON.parse(fs.readFileSync(accountCSnapshot, 'utf8')).tokens.access_token, 'new-account-c-secret');
+  const poolLoc = locations({ HOME: root, XDG_CONFIG_HOME: path.join(root, 'config'),
+    XDG_CACHE_HOME: path.join(root, 'cache'), XDG_DATA_HOME: path.join(root, 'data') });
+  assert.equal(readPool(poolLoc).accounts.find(value => value.accountKey === accountC.account_key).generation, 2);
+  assert.equal(Object.hasOwn(readPool(poolLoc), 'active_account_key'), false);
   assert.equal(readRegistry(home).active_account_key, accountB.account_key);
   assert.doesNotMatch(`${result.stdout}${result.stderr}`, /old-.*-secret|new-account-c-secret/);
 
@@ -180,6 +189,8 @@ fs.writeFileSync(process.env.USAGE_CACHE,JSON.stringify({accounts:entries}));
     env: {
       ...process.env,
       NODE_TEST_CONTEXT: undefined,
+      HOME: root, XDG_CONFIG_HOME: path.join(root, 'config'),
+      XDG_CACHE_HOME: path.join(root, 'cache'), XDG_DATA_HOME: path.join(root, 'data'),
       CODEX_HOME: home,
       CODEX_AUTH_BIN: fakeCodexAuth,
       USAGE_REFRESHER: fakeRefresher,
@@ -195,6 +206,7 @@ fs.writeFileSync(process.env.USAGE_CACHE,JSON.stringify({accounts:entries}));
   assert.deepEqual(JSON.parse(fs.readFileSync(accountCSnapshot, 'utf8')), brokenAccountC);
   assert.deepEqual(readRegistry(home), registry());
   assert.deepEqual(JSON.parse(fs.readFileSync(usageCache, 'utf8')), oldUsage);
+  assert.equal(readPool(poolLoc).accounts.find(value => value.accountKey === accountC.account_key).generation, 2);
   assert.doesNotMatch(`${failed.stdout}${failed.stderr}`, /old-.*-secret|new-account-c-secret/);
 });
 

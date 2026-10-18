@@ -75,8 +75,11 @@ esac
     ]) + '\n')
     pid, fd = pty.fork()
     if pid == 0:
-        os.environ.update(HOME=str(home), XDG_CONFIG_HOME=str(home / '.config'),
-                          XDG_CACHE_HOME=str(home / '.cache'), TERM='xterm',
+        os.environ.update(HOME=str(home), CODEX_HOME=str(home / 'codex'),
+                          CODEX_STATUS_TEST_ROOT=str(home),
+                          XDG_CONFIG_HOME=str(home / '.config'),
+                          XDG_CACHE_HOME=str(home / '.cache'),
+                          XDG_DATA_HOME=str(home / '.local' / 'share'), TERM='xterm',
                           CODEX_AUTO_CONTINUE_STATE=str(auto),
                           XDG_SESSION_TYPE='x11', DISPLAY=':test', WAYLAND_DISPLAY='',
                           PATH=f'{tools}:{os.environ["PATH"]}',

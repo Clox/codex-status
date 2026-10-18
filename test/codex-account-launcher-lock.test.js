@@ -1,4 +1,5 @@
 'use strict';
+require('./test-isolation');
 
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -21,6 +22,15 @@ function fixture(t) {
   fs.writeFileSync(checker, '#!/bin/sh\nprintf "id-target\\tkey-target\\tselector\\n"\n', { mode: 0o755 });
   const core = path.join(tools, 'core');
   fs.writeFileSync(core, '#!/bin/sh\ntouch "$CORE_STARTED"\nwhile test ! -e "$CORE_RELEASE"; do sleep 0.05; done\n', { mode: 0o755 });
+  const manager = path.join(tools, 'instance-manager');
+  fs.writeFileSync(manager, `#!/bin/sh
+case "$1" in
+  pool-migrate|check-account|record-release) exit 0 ;;
+  assignment-lock-path) printf '%s\\n' '${path.join(root, 'assignment.lock')}' ;;
+  account-lock-path) printf '%s\\n' '${path.join(root, 'account.lock')}' ;;
+  *) exit 1 ;;
+esac
+`, { mode: 0o755 });
   fs.writeFileSync(path.join(config, 'accounts.conf'), [
     `CODEX_HOME=${JSON.stringify(path.join(root, 'codex'))}`,
     `NODE_BIN_DIR=${JSON.stringify(path.dirname(process.execPath))}`,
@@ -32,6 +42,7 @@ function fixture(t) {
     started: path.join(root, 'started'), release: path.join(root, 'release'),
     env: { ...process.env, NODE_TEST_CONTEXT: undefined,
       XDG_CONFIG_HOME: path.join(root, 'config'), CODEX_OPERATION_LOCK_DIR: path.join(root, 'exclusive.lock'),
+      CODEX_INSTANCE_MANAGER: manager,
       CORE_STARTED: path.join(root, 'started'), CORE_RELEASE: path.join(root, 'release') } };
 }
 
