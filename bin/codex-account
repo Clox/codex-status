@@ -22,22 +22,35 @@ USAGE_REFRESHER=${USAGE_REFRESHER:-"$HOME/.local/bin/codex-usage-refresh"}
 operation_lock_dir=${CODEX_OPERATION_LOCK_DIR:-"${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/exclusive-codex-operation.lock"}
 operation_lock_helper="$(dirname -- "$0")/../lib/codex-operation-lock.js"
 operation_lock_generation=''
+operation_pid=$BASHPID
 continuation_plan=''
 
 cleanup_operation() {
   if [[ -n $operation_lock_generation ]]; then
-    node "$operation_lock_helper" release "$operation_lock_dir" "$BASHPID" "$operation_lock_generation"
+    node "$operation_lock_helper" release "$operation_lock_dir" "$operation_pid" "$operation_lock_generation"
     operation_lock_generation=''
   fi
   [[ -z $continuation_plan ]] || rm -f -- "$continuation_plan"
 }
 
 acquire_operation_lock() {
-  operation_lock_generation=$(node "$operation_lock_helper" acquire "$operation_lock_dir" "$BASHPID") || {
-    printf 'En annan exklusiv Codex-operation pågår. Kontobytet avbröts.\n' >&2
-    exit 75
-  }
-  trap cleanup_operation EXIT
+  local attempt result
+  for ((attempt = 0; attempt < 25; attempt++)); do
+    if operation_lock_generation=$(node "$operation_lock_helper" acquire "$operation_lock_dir" "$operation_pid"); then
+      trap cleanup_operation EXIT
+      return 0
+    else
+      result=$?
+      if ((result != 75)); then
+        printf 'Codex operationslåset kunde inte verifieras säkert. Kontobytet avbröts.\n' >&2
+        exit 75
+      fi
+    fi
+    sleep 0.2
+  done
+  notify-send 'Codex-kontobyte stoppat' 'En annan exklusiv Codex-operation pågår fortfarande. Försök igen när den är klar.' 2>/dev/null || true
+  printf 'En annan exklusiv Codex-operation pågår fortfarande. Kontobytet avbröts.\n' >&2
+  exit 75
 }
 
 release_operation_lock() {
