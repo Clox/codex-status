@@ -13,6 +13,7 @@ const {
   writeStatusPreferences,
 } = require(path.join(__dirname, '..', 'lib', 'codex-status-preferences'));
 const { ensureAutoTimerRunning } = require(path.join(__dirname, '..', 'lib', 'codex-auto-scheduler'));
+const { acquireOperationLock } = require(path.join(__dirname, '..', 'lib', 'codex-operation-lock'));
 const {
   cancelPendingAction,
   emptyAutoContinueState,
@@ -33,31 +34,10 @@ const operationLockPath = process.env.CODEX_OPERATION_LOCK_DIR || path.join(
 const command = process.argv[2] || 'show';
 
 function withOperationLock(action) {
-  fs.mkdirSync(path.dirname(operationLockPath), { recursive: true, mode: 0o700 });
-  try {
-    fs.mkdirSync(operationLockPath, { mode: 0o700 });
-  } catch (error) {
-    if (error?.code !== 'EEXIST') throw error;
-    let owner;
-    let stale = false;
-    try { owner = Number(fs.readFileSync(path.join(operationLockPath, 'owner'), 'utf8').trim()); } catch {}
-    if (Number.isInteger(owner) && owner > 0) {
-      try { process.kill(owner, 0); } catch (failure) {
-        if (failure?.code === 'EPERM') throw new Error('AUTO_MODE_CHANGE_BUSY');
-        if (failure?.code !== 'ESRCH') throw failure;
-        stale = true;
-      }
-    }
-    if (!stale) throw new Error('AUTO_MODE_CHANGE_BUSY');
-    try { fs.unlinkSync(path.join(operationLockPath, 'owner')); } catch {}
-    fs.rmdirSync(operationLockPath);
-    fs.mkdirSync(operationLockPath, { mode: 0o700 });
-  }
-  fs.writeFileSync(path.join(operationLockPath, 'owner'), `${process.pid}\n`, { mode: 0o600 });
-  try { return action(); } finally {
-    try { fs.unlinkSync(path.join(operationLockPath, 'owner')); } catch {}
-    fs.rmdirSync(operationLockPath);
-  }
+  let release;
+  try { release = acquireOperationLock(operationLockPath); }
+  catch (error) { if (error.code === 'ELOCKED') throw new Error('AUTO_MODE_CHANGE_BUSY'); throw error; }
+  try { return action(); } finally { release(); }
 }
 
 function readAutoState() {

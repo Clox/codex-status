@@ -44,16 +44,18 @@ test('stable keys survive row reorder and upstream selector fails closed for dup
   assert.throws(() => upstreamSelector(registry, 'missing'), /KEY_MISSING/);
 });
 
-test('operation lock excludes another manager and preserves incomplete locks', () => {
+test('operation lock excludes another manager and heals incomplete locks', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-manager-lock-test-'));
   const lock = path.join(root, 'operation.lock');
   try {
     const release = acquireOperationLock(lock);
-    assert.throws(() => acquireOperationLock(lock), /pågår/);
+    assert.throws(() => acquireOperationLock(lock), /EXCLUSIVE_CODEX_OPERATION_IN_PROGRESS/);
     release();
     fs.mkdirSync(lock);
-    assert.throws(() => acquireOperationLock(lock), /pågår/);
-    assert.ok(fs.existsSync(lock));
+    const releaseRecovered = acquireOperationLock(lock);
+    assert.ok(fs.existsSync(path.join(lock, 'owner')));
+    releaseRecovered();
+    assert.equal(fs.existsSync(lock), false);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 

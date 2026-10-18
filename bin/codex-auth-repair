@@ -20,6 +20,7 @@ const {
   validatePostImport,
   validateStagedIdentity,
 } = require(path.join(__dirname, '..', 'lib', 'codex-auth-repair'));
+const { acquireOperationLock } = require(path.join(__dirname, '..', 'lib', 'codex-operation-lock'));
 
 const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
 const codexAuthBin = process.env.CODEX_AUTH_BIN || 'codex-auth';
@@ -29,7 +30,7 @@ const codexLoginBin = process.env.CODEX_LOGIN_BIN || '/usr/lib/chatgpt/resources
 const registryPath = path.join(codexHome, 'accounts', 'registry.json');
 const globalAuthPath = path.join(codexHome, 'auth.json');
 const lockPath = `${usageCachePath}.auth-repair.lock`;
-const operationLockPath = path.join(path.dirname(usageCachePath), 'exclusive-codex-operation.lock');
+const operationLockPath = process.env.CODEX_OPERATION_LOCK_DIR || path.join(path.dirname(usageCachePath), 'exclusive-codex-operation.lock');
 const activationLockDirectory = path.join(path.dirname(usageCachePath), 'activation-locks');
 
 function fail(message, code = 1) {
@@ -129,32 +130,20 @@ function acquireLock() {
   }
 }
 
-function acquireOperationLock() {
-  fs.mkdirSync(path.dirname(operationLockPath), { recursive: true, mode: 0o700 });
-  try {
-    fs.mkdirSync(operationLockPath, { mode: 0o700 });
-    fs.writeFileSync(path.join(operationLockPath, 'owner'), `${process.pid}\n`, { mode: 0o600 });
-    return operationLockPath;
-  } catch (error) {
-    if (error.code !== 'EEXIST') throw error;
-    let owner = null;
-    try { owner = Number(fs.readFileSync(path.join(operationLockPath, 'owner'), 'utf8').trim()); } catch {}
-    try {
-      if (Number.isInteger(owner) && owner > 0) process.kill(owner, 0);
-      fail('Another exclusive Codex operation is already running.', 75);
-    } catch (processError) {
-      if (processError.code !== 'ESRCH') throw processError;
-      try { fs.unlinkSync(path.join(operationLockPath, 'owner')); } catch {}
-      fs.rmdirSync(operationLockPath);
-      return acquireOperationLock();
-    }
-  }
+let releaseHeldOperation = null;
+function cleanupOperation() {
+  if (!releaseHeldOperation) return;
+  const release = releaseHeldOperation;
+  releaseHeldOperation = null;
+  release();
 }
-
-function releaseOperationLock() {
-  try { fs.unlinkSync(path.join(operationLockPath, 'owner')); } catch {}
-  try { fs.rmdirSync(operationLockPath); } catch {}
+for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+  process.on(signal, () => {
+    try { cleanupOperation(); } catch (error) { process.stderr.write(`Operation lock cleanup failed: ${error.message}\n`); }
+    process.exit(128 + (signal === 'SIGINT' ? 2 : signal === 'SIGHUP' ? 1 : 15));
+  });
 }
+process.on('exit', () => { try { cleanupOperation(); } catch {} });
 
 async function chooseTarget(accounts) {
   if (accounts.length === 1) return accounts[0];
@@ -172,7 +161,7 @@ async function chooseTarget(accounts) {
 }
 
 async function main() {
-  const operationLock = acquireOperationLock();
+  releaseHeldOperation = acquireOperationLock(operationLockPath);
   let lockFd = null;
   let stagingRoot = null;
   let rollbackRoot = null;
@@ -331,7 +320,7 @@ async function main() {
       try { fs.closeSync(lockFd); } catch {}
       try { fs.unlinkSync(lockPath); } catch {}
     }
-    if (operationLock) releaseOperationLock();
+    cleanupOperation();
   }
 }
 

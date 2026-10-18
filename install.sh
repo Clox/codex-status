@@ -67,7 +67,9 @@ if [[ $mode == --verify || $mode == --update ]]; then
   if [[ $mode == --update && -f $config_dir/status-preferences.json ]] &&
     node -e 'try { process.exit(require(process.argv[1]).autoMode === "DESKTOP" ? 0 : 1); } catch { process.exit(1); }' \
       "$config_dir/status-preferences.json"; then
-    "$local_bin/codex-status-preferences" migrate >/dev/null ||
+    CODEX_STATUS_PREFERENCES="$config_dir/status-preferences.json" \
+      CODEX_AUTO_CONTINUE_STATE="${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/auto-continue.json" \
+      "$local_bin/codex-status-preferences" migrate >/dev/null ||
       fail 'legacy AUTO: DESKTOP migration failed; inspect the operation lock/timer before using AUTO'
   fi
   if [[ $mode == --verify && $changed -ne 0 ]]; then
@@ -188,6 +190,7 @@ backup_if_present "$local_lib/codex-weekly-activation.js"
 backup_if_present "$local_lib/codex-five-hour-activation.js"
 backup_if_present "$local_lib/codex-five-hour-worker.js"
 backup_if_present "$local_lib/codex-activation-lock.js"
+backup_if_present "$local_lib/codex-operation-lock.js"
 backup_if_present "$local_lib/codex-activation-account.js"
 backup_if_present "$local_lib/codex-activation-hold.js"
 backup_if_present "$local_lib/codex-turn-observer.js"
@@ -252,6 +255,7 @@ install -m 0644 "$lib_source/codex-weekly-activation.js" "$local_lib/codex-weekl
 install -m 0644 "$lib_source/codex-five-hour-activation.js" "$local_lib/codex-five-hour-activation.js"
 install -m 0644 "$lib_source/codex-five-hour-worker.js" "$local_lib/codex-five-hour-worker.js"
 install -m 0644 "$lib_source/codex-activation-lock.js" "$local_lib/codex-activation-lock.js"
+install -m 0644 "$lib_source/codex-operation-lock.js" "$local_lib/codex-operation-lock.js"
 install -m 0644 "$lib_source/codex-activation-account.js" "$local_lib/codex-activation-account.js"
 install -m 0644 "$lib_source/codex-activation-hold.js" "$local_lib/codex-activation-hold.js"
 install -m 0644 "$lib_source/codex-turn-observer.js" "$local_lib/codex-turn-observer.js"

@@ -6,6 +6,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
+const { acquireOperationLock } = require(path.join(__dirname, '..', 'lib', 'codex-operation-lock'));
 const { verifyActiveAccountState } = require(path.join(__dirname, '..', 'lib', 'codex-account-state'));
 const {
   accountStateError,
@@ -186,20 +187,12 @@ function verifyTargetAccount() {
   return { accountId: expectedAccountId, accountKey: expectedAccountKey };
 }
 
-function acquireLock() {
-  fs.mkdirSync(cacheDirectory, { recursive: true, mode: 0o700 });
-  try {
-    fs.mkdirSync(lockPath, { mode: 0o700 });
-    fs.writeFileSync(path.join(lockPath, 'owner'), `${process.pid}\n`, { mode: 0o600 });
-  } catch (error) {
-    if (error.code === 'EEXIST') throw new Error('EXCLUSIVE_CODEX_OPERATION_IN_PROGRESS');
-    throw error;
-  }
-}
+let heldRelease = null;
+function acquireLock() { heldRelease = acquireOperationLock(lockPath); }
 
 function releaseLock() {
-  try { fs.unlinkSync(path.join(lockPath, 'owner')); } catch {}
-  try { fs.rmdirSync(lockPath); } catch {}
+  if (heldRelease) heldRelease();
+  heldRelease = null;
 }
 
 function authEnvironment(serverPid) {

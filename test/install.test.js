@@ -27,7 +27,9 @@ test('existing installation verifies and updates payload without changing privat
     [path.join(binDir, 'codex-usage-resets'), 'legacy-local-file\n'],
   ];
   for (const [file, content] of privateFiles) fs.writeFileSync(file, content);
-  const env = { ...process.env, HOME: home, XDG_CONFIG_HOME: path.join(home, '.config'),
+  const env = { ...process.env, NODE_TEST_CONTEXT: undefined,
+    CODEX_STATUS_PREFERENCES: undefined, CODEX_AUTO_CONTINUE_STATE: undefined,
+    HOME: home, XDG_CONFIG_HOME: path.join(home, '.config'),
     XDG_CACHE_HOME: path.join(home, '.cache') };
   const run = mode => spawnSync('bash', [installer, mode], { env, encoding: 'utf8' });
 
@@ -71,7 +73,9 @@ test('state-preserving update migrates an old DESKTOP preference to HEADLESS', t
   const committed = '{"attempts":{"old":{"strategy":"DESKTOP","status":"SEND_UNCONFIRMED"}}}\n';
   fs.writeFileSync(resume, committed);
   const result = spawnSync('bash', [installer, '--update'], {
-    env: { ...process.env, HOME: home, XDG_CONFIG_HOME: path.join(home, '.config'),
+    env: { ...process.env, NODE_TEST_CONTEXT: undefined,
+      CODEX_STATUS_PREFERENCES: undefined, CODEX_AUTO_CONTINUE_STATE: undefined,
+      HOME: home, XDG_CONFIG_HOME: path.join(home, '.config'),
       XDG_CACHE_HOME: path.join(home, '.cache'),
       CODEX_SYSTEMCTL_BIN: path.join(__dirname, 'fixtures', 'systemctl-test') },
     encoding: 'utf8',

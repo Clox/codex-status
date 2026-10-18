@@ -234,9 +234,9 @@ start_local_collection() {
   chmod 600 "$collector_tmp"
   (
     collection_lock="${CODEX_OPERATION_LOCK_DIR:-$status_runtime_dir/exclusive-codex-operation.lock}"
-    mkdir -m 700 "$collection_lock" 2>/dev/null || { rm -f -- "$collector_tmp"; exit 1; }
-    printf '%s\n' "$BASHPID" >"$collection_lock/owner"
-    trap 'rm -f -- "$collection_lock/owner"; rmdir -- "$collection_lock" 2>/dev/null || true' EXIT
+    collection_pid=$BASHPID
+    collection_generation=$(node "$(dirname -- "$0")/../lib/codex-operation-lock.js" acquire "$collection_lock" "$collection_pid") || { rm -f -- "$collector_tmp"; exit 1; }
+    trap 'node "$(dirname -- "$0")/../lib/codex-operation-lock.js" release "$collection_lock" "$collection_pid" "$collection_generation"' EXIT
     if script -qefc "stty cols $columns; exec \"$CODEX_AUTH_BIN\" list --skip-api" /dev/null </dev/null >"$collector_tmp"; then
       mv -f -- "$collector_tmp" "$status_raw_frame_cache"
       chmod 600 "$status_raw_frame_cache"

@@ -20,32 +20,23 @@ ACCOUNT_SWITCH_CORE=${ACCOUNT_SWITCH_CORE:-"$(dirname -- "$0")/codex-account-swi
 CONTINUATION_DRAFTS=${CONTINUATION_DRAFTS:-"$HOME/.local/bin/codex-continuation-drafts"}
 USAGE_REFRESHER=${USAGE_REFRESHER:-"$HOME/.local/bin/codex-usage-refresh"}
 operation_lock_dir=${CODEX_OPERATION_LOCK_DIR:-"${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/exclusive-codex-operation.lock"}
+operation_lock_helper="$(dirname -- "$0")/../lib/codex-operation-lock.js"
+operation_lock_generation=''
 continuation_plan=''
 
 cleanup_operation() {
-  rm -f -- "$operation_lock_dir/owner"
-  rmdir -- "$operation_lock_dir" 2>/dev/null || true
+  if [[ -n $operation_lock_generation ]]; then
+    node "$operation_lock_helper" release "$operation_lock_dir" "$BASHPID" "$operation_lock_generation"
+    operation_lock_generation=''
+  fi
   [[ -z $continuation_plan ]] || rm -f -- "$continuation_plan"
 }
 
 acquire_operation_lock() {
-  mkdir -p "$(dirname -- "$operation_lock_dir")"
-  chmod 700 "$(dirname -- "$operation_lock_dir")"
-  if ! mkdir -m 700 "$operation_lock_dir" 2>/dev/null; then
-    owner=''
-    [[ -r "$operation_lock_dir/owner" ]] && read -r owner <"$operation_lock_dir/owner"
-    if [[ $owner =~ ^[0-9]+$ ]] && kill -0 "$owner" 2>/dev/null; then
-      printf 'En annan exklusiv Codex-operation pågår. Kontobytet avbröts.\n' >&2
-      exit 75
-    fi
-    rm -f -- "$operation_lock_dir/owner"
-    rmdir -- "$operation_lock_dir" 2>/dev/null || {
-      printf 'Codex operationslåset kunde inte återställas säkert.\n' >&2
-      exit 75
-    }
-    mkdir -m 700 "$operation_lock_dir"
-  fi
-  printf '%s\n' "$BASHPID" >"$operation_lock_dir/owner"
+  operation_lock_generation=$(node "$operation_lock_helper" acquire "$operation_lock_dir" "$BASHPID") || {
+    printf 'En annan exklusiv Codex-operation pågår. Kontobytet avbröts.\n' >&2
+    exit 75
+  }
   trap cleanup_operation EXIT
 }
 

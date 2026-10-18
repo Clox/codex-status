@@ -77,6 +77,7 @@ esac
     if pid == 0:
         os.environ.update(HOME=str(home), XDG_CONFIG_HOME=str(home / '.config'),
                           XDG_CACHE_HOME=str(home / '.cache'), TERM='xterm',
+                          CODEX_AUTO_CONTINUE_STATE=str(auto),
                           XDG_SESSION_TYPE='x11', DISPLAY=':test', WAYLAND_DISPLAY='',
                           PATH=f'{tools}:{os.environ["PATH"]}',
                           QUOTA_CALLS=str(quota_calls), CLIPBOARD_OUTPUT=str(clipboard))
@@ -84,7 +85,7 @@ esac
     try:
         until(fd, b'BEFORE')
         # Let the initial cached-frame transition finish before measuring C.
-        time.sleep(0.5)
+        time.sleep(1.5)
         baseline = quota_calls.read_text()
         os.write(fd, b'c')
         until(fd, b'Status copied')
