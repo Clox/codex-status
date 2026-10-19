@@ -150,6 +150,18 @@ test('active marker stays primary while only account text is bold and separators
   assert.doesNotMatch(output, /\x1b\[38;2;[^m]+m│/);
 });
 
+test('instance-use marker overrides primary recommendation active state per row', () => {
+  const row = rankAccounts([normalize({
+    account: { chatgpt_account_id: 'account-c', email: 'account-c@example.com' },
+  })], { nowMs: NOW_MS })[0];
+  const inAnotherInstance = render({ ...row, active: false, usedByInstance: true });
+  assert.match(inAnotherInstance, /^\x1b\[1m/);
+  assert.match(inAnotherInstance.replace(/\x1b\[[0-9;]*m/g, ''), /^\*01 /);
+  const unused = render({ ...row, active: true, usedByInstance: false });
+  assert.match(unused.replace(/\x1b\[[0-9;]*m/g, ''), /^ 01 /);
+  assert.doesNotMatch(unused, /^\x1b\[1m/);
+});
+
 test('pending switch uses a compact spinner frame without moving the active marker or recoloring quota cells', () => {
   const account = { chatgpt_account_id: 'account-c', email: 'account-c@example.com' };
   const serverEntry = {

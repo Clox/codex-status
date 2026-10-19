@@ -9,7 +9,9 @@ const test = require('node:test');
 const {
   DESKTOP, locations, defaultInstance, derivedInstance, instanceNamespaces, readRegistry, createInstance,
   renameInstance, deleteInstance, ownedRoots, runningInstances, startInstance, stopInstance,
+  focusInstance, openInstance,
   clearStalePending,
+  resolveInstanceSelection,
 } = require('../lib/codex-instances');
 
 function fixture(t) {
@@ -86,6 +88,16 @@ test('new instance has a separate namespace and registry persists default withou
   assert.equal(readRegistry(loc, env).instances[1].displayName, 'Rosetta II');
 });
 
+test('manager resolves a displayed instance by number, name or stable ID', t => {
+  const { env, loc } = fixture(t);
+  createInstance('rosetta', 'Rosetta', loc, env);
+  const registry = readRegistry(loc, env);
+  for (const selection of ['2', 'Rosetta', 'rosetta', 'ROSETTA']) {
+    assert.equal(resolveInstanceSelection(registry, selection).instanceId, 'rosetta');
+  }
+  assert.throws(() => resolveInstanceSelection(registry, '3'), /INSTANCE_NOT_FOUND/);
+});
+
 test('same binary is separated by profile and Codex home; stop can signal only B', async t => {
   const { env, loc } = fixture(t);
   const b = createInstance('rosetta', 'Rosetta', loc, env);
@@ -114,6 +126,67 @@ test('same binary is separated by profile and Codex home; stop can signal only B
   assert.equal(root.pid, 20);
   assert.deepEqual(signaled, [[20, 'SIGTERM']]);
   assert.deepEqual(ownedRoots(a, live), [{ pid: 10, startTicks: '100' }]);
+});
+
+test('O starts only stopped B and focuses running B without restarting either instance', async t => {
+  const { env, loc } = fixture(t);
+  const b = createInstance('rosetta', 'Rosetta', loc, env);
+  const a = readRegistry(loc, env).instances[0];
+  const calls = [];
+  const start = (id, targetLoc) => {
+    calls.push(['start', id]);
+    assert.equal(targetLoc, loc);
+    return { record: b };
+  };
+  const wait = async record => {
+    assert.equal(record, b);
+    return { pid: 20, startTicks: '200' };
+  };
+  const focus = id => {
+    calls.push(['focus', id]);
+    return { root: { pid: 20, startTicks: '200' }, windowId: '0x02000001' };
+  };
+  const stopped = await openInstance('rosetta', loc, env, {
+    snapshot: () => fakeProcesses(a, b).filter(value => value.pid < 20), start, wait, focus,
+  });
+  assert.equal(stopped.action, 'started');
+  assert.deepEqual(calls, [['start', 'rosetta']]);
+  const running = await openInstance('rosetta', loc, env, {
+    snapshot: () => fakeProcesses(a, b), start, wait, focus,
+  });
+  assert.equal(running.action, 'focused');
+  assert.deepEqual(calls, [['start', 'rosetta'], ['focus', 'rosetta']]);
+  assert.deepEqual(ownedRoots(a, fakeProcesses(a, b)), [{ pid: 10, startTicks: '100' }]);
+});
+
+test('focus raises only a window owned by the verified instance and fails closed on PID changes', t => {
+  const { env, loc } = fixture(t);
+  const b = createInstance('rosetta', 'Rosetta', loc, env);
+  const a = readRegistry(loc, env).instances[0];
+  const calls = [];
+  const run = (command, args) => {
+    calls.push([command, ...args]);
+    return args[0] === '-lp'
+      ? { status: 0, stdout: '0x01000001 0 10 host ChatGPT A\n0x02000001 0 20 host ChatGPT B\n' }
+      : { status: 0 };
+  };
+  const result = focusInstance('rosetta', loc, env, {
+    snapshot: () => fakeProcesses(a, b), run, sessionType: 'x11',
+  });
+  assert.equal(result.windowId, '0x02000001');
+  assert.deepEqual(calls, [['wmctrl', '-lp'], ['wmctrl', '-i', '-a', '0x02000001']]);
+  let reads = 0;
+  assert.throws(() => focusInstance('rosetta', loc, env, {
+    snapshot: () => (++reads === 1 ? fakeProcesses(a, b)
+      : fakeProcesses(a, b).map(value => value.pid === 20 ? { ...value, startTicks: '999' } : value)),
+    run, sessionType: 'x11',
+  }), /INSTANCE_ROOT_CHANGED/);
+  assert.equal(calls.length, 3); // Only the read-only window listing was repeated.
+  assert.throws(() => focusInstance('rosetta', loc, env, {
+    snapshot: () => fakeProcesses(a, b),
+    run: () => ({ status: 0, stdout: '0x01000001 0 10 host ChatGPT A\n' }),
+    sessionType: 'x11',
+  }), /INSTANCE_WINDOW_NOT_FOUND/);
 });
 
 test('start uses explicit B paths, separate unit, and no global ChatGPT process name', t => {

@@ -8,6 +8,7 @@ const path = require('node:path');
 const {
   locations, readRegistry, createInstance, renameInstance, setInstanceEnabled,
   runningInstances, startInstance, waitForRoot, stopInstance, clearStalePending,
+  resolveInstanceSelection, openInstance,
 } = require(path.join(__dirname, '..', 'lib', 'codex-instances'));
 const { readPool, migrateDefault, instanceActive, provisionAccount, poolPaths,
   accountLockPath, recordRelease, deleteInstanceWithAccounts, assignments,
@@ -56,36 +57,41 @@ async function menu() {
       const action = (await terminal.question('\n[L] List  [C] Create  [N] Rename  [A] Change account  [S] Start  [T] Stop  [E] Enable  [B] Disable  [U] Clear stale launch  [D] Delete  [Enter] Exit: ')).trim().toLowerCase();
       if (!action) return;
       if (action === 'l') continue;
-      const id = (await terminal.question('Instance ID: ')).trim();
-      if (action === 'c') {
-        const name = await terminal.question('Display name: ');
-        createInstance(id, name, loc);
-      } else if (action === 'n') {
-        const name = await terminal.question('New display name: ');
-        renameInstance(id, name, loc);
-      } else if (action === 'a') {
-        const pool = migrateDefault(loc);
-        pool.accounts.forEach((account, index) => stdout.write(`${index + 1}  ${account.displayName}\n`));
-        const choice = await terminal.question('Account number: ');
-        const account = /^\d+$/.test(choice) ? pool.accounts[Number(choice) - 1] : null;
-        if (!account) throw new Error('INVALID_ACCOUNT_NUMBER');
-        const outcome = await switchAccount(id, account.accountKey);
-        stdout.write(outcome.unchanged ? 'Account already active; no change.\n' : 'Account switched and verified.\n');
-      } else if (action === 's') {
-        const launch = startInstance(id, loc);
-        const root = await waitForRoot(launch.record);
-        stdout.write(`Started ${id}: PID ${root.pid}, start ${root.startTicks}\n`);
-      } else if (action === 't') {
-        const root = await stopInstance(id, loc);
-        stdout.write(`Stopped ${id}: PID ${root.pid}\n`);
-      } else if (action === 'e' || action === 'b') {
-        setInstanceEnabled(id, action === 'e', loc);
-      } else if (action === 'u') {
-        stdout.write(clearStalePending(id, loc) ? 'Cleared stale launch.\n' : 'No pending launch.\n');
-      } else if (action === 'd') {
-        const phrase = await terminal.question(`Permanently delete only ${id}'s local state? Type DELETE ${id}: `);
-        deleteInstanceWithAccounts(id, phrase, loc);
-      } else stdout.write('Unknown action.\n');
+      try {
+        const selection = (await terminal.question(action === 'c' ? 'New instance ID: ' : 'Instance number, name or ID: ')).trim();
+        const id = action === 'c' ? selection : resolveInstanceSelection(readRegistry(loc), selection).instanceId;
+        if (action === 'c') {
+          const name = await terminal.question('Display name: ');
+          createInstance(id, name, loc);
+        } else if (action === 'n') {
+          const name = await terminal.question('New display name: ');
+          renameInstance(id, name, loc);
+        } else if (action === 'a') {
+          const pool = migrateDefault(loc);
+          pool.accounts.forEach((account, index) => stdout.write(`${index + 1}  ${account.displayName}\n`));
+          const choice = await terminal.question('Account number: ');
+          const account = /^\d+$/.test(choice) ? pool.accounts[Number(choice) - 1] : null;
+          if (!account) throw new Error('INVALID_ACCOUNT_NUMBER');
+          const outcome = await switchAccount(id, account.accountKey);
+          stdout.write(outcome.unchanged ? 'Account already active; no change.\n' : 'Account switched and verified.\n');
+        } else if (action === 's') {
+          const launch = startInstance(id, loc);
+          const root = await waitForRoot(launch.record);
+          stdout.write(`Started ${id}: PID ${root.pid}, start ${root.startTicks}\n`);
+        } else if (action === 't') {
+          const root = await stopInstance(id, loc);
+          stdout.write(`Stopped ${id}: PID ${root.pid}\n`);
+        } else if (action === 'e' || action === 'b') {
+          setInstanceEnabled(id, action === 'e', loc);
+        } else if (action === 'u') {
+          stdout.write(clearStalePending(id, loc) ? 'Cleared stale launch.\n' : 'No pending launch.\n');
+        } else if (action === 'd') {
+          const phrase = await terminal.question(`Permanently delete only ${id}'s local state? Type DELETE ${id}: `);
+          deleteInstanceWithAccounts(id, phrase, loc);
+        } else stdout.write('Unknown action.\n');
+      } catch (error) {
+        stdout.write(`Operation failed: ${error.message}\n`);
+      }
     }
   } finally { terminal.close(); }
 }
@@ -103,8 +109,8 @@ async function main() {
   if (command === 'account-lock-path') return void stdout.write(`${accountLockPath(loc, instanceId)}\n`);
   if (command === 'record-release') return void stdout.write(`${JSON.stringify(recordRelease(instanceId, loc))}\n`);
   if (command === 'resolve-index') {
-    const value = readRegistry(loc).instances[Number(instanceId) - 1];
-    if (!value || !/^[1-9]$/.test(instanceId)) throw new Error('INSTANCE_NOT_FOUND');
+    if (!/^[1-9]$/.test(instanceId)) throw new Error('INSTANCE_NOT_FOUND');
+    const value = resolveInstanceSelection(readRegistry(loc), instanceId);
     return void stdout.write(`${value.instanceId}\n`);
   }
   if (command === 'check-account') {
@@ -160,11 +166,17 @@ async function main() {
     const root = await waitForRoot(launch.record);
     return void stdout.write(`Started ${instanceId}: PID ${root.pid}, start ${root.startTicks}\n`);
   }
+  if (command === 'open') {
+    const result = await openInstance(instanceId, loc);
+    return void stdout.write(result.action === 'focused'
+      ? `Focused ${instanceId}: window ${result.windowId}\n`
+      : `Started ${instanceId}: PID ${result.root.pid}, start ${result.root.startTicks}\n`);
+  }
   if (command === 'stop') {
     const root = await stopInstance(instanceId, loc);
     return void stdout.write(`Stopped ${instanceId}: PID ${root.pid}\n`);
   }
-  throw new Error('Usage: codex-instance list|is-running ID|create ID NAME|rename ID NAME|enable ID|disable ID|start ID|stop ID|clear-stale-launch ID|delete ID --confirm "DELETE ID"');
+  throw new Error('Usage: codex-instance list|is-running ID|create ID NAME|rename ID NAME|enable ID|disable ID|open ID|start ID|stop ID|clear-stale-launch ID|delete ID --confirm "DELETE ID"');
 }
 
 main().catch(error => { process.stderr.write(`${error.message}\n`); process.exitCode = command === 'is-running' ? 2 : 1; });

@@ -54,9 +54,10 @@ test('startup renders cached or loading state before asynchronous local collecti
 });
 
 test('selection prompt is conditional and magenta auto-continue remains last before help', () => {
-  const outputStatement = annotateSource.indexOf('process.stdout.write(`${output.join');
+  const outputStatement = annotateSource.indexOf('process.stdout.write(`${instancesSection}');
   assert.notEqual(outputStatement, -1);
-  const outputExpression = annotateSource.slice(outputStatement, outputStatement + 300);
+  const outputExpression = annotateSource.slice(outputStatement, outputStatement + 400);
+  assert.match(outputExpression, /ACCOUNTS:.*output\.join/);
   assert.match(outputExpression, /accountSelectionLines\.length \? .*accountSelectionLines\.join/);
   assert.doesNotMatch(outputExpression, /renderedRecommendationLines/);
   const footerStatement = annotateSource.indexOf('const footerParts = [');
@@ -84,9 +85,22 @@ test('status keys select an instance before an account and Esc or X cancels sele
   assert.match(keyBranch, /else[\s\S]*availability "\$selected_instance_id" "\$launcher_account"/);
   assert.match(keyBranch, /already-active\) copy_feedback='Account already active; no change'/);
   assert.match(keyBranch, /in-use:\*\) copy_feedback="Account in use by/);
-  assert.match(keyBranch, /switch-key "\$selected_instance_id" "\$launcher_account"/);
+  assert.match(keyBranch, /launch_instance_switch "\$selected_instance_id" "\$launcher_account"/);
+  assert.match(source, /launch_instance_switch\(\)[\s\S]*codex-instance" switch-key "\$1" "\$2"/);
+  assert.match(source, /instance-switch\.log/);
+  assert.match(keyBranch, /Account switch blocked: \$\{availability/);
   assert.match(source, /x\|X\)[\s\S]*if \[\[ -n \$selected_instance_id \]\]; then[\s\S]*Instance selection cancelled/);
   assert.match(source, /\$'\\e'\)[\s\S]*if \[\[ \$key == \$'\\e' && -n \$selected_instance_id \]\]; then/);
+});
+
+test('selected-instance O and T use shared instance commands then exit and refresh on success', () => {
+  const branch = source.slice(source.indexOf('      o|O|t|T)'), source.indexOf('      r|R)'));
+  assert.match(branch, /if \[\[ -n \$selected_instance_id \]\]; then/);
+  assert.match(branch, /instance_action=open/);
+  assert.match(branch, /if \[\[ \$key == t \|\| \$key == T \]\]; then instance_action=stop; fi/);
+  assert.match(branch, /codex-instance" "\$instance_action" "\$selected_instance_id"/);
+  assert.match(branch, /selected_instance_id=''[\s\S]*CODEX_SELECTED_INSTANCE_ID=''[\s\S]*refresh_local_frame/);
+  assert.doesNotMatch(branch, /codex-account|AUTO|pkill|pgrep/);
 });
 
 test('AUTO animation and countdown redraw locally without extra usage refresh', () => {

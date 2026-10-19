@@ -156,6 +156,11 @@ launch_detached() {
   setsid -f "$@" {status_lock_fd}>&- </dev/null >/dev/null 2>&1
 }
 
+launch_instance_switch() {
+  setsid -f "$HOME/.local/bin/codex-instance" switch-key "$1" "$2" \
+    {status_lock_fd}>&- </dev/null >>"$status_runtime_dir/instance-switch.log" 2>&1
+}
+
 launch_usage_refresh() {
   mkdir -p "$(dirname -- "$USAGE_REFRESH_LOG")"
   chmod 700 "$(dirname -- "$USAGE_REFRESH_LOG")"
@@ -425,12 +430,20 @@ while true; do
             notify-send 'Codex-kontobyte stoppat' 'Kunde inte entydigt identifiera kontot. Öppna kontomenyn med K.' 2>/dev/null || true
             continue
           fi
-          availability=$("$HOME/.local/bin/codex-instance" availability "$selected_instance_id" "$launcher_account" 2>/dev/null || true)
+          availability=$("$HOME/.local/bin/codex-instance" availability "$selected_instance_id" "$launcher_account" 2>&1) || {
+            copy_feedback="Account switch blocked: ${availability//$'\n'/ }"
+            copy_feedback_until=$((SECONDS + 5))
+            selected_instance_id=''
+            CODEX_SELECTED_INSTANCE_ID=''
+            export CODEX_SELECTED_INSTANCE_ID
+            refresh_local_frame
+            continue
+          }
           case "$availability" in
             already-active) copy_feedback='Account already active; no change' ;;
             in-use:*) copy_feedback="Account in use by ${availability#in-use:}" ;;
             available)
-              launch_detached "$HOME/.local/bin/codex-instance" switch-key "$selected_instance_id" "$launcher_account"
+              launch_instance_switch "$selected_instance_id" "$launcher_account"
               copy_feedback='Account switch started'
               ;;
             *) copy_feedback='Account state unverified; no switch' ;;
@@ -448,6 +461,23 @@ while true; do
         ;;
       i|I)
         launch_detached "$(command -v gnome-terminal)" --hide-menubar --title='Codex-instanser' -- "$HOME/.local/bin/codex-instance" menu
+        ;;
+      o|O|t|T)
+        if [[ -n $selected_instance_id ]]; then
+          instance_action=open
+          if [[ $key == t || $key == T ]]; then instance_action=stop; fi
+          if action_result=$("$HOME/.local/bin/codex-instance" "$instance_action" "$selected_instance_id" 2>&1); then
+            copy_feedback=${action_result//$'\n'/ }
+            selected_instance_id=''
+            CODEX_SELECTED_INSTANCE_ID=''
+            export CODEX_SELECTED_INSTANCE_ID
+          else
+            copy_feedback="Instance ${instance_action} failed: ${action_result//$'\n'/ }"
+          fi
+          copy_feedback_until=$((SECONDS + 5))
+          refresh_local_frame
+          last_drawn_input=''
+        fi
         ;;
       r|R)
         if printf '%s\n' "$base_frame" | grep -Fq 'Press [R] to repair authentication'; then

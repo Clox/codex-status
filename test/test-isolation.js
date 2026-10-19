@@ -14,6 +14,7 @@ function install() {
     process.env[name] = path.join(root, relative);
   }
   process.env.CODEX_STATUS_TEST_ROOT = root;
+  delete process.env.CODEX_SELECTED_INSTANCE_ID;
   process.on('exit', () => fs.rmSync(root, { recursive: true, force: true }));
 }
 

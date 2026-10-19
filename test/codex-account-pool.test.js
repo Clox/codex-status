@@ -10,7 +10,7 @@ const { locations, createInstance, readRegistry: readInstances } = require('../l
 const { DESKTOP } = require('../lib/codex-instances');
 const { poolPaths, readPool, migrateDefault, instanceActive, provisionAccount,
   updateCredential, acquireAccountLock, snapshotPath, digest,
-  deleteInstanceWithAccounts, readProvisioned, writeProvisioned } = require('../lib/codex-account-pool');
+  deleteInstanceWithAccounts, readProvisioned, writeProvisioned, readSwitchState } = require('../lib/codex-account-pool');
 const { classify } = require('../lib/codex-operation-lock');
 
 function fixture(t) {
@@ -98,6 +98,7 @@ test('B provisions through import then switch in B home; A bytes stay unchanged 
   const calls = [];
   const options = { run: fakeAuthCalls(calls), processSnapshot: [] };
   await assert.rejects(provisionAccount('rosetta', 'key-a', f.loc, f.env, options), /ACCOUNT_IN_USE_BY:Spadrig/);
+  assert.equal(readSwitchState(f.loc).errorKind, 'ACCOUNT_IN_USE_BY:Spadrig');
   assert.equal(calls.length, 0);
   const result = await provisionAccount('rosetta', 'key-b', f.loc, f.env, options);
   assert.equal(result.unchanged, false);

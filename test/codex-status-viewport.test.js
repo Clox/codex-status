@@ -47,6 +47,50 @@ test('instance section follows the account list and scrolls without changing acc
   assert.match(rendered.lines.map(plain).join('\n'), /Spadrig · running/);
 });
 
+test('instances precede accounts in the pinned viewport at normal and narrow widths', () => {
+  const input = [
+    '\x1b[1;36mINSTANCES:\x1b[0m',
+    '1  Spadrig · marko@example.test · running',
+    '2  Rosetta · ogggan@example.test · stopped',
+    '',
+    '\x1b[1;36mACCOUNTS:\x1b[0m',
+    'ACCOUNT │ STATUS', '────────┼───────', 'account-a │ OK', 'account-b │ EXHAU',
+    '',
+    'ACTIVE CODEX TURNS:',
+    ...Array.from({ length: 20 }, (_, index) => `active-${index}`),
+    '',
+    '\x1b[1;35mAUTO: OFF\x1b[0m',
+  ].join('\n');
+  const parts = splitStatusFrame(input);
+  assert.equal(plain(parts.instances[0]), 'INSTANCES:');
+  assert.equal(plain(parts.table[0]), 'ACCOUNTS:');
+  assert.equal(parts.table[1], 'ACCOUNT │ STATUS');
+  for (const columns of [60, 77, 79]) {
+    const first = layoutStatusFrame(input, { rows: 13, columns });
+    const shown = first.lines.map(plain).join('\n');
+    assert.match(shown, /^INSTANCES:\n1  Spadrig/);
+    assert.ok(shown.indexOf('Rosetta') < shown.indexOf('ACCOUNTS:'));
+    assert.ok(shown.indexOf('ACCOUNTS:') < shown.indexOf('ACCOUNT │ STATUS'));
+    assert.match(shown, /AUTO: OFF/);
+    assert.ok(serializeStatusFrame(first).split('\n').slice(1).length <= 13);
+    assert.ok(first.below > 0);
+    const scrolled = layoutStatusFrame(input, { rows: 13, columns, offset: 999 });
+    assert.match(scrolled.lines.map(plain).join('\n'), /active-19/);
+  }
+});
+
+test('selected-instance account prompt remains visible after the account table', () => {
+  const input = [
+    'INSTANCES:', '1  Spadrig · running', '2  Rosetta · stopped', '',
+    'ACCOUNTS:', 'ACCOUNT │ STATUS', '────────┼───────', 'account-a │ OK', '',
+    'Selected instance: Rosetta',
+    'Choose account [1-4] · [O] Open/focus · [T] Stop · Esc cancel', '',
+    'AUTO: OFF',
+  ].join('\n');
+  const lines = layoutStatusFrame(input, { rows: 16, columns: 77 }).lines.map(plain).join('\n');
+  assert.match(lines, /INSTANCES:[\s\S]*ACCOUNTS:[\s\S]*Selected instance: Rosetta\nChoose account \[1-4\] · \[O\] Open\/focus · \[T\] Stop · Esc cancel/);
+});
+
 test('small terminal pins table, legacy recommendation, AUTO and help while scrolling crowded middle', () => {
   const rendered = layoutStatusFrame(frame(), { rows: 13 });
   const lines = rendered.lines.map(plain);
@@ -261,7 +305,7 @@ test('ANSI and wide text consume physical rows before middle scroll is chosen', 
   assert.notEqual(narrow.offset, wide.offset);
 });
 
-test('four-account table stays exactly six physical rows at 77, 78 and 79 columns', t => {
+test('four-account table and its label stay seven physical rows at 77, 78 and 79 columns', t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-table-viewport-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const home = path.join(root, 'codex');
@@ -298,10 +342,12 @@ test('four-account table stays exactly six physical rows at 77, 78 and 79 column
     assert.equal(result.status, 0, fs.readFileSync(errorFile, 'utf8') || result.error?.message);
     const annotated = fs.readFileSync(outputFile, 'utf8');
     const sections = splitStatusFrame(annotated);
-    assert.equal(sections.table.length, 6);
+    assert.equal(sections.table.length, 7);
     const layout = layoutStatusFrame(annotated, { rows: 24, columns });
     assert.equal(physicalFrameHeight(layout, columns), 24);
-    const table = layout.lines.slice(0, 6).map(plain);
+    const accountStart = layout.lines.findIndex(line => plain(line) === 'ACCOUNTS:');
+    assert.ok(accountStart > 0);
+    const table = layout.lines.slice(accountStart + 1, accountStart + 7).map(plain);
     assert.match(table[0], /ACCOUNT.*STATU.*RESETS.*5H USAGE.*WEEKLY USAGE.*PRIOR.*ACTIVITY/);
     assert.match(table[1], /┼/);
     for (let index = 0; index < 4; index++) {
