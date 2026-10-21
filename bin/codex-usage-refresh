@@ -5,6 +5,8 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { locations } = require(path.join(__dirname, '..', 'lib', 'codex-instances'));
+const { readPool, poolPaths, snapshotPath } = require(path.join(__dirname, '..', 'lib', 'codex-account-pool'));
 const {
   CACHE_VERSION,
   DEFAULT_POLL_INTERVAL_MS,
@@ -52,6 +54,20 @@ function credentialsByAccountId() {
       }
     } catch {
       // A concurrent credential update is retried at the next scheduled refresh.
+    }
+  }
+  if (process.env.CODEX_USAGE_CREDENTIAL_SOURCE !== 'local') {
+    const loc = locations();
+    const pool = readPool(loc);
+    if (pool) {
+      const paths = poolPaths(loc);
+      for (const member of pool.accounts) {
+        const auth = readJson(snapshotPath(paths, member.accountKey, member.generation));
+        if (auth?.tokens?.account_id !== member.accountId || !auth?.tokens?.access_token) {
+          throw new Error('POOL_USAGE_CREDENTIAL_UNVERIFIED');
+        }
+        credentials.set(member.accountId, auth.tokens.access_token);
+      }
     }
   }
   return credentials;

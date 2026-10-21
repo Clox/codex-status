@@ -2,7 +2,6 @@
 
 'use strict';
 
-const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -16,22 +15,17 @@ const {
   accountId,
   accountsFromRegistry,
   repairableAccounts,
-  validateInactivePrecondition,
-  validatePostImport,
   validateStagedIdentity,
 } = require(path.join(__dirname, '..', 'lib', 'codex-auth-repair'));
 const { acquireOperationLock } = require(path.join(__dirname, '..', 'lib', 'codex-operation-lock'));
-const { locations: instanceLocations, readRegistry: readInstances } = require(path.join(__dirname, '..', 'lib', 'codex-instances'));
-const { poolPaths, migrateDefault, readPool, assignments, acquireAccountLock,
+const { locations: instanceLocations } = require(path.join(__dirname, '..', 'lib', 'codex-instances'));
+const { poolPaths, migrateDefault, readPool, acquireAccountLock,
   updateCredentialLocked } = require(path.join(__dirname, '..', 'lib', 'codex-account-pool'));
 
-const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
 const codexAuthBin = process.env.CODEX_AUTH_BIN || 'codex-auth';
 const usageRefresher = process.env.USAGE_REFRESHER || path.join(os.homedir(), '.local', 'bin', 'codex-usage-refresh');
 const usageCachePath = process.env.USAGE_CACHE || path.join(os.homedir(), '.cache', 'codex-account-switcher', 'usage.json');
 const codexLoginBin = process.env.CODEX_LOGIN_BIN || '/usr/lib/chatgpt/resources/codex';
-const registryPath = path.join(codexHome, 'accounts', 'registry.json');
-const globalAuthPath = path.join(codexHome, 'auth.json');
 const operationLockPath = process.env.CODEX_OPERATION_LOCK_DIR || path.join(path.dirname(usageCachePath), 'exclusive-codex-operation.lock');
 const activationLockDirectory = path.join(path.dirname(usageCachePath), 'activation-locks');
 
@@ -43,48 +37,6 @@ function fail(message, code = 1) {
 
 function readJson(filename) {
   return JSON.parse(fs.readFileSync(filename, 'utf8'));
-}
-
-function hashFile(filename) {
-  return crypto.createHash('sha256').update(fs.readFileSync(filename)).digest('hex');
-}
-
-function atomicRestore(source, destination) {
-  const temporary = `${destination}.repair-${process.pid}.tmp`;
-  fs.copyFileSync(source, temporary);
-  fs.chmodSync(temporary, 0o600);
-  fs.renameSync(temporary, destination);
-}
-
-function snapshotFiles(home) {
-  const directory = path.join(home, 'accounts');
-  return fs.readdirSync(directory)
-    .filter(name => name.endsWith('.auth.json'))
-    .map(name => path.join(directory, name));
-}
-
-function findSnapshot(home, wantedAccountId) {
-  const matches = snapshotFiles(home).filter(filename => {
-    try {
-      return readJson(filename)?.tokens?.account_id === wantedAccountId;
-    } catch {
-      return false;
-    }
-  });
-  if (matches.length !== 1) fail(`Expected exactly one managed snapshot for the selected account; found ${matches.length}.`);
-  return matches[0];
-}
-
-function snapshotHashes(home) {
-  return new Map(snapshotFiles(home).map(filename => [path.basename(filename), hashFile(filename)]));
-}
-
-function assertOtherSnapshotsUnchanged(before, after, targetBasename) {
-  const names = new Set([...before.keys(), ...after.keys()]);
-  for (const name of names) {
-    if (name === targetBasename) continue;
-    if (before.get(name) !== after.get(name)) fail(`Another account snapshot changed unexpectedly: ${name}`);
-  }
 }
 
 function run(command, args, options = {}) {
@@ -150,22 +102,15 @@ async function main() {
   const poolLoc = instanceLocations();
   migrateDefault(poolLoc);
   let stagingRoot = null;
-  let rollbackRoot = null;
-  let mutationStarted = false;
-  let targetSnapshot = null;
-  let backupTarget = null;
-  let backupRegistry = null;
-  let backupGlobal = null;
-  let backupUsage = null;
-  let backupSnapshotsDirectory = null;
-  let beforeSnapshotHashes = null;
   let accountActivationLock = null;
 
   try {
-    const beforeRegistry = readJson(registryPath);
-    const beforeGlobalAuth = readJson(globalAuthPath);
     const usageCache = readJson(usageCachePath);
-    const candidates = repairableAccounts(beforeRegistry, usageCache);
+    const poolBeforeSelection = readPool(poolLoc);
+    const candidates = repairableAccounts({ accounts: poolBeforeSelection.accounts.map(member => ({
+      account_key: member.accountKey, chatgpt_account_id: member.accountId,
+      email: member.email, alias: member.alias,
+    })) }, usageCache);
     if (candidates.length === 0) fail('No account currently has a repairable authentication error.', 2);
     const target = await chooseTarget(candidates);
     releasePoolAssignment = acquireOperationLock(poolPaths(poolLoc).assignmentLock);
@@ -174,16 +119,8 @@ async function main() {
     if (!pool?.accounts.some(value => value.accountKey === target.account_key && value.accountId === accountId(target))) {
       fail('The selected account is not in the verified shared pool.', 3);
     }
-    const holder = assignments(readInstances(poolLoc), pool).find(value =>
-      value.active?.accountKey === target.account_key);
-    if (holder) fail(`The selected account is active in ${holder.instance.displayName}; switch it away before repair.`, 3);
-    const precondition = validateInactivePrecondition({ target, registry: beforeRegistry, globalAuth: beforeGlobalAuth });
-    if (!precondition.ok) {
-      if (precondition.errors.includes('target-is-active')) {
-        fail('The broken account is active. Switch to a different VERIFIED account first, then retry repair. Desktop and global auth were not changed.', 3);
-      }
-      fail(`Global auth/registry precondition failed: ${precondition.errors.join(', ')}`, 3);
-    }
+    const poolMember = pool.accounts.find(value => value.accountKey === target.account_key);
+    if (poolMember.accountId !== accountId(target)) fail('Pool identity changed during repair.', 3);
     accountActivationLock = acquireAccountActivationLock(activationLockDirectory, accountId(target));
 
     const targetLabel = target.email || target.alias || target.account_key;
@@ -221,95 +158,39 @@ async function main() {
       env: {
         ...process.env,
         CODEX_HOME: stagingRoot,
+        CODEX_USAGE_CREDENTIAL_SOURCE: 'local',
         USAGE_CACHE: stagedUsageCache,
         USAGE_REFRESH_INTERVAL_MS: '0',
       },
     });
     verifyFreshUsage(stagedUsageCache, accountId(target));
 
-    targetSnapshot = findSnapshot(codexHome, accountId(target));
-    beforeSnapshotHashes = snapshotHashes(codexHome);
-    rollbackRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-auth-repair-rollback-'));
-    fs.chmodSync(rollbackRoot, 0o700);
-    backupSnapshotsDirectory = path.join(rollbackRoot, 'snapshots');
-    fs.mkdirSync(backupSnapshotsDirectory, { mode: 0o700 });
-    backupTarget = path.join(rollbackRoot, 'target.auth.json');
-    backupRegistry = path.join(rollbackRoot, 'registry.json');
-    backupGlobal = path.join(rollbackRoot, 'global-auth.json');
-    backupUsage = path.join(rollbackRoot, 'usage.json');
-    fs.copyFileSync(targetSnapshot, backupTarget);
-    fs.copyFileSync(registryPath, backupRegistry);
-    fs.copyFileSync(globalAuthPath, backupGlobal);
-    if (fs.existsSync(usageCachePath)) fs.copyFileSync(usageCachePath, backupUsage);
-    for (const filename of snapshotFiles(codexHome)) {
-      const backup = path.join(backupSnapshotsDirectory, path.basename(filename));
-      fs.copyFileSync(filename, backup);
-      fs.chmodSync(backup, 0o600);
+    // codex-auth chooses its own snapshot basename; identify by account ID.
+    const stagedMatches = fs.readdirSync(path.join(stagingRoot, 'accounts'))
+      .filter(name => name.endsWith('.auth.json'))
+      .map(name => path.join(stagingRoot, 'accounts', name))
+      .filter(filename => readJson(filename)?.tokens?.account_id === accountId(target));
+    if (stagedMatches.length !== 1 || !fs.existsSync(path.join(stagingRoot, 'auth.json'))) {
+      fail('Verified login did not produce exactly one account snapshot.', 5);
     }
-    for (const filename of [backupTarget, backupRegistry, backupGlobal, ...(fs.existsSync(backupUsage) ? [backupUsage] : [])]) {
-      fs.chmodSync(filename, 0o600);
+    updateCredentialLocked(target.account_key, stagedMatches[0], poolLoc, { verified: true });
+    // Refresh the shared status from pool credentials. A transient usage error
+    // does not roll back a credential already server-verified in staging.
+    const refreshed = spawnSync(usageRefresher, [], {
+      env: { ...process.env, CODEX_USAGE_CREDENTIAL_SOURCE: 'pool',
+        USAGE_CACHE: usageCachePath, USAGE_REFRESH_INTERVAL_MS: '-1' },
+      stdio: 'ignore', timeout: 60000,
+    });
+    if (refreshed.error || refreshed.status !== 0) {
+      process.stderr.write('Pool credential was saved, but status usage refresh will retry later.\n');
     }
-
-    mutationStarted = true;
-    const importArgs = ['import', path.join(stagingRoot, 'auth.json')];
-    if (target.alias) importArgs.push('--alias', target.alias);
-    run(codexAuthBin, importArgs, { env: { ...process.env, CODEX_HOME: codexHome } });
-
-    const afterRegistry = readJson(registryPath);
-    const afterGlobalAuth = readJson(globalAuthPath);
-    const afterTargetSnapshot = findSnapshot(codexHome, accountId(target));
-    const afterTargetAuth = readJson(afterTargetSnapshot);
-    const postcondition = validatePostImport({
-      target,
-      beforeRegistry,
-      beforeGlobalAuth,
-      afterRegistry,
-      afterGlobalAuth,
-      afterTargetAuth,
-    });
-    if (!postcondition.ok) fail(`Repair postcondition failed: ${postcondition.errors.join(', ')}`, 5);
-    if (hashFile(globalAuthPath) !== hashFile(backupGlobal)) fail('Global auth changed during inactive-account repair.', 5);
-    assertOtherSnapshotsUnchanged(beforeSnapshotHashes, snapshotHashes(codexHome), path.basename(targetSnapshot));
-
-    run(usageRefresher, [], {
-      env: {
-        ...process.env,
-        CODEX_HOME: codexHome,
-        USAGE_CACHE: usageCachePath,
-        USAGE_REFRESH_INTERVAL_MS: '0',
-      },
-    });
-    verifyFreshUsage(usageCachePath, accountId(target));
-    updateCredentialLocked(target.account_key, afterTargetSnapshot, poolLoc, { verified: true });
-    mutationStarted = false;
     process.stdout.write(`\nAuthentication repaired and server-verified for ${targetLabel}.\n`);
-    process.stdout.write('Desktop remained on the previously active account. The status window will update automatically.\n');
+    process.stdout.write('The pool was updated. Running Desktop credentials were not changed; apply the update per instance when safe.\n');
   } catch (error) {
-    if (mutationStarted && targetSnapshot && backupTarget && backupRegistry && backupGlobal) {
-      try {
-        if (backupSnapshotsDirectory && beforeSnapshotHashes) {
-          for (const filename of snapshotFiles(codexHome)) {
-            if (!beforeSnapshotHashes.has(path.basename(filename))) fs.unlinkSync(filename);
-          }
-          for (const name of beforeSnapshotHashes.keys()) {
-            atomicRestore(path.join(backupSnapshotsDirectory, name), path.join(codexHome, 'accounts', name));
-          }
-        } else {
-          atomicRestore(backupTarget, targetSnapshot);
-        }
-        atomicRestore(backupRegistry, registryPath);
-        atomicRestore(backupGlobal, globalAuthPath);
-        if (backupUsage && fs.existsSync(backupUsage)) atomicRestore(backupUsage, usageCachePath);
-        process.stderr.write('Repair failed after staging; previous auth, registry, and usage error state were restored.\n');
-      } catch {
-        process.stderr.write('CRITICAL: automatic rollback could not be completed. Do not start or switch Desktop accounts until state is inspected.\n');
-      }
-    }
     process.stderr.write(`Authentication repair did not complete: ${error.message}\n`);
     process.exitCode = error.exitCode || 1;
   } finally {
     if (stagingRoot) fs.rmSync(stagingRoot, { recursive: true, force: true });
-    if (rollbackRoot) fs.rmSync(rollbackRoot, { recursive: true, force: true });
     releaseAccountActivationLock(accountActivationLock);
     cleanupOperation();
   }

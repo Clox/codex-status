@@ -116,6 +116,15 @@ from the pool is held back from another instance until repair or a future
 verified refresh handoff updates the pool. Auth repair updates the pool only
 after server verification and increments the generation; older provisioned
 copies are marked for reprovisioning rather than changed silently.
+The account table reports authentication for the pool's latest snapshot;
+the instance list separately reports `credentials stale` when a local copy
+is older. `[R]` can repair an account while it is active in an instance.
+The repair leaves that instance's live auth untouched. Use `[I]` → `[P]`
+or `codex-instance apply-credentials rosetta` to import and activate the
+latest snapshot for the same account. A running instance is restarted only
+when its own turn observer verifies that no turns are active. Secondary
+instances without an observer must be stopped explicitly before applying;
+the command never stops them on an unverified turn state.
 
 Secondary instances still do not have status collectors, observers or
 AUTO/HEADLESS schedulers. The existing account and AUTO flows belong to

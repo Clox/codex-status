@@ -62,7 +62,7 @@ const { displaySwitchState, readSwitchState } = require(path.join(__dirname, '..
 const { autoDisplayPlan } = require(path.join(__dirname, '..', 'lib', 'codex-auto-display'));
 const { readRegistry: readInstanceRegistry, runningInstances, locations: instanceLocations } =
   require(path.join(__dirname, '..', 'lib', 'codex-instances'));
-const { readPool, instanceActive, readProvisioned, readSwitchState: readPoolSwitchState } =
+const { readPool, instanceActive, readProvisioned, activeCredentialState, readSwitchState: readPoolSwitchState } =
   require(path.join(__dirname, '..', 'lib', 'codex-account-pool'));
 const {
   tableCell,
@@ -551,7 +551,10 @@ try {
           const expected = pool?.accounts.find(item => item.accountKey === key)?.generation;
           return value.stale === true || (expected && value.generation < expected);
         });
-      const stale = staleEntries.length ? ` · ${staleEntries.length} credential${staleEntries.length === 1 ? '' : 's'} stale` : '';
+      const activeStale = pool && active && active.accountKey !== 'unverified' &&
+        activeCredentialState(instance, active, pool, loc).stale;
+      const stale = activeStale ? ' · credentials stale (I → P to apply)' :
+        staleEntries.length ? ` · ${staleEntries.length} credential${staleEntries.length === 1 ? '' : 's'} stale` : '';
       const turns = instance.instanceId === 'default' && activeTurns.length ? ` · ${activeTurns.length} turns` : '';
       return `${index + 1}  ${instance.displayName} · ${account} · ${instance.roots.length ? 'running' : 'stopped'}${turns}${stale}` +
         `${instance.enabled ? '' : ' · disabled'}`;

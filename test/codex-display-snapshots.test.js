@@ -13,6 +13,7 @@ const { formatInterruptedCandidate, partitionInterruptedCandidates } =
   require('../lib/codex-interrupted-label');
 const { turnKey } = require('../lib/codex-turn-observer');
 const { locations, createInstance } = require('../lib/codex-instances');
+const { migrateDefault, updateCredential } = require('../lib/codex-account-pool');
 
 const THREAD = '01a0e2d5-e5e2-74e1-9ad1-3194bda82e93';
 const TURN = '01a0e463-9851-7ed2-9c87-52290cf748a9';
@@ -172,6 +173,19 @@ test('account rows mark every instance-active account in bold and leave unused a
   assert.match(plain(two[2]), /^ 03 /);
   assert.doesNotMatch(two[2], /^\x1b\[1m/);
   assert.match(renderStatus(root, env, inputFile).stdout, /Rosetta · key-b · stopped/);
+  for (const account of accounts) fs.writeFileSync(path.join(home, 'accounts',
+    `${account.chatgpt_account_id}.auth.json`), JSON.stringify({ tokens: {
+    account_id: account.chatgpt_account_id, access_token: 'old',
+  } }));
+  fs.writeFileSync(path.join(b.codexHome, 'accounts', 'account-b.auth.json'),
+    fs.readFileSync(path.join(home, 'accounts', 'account-b.auth.json')));
+  const loc = locations(env);
+  migrateDefault(loc, env);
+  const updated = path.join(root, 'updated-b.auth.json');
+  fs.writeFileSync(updated, JSON.stringify({ tokens: { account_id: 'account-b', access_token: 'new' } }));
+  updateCredential('key-b', updated, loc, { verified: true });
+  assert.match(renderStatus(root, env, inputFile).stdout,
+    /Rosetta · b@example\.test · stopped · credentials stale \(I → P to apply\)/);
 });
 
 test('observer captures candidate display metadata at creation and preserves it after sources disappear', t => {

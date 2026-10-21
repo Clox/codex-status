@@ -11,7 +11,7 @@ const { DESKTOP } = require('../lib/codex-instances');
 const { poolPaths, readPool, migrateDefault, instanceActive, provisionAccount,
   updateCredential, acquireAccountLock, snapshotPath, digest,
   deleteInstanceWithAccounts, readProvisioned, writeProvisioned, readSwitchState,
-  assertCredentialAvailable } = require('../lib/codex-account-pool');
+  assertCredentialAvailable, activeCredentialState, reprovisionActive } = require('../lib/codex-account-pool');
 const { classify } = require('../lib/codex-operation-lock');
 
 function fixture(t) {
@@ -48,7 +48,9 @@ function fakeAuthCalls(calls) {
       const auth = JSON.parse(fs.readFileSync(args[1], 'utf8'));
       const id = auth.tokens.account_id;
       const key = id === 'account-b' ? 'key-b' : 'key-a';
-      fs.copyFileSync(args[1], path.join(dir, `${id}.auth.json`));
+      const existing = fs.readdirSync(dir).filter(name => name.endsWith('.auth.json'))
+        .find(name => JSON.parse(fs.readFileSync(path.join(dir, name))).tokens.account_id === id);
+      fs.copyFileSync(args[1], path.join(dir, existing || `${id}.auth.json`));
       const prior = fs.existsSync(path.join(dir, 'registry.json'))
         ? JSON.parse(fs.readFileSync(path.join(dir, 'registry.json'))) : { active_account_key: null, accounts: [] };
       if (!prior.accounts.some(value => value.account_key === key)) prior.accounts.push({
@@ -61,7 +63,9 @@ function fakeAuthCalls(calls) {
       if (!account) throw new Error('FAKE_SELECTOR_MISMATCH');
       registry.active_account_key = account.account_key;
       fs.writeFileSync(registryPath, JSON.stringify(registry));
-      fs.copyFileSync(path.join(dir, `${account.chatgpt_account_id}.auth.json`), path.join(home, 'auth.json'));
+      const snapshot = fs.readdirSync(dir).filter(name => name.endsWith('.auth.json'))
+        .find(name => JSON.parse(fs.readFileSync(path.join(dir, name))).tokens.account_id === account.chatgpt_account_id);
+      fs.copyFileSync(path.join(dir, snapshot), path.join(home, 'auth.json'));
     } else throw new Error('UNEXPECTED_AUTH_COMMAND');
     return { status: 0 };
   };
@@ -195,6 +199,111 @@ test('failed B switch restores B auth files and does not touch A', async t => {
   assert.equal(fs.existsSync(path.join(b.codexHome, 'accounts', 'registry.json')), false);
   assert.deepEqual(readProvisioned(f.loc).instances, {});
   assert.equal(digest(fs.readFileSync(path.join(f.home, 'auth.json'))), beforeA);
+});
+
+test('same-account reprovision applies the new generation only to selected stopped B', async t => {
+  const f = fixture(t);
+  migrateDefault(f.loc, f.env);
+  const b = createInstance('rosetta', 'Rosetta', f.loc, f.env);
+  await provisionAccount('rosetta', 'key-b', f.loc, f.env, {
+    run: fakeAuthCalls([]), processSnapshot: [],
+  });
+  const aBefore = ['auth.json', 'accounts/registry.json', 'accounts/0.auth.json', 'accounts/1.auth.json']
+    .map(name => digest(fs.readFileSync(path.join(f.home, name))));
+  const bBefore = fs.readFileSync(path.join(b.codexHome, 'auth.json'));
+  const updated = path.join(f.root, 'new-b.auth.json');
+  fs.writeFileSync(updated, JSON.stringify({ auth_mode: 'chatgpt', tokens: {
+    account_id: 'account-b', access_token: 'new-synthetic' } }));
+  assert.equal(updateCredential('key-b', updated, f.loc, { verified: true }).generation, 2);
+  assert.deepEqual(fs.readFileSync(path.join(b.codexHome, 'auth.json')), bBefore);
+  assert.equal(activeCredentialState(b, instanceActive(b, readPool(f.loc)), readPool(f.loc), f.loc).stale, true);
+  const calls = [];
+  const result = await reprovisionActive('rosetta', f.loc, f.env, {
+    run: fakeAuthCalls(calls), processSnapshot: [],
+  });
+  assert.equal(result.unchanged, false);
+  assert.deepEqual(calls.map(value => value.args[0]), ['import', 'switch']);
+  assert.ok(calls.every(value => value.home === b.codexHome));
+  assert.equal(readProvisioned(f.loc).instances.rosetta['key-b'].generation, 2);
+  assert.equal(activeCredentialState(b, instanceActive(b, readPool(f.loc)), readPool(f.loc), f.loc).stale, false);
+  assert.deepEqual(['auth.json', 'accounts/registry.json', 'accounts/0.auth.json', 'accounts/1.auth.json']
+    .map(name => digest(fs.readFileSync(path.join(f.home, name)))), aBefore);
+});
+
+test('default same-account reprovision uses import and switch without selecting another account', async t => {
+  const f = fixture(t);
+  migrateDefault(f.loc, f.env);
+  const oldB = fs.readFileSync(path.join(f.home, 'accounts', '1.auth.json'));
+  const updated = path.join(f.root, 'new-a.auth.json');
+  fs.writeFileSync(updated, JSON.stringify({ auth_mode: 'chatgpt', tokens: {
+    account_id: 'account-a', access_token: 'new-a' } }));
+  updateCredential('key-a', updated, f.loc, { verified: true });
+  const calls = [];
+  const result = await reprovisionActive('default', f.loc, f.env, {
+    run: fakeAuthCalls(calls), processSnapshot: [],
+  });
+  assert.equal(result.unchanged, false);
+  assert.deepEqual(calls.map(call => call.args[0]), ['import', 'switch']);
+  assert.ok(calls.every(call => call.home === f.home));
+  assert.equal(readProvisioned(f.loc).instances.default['key-a'].generation, 2);
+  assert.deepEqual(fs.readFileSync(path.join(f.home, 'accounts', '1.auth.json')), oldB);
+});
+
+test('running reprovision refuses active turns and leaves both instances untouched', async t => {
+  const f = fixture(t);
+  migrateDefault(f.loc, f.env);
+  const b = createInstance('rosetta', 'Rosetta', f.loc, f.env);
+  await provisionAccount('rosetta', 'key-b', f.loc, f.env, { run: fakeAuthCalls([]), processSnapshot: [] });
+  const updated = path.join(f.root, 'new-b.auth.json');
+  fs.writeFileSync(updated, JSON.stringify({ tokens: { account_id: 'account-b', access_token: 'new' } }));
+  updateCredential('key-b', updated, f.loc, { verified: true });
+  const beforeA = fs.readFileSync(path.join(f.home, 'auth.json'));
+  const beforeB = fs.readFileSync(path.join(b.codexHome, 'auth.json'));
+  const entries = [{ pid: 20, ppid: 1, startTicks: '20', exe: DESKTOP,
+    cmdline: `${DESKTOP} --user-data-dir=${b.desktopProfile}`, env: { CODEX_HOME: b.codexHome } }];
+  fs.mkdirSync(b.runtime, { recursive: true });
+  fs.writeFileSync(path.join(b.runtime, 'turn-events.json'), JSON.stringify({
+    worker: { heartbeatAtMs: Date.now() }, activeTurns: { turn: { threadId: 'thread-b' } },
+  }));
+  let stopped = false;
+  await assert.rejects(reprovisionActive('rosetta', f.loc, f.env, {
+    processSnapshot: entries,
+    stop: async () => { stopped = true; }, run: fakeAuthCalls([]),
+  }), /INSTANCE_ACTIVE_TURNS:Rosetta/);
+  assert.equal(stopped, false);
+  assert.deepEqual(fs.readFileSync(path.join(f.home, 'auth.json')), beforeA);
+  assert.deepEqual(fs.readFileSync(path.join(b.codexHome, 'auth.json')), beforeB);
+});
+
+test('running same-account reprovision restarts only the verified selected instance', async t => {
+  const f = fixture(t);
+  migrateDefault(f.loc, f.env);
+  const b = createInstance('rosetta', 'Rosetta', f.loc, f.env);
+  await provisionAccount('rosetta', 'key-b', f.loc, f.env, { run: fakeAuthCalls([]), processSnapshot: [] });
+  const updated = path.join(f.root, 'new-b.auth.json');
+  fs.writeFileSync(updated, JSON.stringify({ auth_mode: 'chatgpt', tokens: {
+    account_id: 'account-b', access_token: 'new-synthetic' } }));
+  updateCredential('key-b', updated, f.loc, { verified: true });
+  fs.mkdirSync(b.runtime, { recursive: true });
+  fs.writeFileSync(path.join(b.runtime, 'turn-events.json'), JSON.stringify({
+    worker: { heartbeatAtMs: Date.now() }, activeTurns: {},
+  }));
+  const a = readInstances(f.loc, f.env).instances[0];
+  const entries = [a, b].map((record, index) => ({ pid: 10 + index, ppid: 1,
+    startTicks: String(10 + index), exe: DESKTOP,
+    cmdline: `${DESKTOP} --user-data-dir=${record.desktopProfile}`, env: { CODEX_HOME: record.codexHome } }));
+  const operations = [];
+  const beforeA = fs.readFileSync(path.join(f.home, 'auth.json'));
+  await reprovisionActive('rosetta', f.loc, f.env, {
+    processSnapshot: entries, run: fakeAuthCalls(operations),
+    stop: async id => { operations.push({ stop: id }); },
+    start: id => { operations.push({ start: id }); return { record: b }; },
+    wait: async record => { assert.equal(record.instanceId, 'rosetta'); },
+  });
+  assert.deepEqual(operations.filter(value => value.stop || value.start),
+    [{ stop: 'rosetta' }, { start: 'rosetta' }]);
+  assert.deepEqual(fs.readFileSync(path.join(f.home, 'auth.json')), beforeA);
+  assert.equal(readProvisioned(f.loc).instances.rosetta['key-b'].generation, 2);
 });
 
 test('per-account operation lock excludes peers, heals stale ownership, and generation advances only after verified update', t => {
