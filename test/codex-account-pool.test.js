@@ -10,7 +10,8 @@ const { locations, createInstance, readRegistry: readInstances } = require('../l
 const { DESKTOP } = require('../lib/codex-instances');
 const { poolPaths, readPool, migrateDefault, instanceActive, provisionAccount,
   updateCredential, acquireAccountLock, snapshotPath, digest,
-  deleteInstanceWithAccounts, readProvisioned, writeProvisioned, readSwitchState } = require('../lib/codex-account-pool');
+  deleteInstanceWithAccounts, readProvisioned, writeProvisioned, readSwitchState,
+  assertCredentialAvailable } = require('../lib/codex-account-pool');
 const { classify } = require('../lib/codex-operation-lock');
 
 function fixture(t) {
@@ -111,6 +112,48 @@ test('B provisions through import then switch in B home; A bytes stay unchanged 
   const again = await provisionAccount('rosetta', 'key-b', f.loc, f.env, options);
   assert.equal(again.unchanged, true);
   assert.equal(calls.length, 2);
+});
+
+test('default can select its current pool snapshot despite B stale inactive copy', t => {
+  const f = fixture(t);
+  const registryPath = path.join(f.home, 'accounts', 'registry.json');
+  const registry = JSON.parse(fs.readFileSync(registryPath));
+  registry.accounts.push({ account_key: 'key-c', chatgpt_account_id: 'account-c',
+    email: 'c@example.test' });
+  fs.writeFileSync(registryPath, JSON.stringify(registry));
+  fs.writeFileSync(path.join(f.home, 'accounts', '2.auth.json'), JSON.stringify({
+    tokens: { account_id: 'account-c', access_token: 'synthetic-c' },
+  }));
+  migrateDefault(f.loc, f.env);
+  const b = createInstance('rosetta', 'Rosetta', f.loc, f.env);
+  fs.mkdirSync(path.join(b.codexHome, 'accounts'), { recursive: true });
+  fs.copyFileSync(path.join(f.home, 'accounts', '1.auth.json'),
+    path.join(b.codexHome, 'accounts', 'b.auth.json'));
+  fs.writeFileSync(path.join(b.codexHome, 'accounts', 'registry.json'), JSON.stringify({
+    active_account_key: 'key-c', accounts: [registry.accounts[2], registry.accounts[1]],
+  }));
+  fs.copyFileSync(path.join(f.home, 'accounts', '2.auth.json'), path.join(b.codexHome, 'auth.json'));
+  writeProvisioned(f.loc, { version: 1, instances: { rosetta: {
+    'key-b': { generation: 1, stale: false },
+  } } });
+  const newer = path.join(f.root, 'new-b.auth.json');
+  fs.writeFileSync(newer, JSON.stringify({ tokens: { account_id: 'account-b',
+    access_token: 'synthetic-b-updated' } }));
+  fs.copyFileSync(newer, path.join(f.home, 'accounts', '1.auth.json'));
+  updateCredential('key-b', newer, f.loc, { verified: true });
+  const pool = readPool(f.loc);
+  const instances = readInstances(f.loc, f.env);
+  assert.equal(pool.accounts.find(value => value.accountKey === 'key-b').generation, 2);
+  assert.equal(instanceActive(instances.instances[0], pool).accountKey, 'key-a');
+  assert.equal(instanceActive(b, pool).accountKey, 'key-c');
+  assert.equal(assertCredentialAvailable('key-b', 'default', instances, pool, f.loc).accountKey, 'key-b');
+  assert.throws(() => assertCredentialAvailable('key-c', 'default', instances, pool, f.loc),
+    /ACCOUNT_IN_USE_BY:Rosetta/);
+  fs.writeFileSync(path.join(f.home, 'accounts', '1.auth.json'), JSON.stringify({
+    tokens: { account_id: 'account-b', access_token: 'synthetic-b-old' },
+  }));
+  assert.throws(() => assertCredentialAvailable('key-b', 'default', instances, pool, f.loc),
+    /CREDENTIAL_REPROVISION_NEEDED:Spadrig/);
 });
 
 test('switch of a running B targets only B stop and start even when A also runs', async t => {

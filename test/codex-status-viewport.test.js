@@ -91,6 +91,19 @@ test('selected-instance account prompt remains visible after the account table',
   assert.match(lines, /INSTANCES:[\s\S]*ACCOUNTS:[\s\S]*Selected instance: Rosetta\nChoose account \[1-4\] · \[O\] Open\/focus · \[T\] Stop · Esc cancel/);
 });
 
+test('failed manual switch remains pinned below accounts on a crowded viewport', () => {
+  const input = [
+    'INSTANCES:', '1  Spadrig · running', '2  Rosetta · running', '',
+    'ACCOUNTS:', 'ACCOUNT │ STATUS', '────────┼───────', 'account-a │ OK', '',
+    'ACCOUNT SWITCH FAILED: Account switch failed (75): EXCLUSIVE_CODEX_OPERATION_IN_PROGRESS', '',
+    ...Array.from({ length: 25 }, (_, index) => `problem-${index}`),
+    'AUTO: OFF',
+  ].join('\n');
+  const layout = layoutStatusFrame(input, { rows: 14, columns: 79 });
+  assert.match(plain(layout.lines.join('\n')), /ACCOUNT SWITCH FAILED:/);
+  assert.match(plain(layout.lines.join('\n')), /AUTO: OFF/);
+});
+
 test('small terminal pins table, legacy recommendation, AUTO and help while scrolling crowded middle', () => {
   const rendered = layoutStatusFrame(frame(), { rows: 13 });
   const lines = rendered.lines.map(plain);

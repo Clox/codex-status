@@ -5,6 +5,7 @@ import os
 import pathlib
 import pty
 import select
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -121,5 +122,74 @@ try:
     assert json.loads((b_home / 'accounts' / 'registry.json').read_text())['active_account_key'] == alpha['account_key']
     assert protected_hashes() == before
     print('PASS: I → A accepts instance number 2 and provisions B without touching A')
+
+    # A uses gamma; B uses alpha and holds an older, inactive beta copy.
+    assert run([codex_auth, 'login'], {'TEST_LOGIN_NAME': 'gamma'}).returncode == 0
+    registry, by_id = state()
+    assert registry['active_account_key'] == by_id['gamma']['account_key']
+    added = run(['node', '-e',
+                 'const {addPoolAccount}=require(process.argv[1]); addPoolAccount(process.argv[2])',
+                 str(repo / 'lib' / 'codex-account-pool.js'), by_id['gamma']['account_key']])
+    assert added.returncode == 0, added.stderr
+    beta_source = next(p for p in (home / 'accounts').glob('*.auth.json')
+                       if json.loads(p.read_text())['tokens']['account_id'] == 'beta')
+    b_env = dict(env, CODEX_HOME=str(b_home), HOME=str(b_home.parent),
+                 XDG_CONFIG_HOME=str(b_home.parent / 'xdg-config'),
+                 XDG_CACHE_HOME=str(b_home.parent / 'xdg-cache'))
+    imported = subprocess.run([codex_auth, 'import', str(beta_source)], env=b_env,
+                              capture_output=True, text=True, timeout=30)
+    assert imported.returncode == 0, imported.stderr
+    assert json.loads((b_home / 'accounts' / 'registry.json').read_text())['active_account_key'] == alpha['account_key']
+    b_before = {str(p): hashlib.sha256(p.read_bytes()).hexdigest()
+                for p in [b_home / 'auth.json', b_home / 'accounts' / 'registry.json']}
+    beta_auth = json.loads(beta_source.read_text())
+    beta_auth['tokens']['access_token'] = 'synthetic-updated-generation'
+    beta_source.write_text(json.dumps(beta_auth))
+    update = run(['node', '-e',
+                  'const {updateCredential}=require(process.argv[1]); '
+                  'updateCredential(process.argv[2],process.argv[3],undefined,{verified:true})',
+                  str(repo / 'lib' / 'codex-account-pool.js'), beta['account_key'], str(beta_source)])
+    assert update.returncode == 0, update.stderr
+    pool = json.loads((root / 'config' / 'codex-status' / 'account-pool' / 'registry.json').read_text())
+    assert next(a for a in pool['accounts'] if a['accountKey'] == beta['account_key'])['generation'] == 2
+
+    beta_key = base64.urlsafe_b64encode(beta['account_key'].encode()).decode().rstrip('=')
+    available = run([manager, 'availability', 'default', beta_key])
+    assert available.returncode == 0 and available.stdout.strip() == 'available', available.stderr
+    fake_launcher = fake_dir / 'desktop-launcher'
+    fake_launcher.write_text('#!/bin/sh\ntouch "$TEST_DESKTOP_MARKER"\n')
+    fake_launcher.chmod(0o755)
+    manager_shim = fake_dir / 'instance-manager'
+    manager_shim.write_text('''#!/bin/sh
+case "$1" in
+  is-running) test -f "$TEST_DESKTOP_MARKER" ;;
+  stop) rm -f "$TEST_DESKTOP_MARKER" ;;
+  *) exec "$TEST_REAL_INSTANCE_MANAGER" "$@" ;;
+esac
+''')
+    manager_shim.chmod(0o755)
+    config = root / 'config' / 'codex-account-switcher'
+    config.mkdir(parents=True, exist_ok=True)
+    settings = {'CODEX_HOME': str(home), 'NODE_BIN_DIR': str(pathlib.Path(shutil.which('node')).parent),
+                'CODEX_AUTH_BIN': codex_auth, 'ACCOUNT_STATE_CHECKER': str(repo / 'bin' / 'codex-account-state'),
+                'ACCOUNT_SWITCH_CORE': str(repo / 'bin' / 'codex-account-switch-core'),
+                'CONTINUATION_DRAFTS': str(root / 'no-continuation'),
+                'USAGE_REFRESHER': '/bin/true', 'CHATGPT_LAUNCHER': str(fake_launcher)}
+    (config / 'accounts.conf').write_text(''.join(k + '=' + shlex.quote(v) + '\n'
+                                                 for k, v in settings.items()))
+    default_switch = run([manager, 'switch-key', 'default', beta_key], {
+        'CODEX_INSTANCE_MANAGER': str(manager_shim),
+        'TEST_REAL_INSTANCE_MANAGER': manager,
+        'TEST_DESKTOP_MARKER': str(root / 'fake-desktop-running'),
+    })
+    assert default_switch.returncode == 0, default_switch.stderr
+    assert state()[0]['active_account_key'] == beta['account_key']
+    assert json.loads((home / 'auth.json').read_text())['tokens']['account_id'] == 'beta'
+    assert json.loads((b_home / 'accounts' / 'registry.json').read_text())['active_account_key'] == alpha['account_key']
+    assert {str(p): hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in [b_home / 'auth.json', b_home / 'accounts' / 'registry.json']} == b_before
+    blocked = run([manager, 'availability', 'rosetta', beta_key])
+    assert blocked.stdout.strip() == 'in-use:Spadrig'
+    print('PASS: default gamma → beta uses the manager switch path despite B stale inactive beta; B unchanged')
 finally:
     shutil.rmtree(root)

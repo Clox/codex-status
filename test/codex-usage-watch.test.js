@@ -83,14 +83,28 @@ test('status keys select an instance before an account and Esc or X cancels sele
   const keyBranch = source.slice(source.indexOf('      1|2|3|4|5|6|7|8|9)'), source.indexOf('      k|K)'));
   assert.match(keyBranch, /if \[\[ -z \$selected_instance_id \]\]; then[\s\S]*resolve-index "\$key"/);
   assert.match(keyBranch, /else[\s\S]*availability "\$selected_instance_id" "\$launcher_account"/);
-  assert.match(keyBranch, /already-active\) copy_feedback='Account already active; no change'/);
-  assert.match(keyBranch, /in-use:\*\) copy_feedback="Account in use by/);
+  assert.match(keyBranch, /already-active\) selection_error='Account already active; no change'/);
+  assert.match(keyBranch, /in-use:\*\) selection_error="Account in use by/);
   assert.match(keyBranch, /launch_instance_switch "\$selected_instance_id" "\$launcher_account"/);
   assert.match(source, /launch_instance_switch\(\)[\s\S]*codex-instance" switch-key "\$1" "\$2"/);
-  assert.match(source, /instance-switch\.log/);
+  assert.match(source, /instance-switch\.XXXXXXXX\.log/);
   assert.match(keyBranch, /Account switch blocked: \$\{availability/);
+  assert.match(keyBranch, /selection_error="Account switch blocked: \$\{availability/);
+  assert.doesNotMatch(keyBranch, /notify-send 'Codex-kontobyte stoppat'/);
+  assert.match(keyBranch, /if launch_instance_switch[\s\S]*pending_source_row=\$source_row/);
+  assert.match(keyBranch, /selected_instance_id=''[\s\S]*else\s+selection_error='Account switch could not be launched'/);
   assert.match(source, /x\|X\)[\s\S]*if \[\[ -n \$selected_instance_id \]\]; then[\s\S]*Instance selection cancelled/);
   assert.match(source, /\$'\\e'\)[\s\S]*if \[\[ \$key == \$'\\e' && -n \$selected_instance_id \]\]; then/);
+});
+
+test('detached switch completion preserves the real failure instead of silently clearing WAIT', () => {
+  const finish = source.slice(source.indexOf('finish_instance_switch() {'),
+    source.indexOf('launch_usage_refresh() {'));
+  assert.match(finish, /if wait "\$instance_switch_pid"; then[\s\S]*else[\s\S]*result=\$\?/);
+  assert.match(finish, /instance_switch_feedback="Account switch failed \(\$\{result\}\):/);
+  assert.match(finish, /CODEX_INSTANCE_SWITCH_FEEDBACK=\$instance_switch_feedback/);
+  assert.match(finish, /refresh_local_frame/);
+  assert.match(source, /\[\[ -z \$instance_switch_pid && -n \$pending_source_row/);
 });
 
 test('selected-instance O and T use shared instance commands then exit and refresh on success', () => {

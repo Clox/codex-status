@@ -41,8 +41,11 @@ async function switchAccount(id, key) {
     if (!instance) throw new Error('INSTANCE_NOT_FOUND');
     if (instanceActive(instance, pool)?.accountKey === key) return { unchanged: true };
     const result = spawnSync(path.join(__dirname, 'codex-account'), ['--key', Buffer.from(key).toString('base64url'), '--desktop'],
-      { stdio: 'inherit' });
-    if (result.error || result.status !== 0) throw new Error('DEFAULT_ACCOUNT_SWITCH_FAILED');
+      { encoding: 'utf8' });
+    if (result.error || result.status !== 0) {
+      const reason = String(result.stderr || '').trim().split('\n').filter(Boolean).at(-1) || result.error?.message || 'UNKNOWN';
+      throw new Error(`DEFAULT_ACCOUNT_SWITCH_FAILED:${reason}`);
+    }
     return { unchanged: false };
   }
   return provisionAccount(id, key, loc);

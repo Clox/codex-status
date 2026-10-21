@@ -561,7 +561,14 @@ try {
     `\x1b[1;33mSelected instance: ${selected.displayName}\x1b[0m`,
     `\x1b[1;33mChoose account [1-${Math.min(9, rankedRows.length)}] · [O] Open/focus · [T] Stop · Esc cancel\x1b[0m`,
   ];
+  const selectionError = String(process.env.CODEX_INSTANCE_SELECTION_ERROR || '')
+    .replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 180);
+  if (selected && selectionError) accountSelectionLines.push(`\x1b[1;31m${selectionError}\x1b[0m`);
 } catch (error) {
   instancesSection = `\x1b[1;31mINSTANCES: ${error.message}\x1b[0m`;
 }
-process.stdout.write(`${instancesSection}\n\n\x1b[1;36mACCOUNTS:\x1b[0m\n${output.join('\n').trimEnd()}${accountSelectionLines.length ? `\n\n${accountSelectionLines.join('\n')}` : ''}\n\n${footer}`);
+const switchFeedback = String(process.env.CODEX_INSTANCE_SWITCH_FEEDBACK || '')
+  .replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 180);
+const switchFeedbackLine = switchFeedback.startsWith('Account switch failed')
+  ? `\x1b[1;31mACCOUNT SWITCH FAILED: ${switchFeedback}\x1b[0m` : '';
+process.stdout.write(`${instancesSection}\n\n\x1b[1;36mACCOUNTS:\x1b[0m\n${output.join('\n').trimEnd()}${accountSelectionLines.length ? `\n\n${accountSelectionLines.join('\n')}` : ''}${switchFeedbackLine ? `\n\n${switchFeedbackLine}` : ''}\n\n${footer}`);

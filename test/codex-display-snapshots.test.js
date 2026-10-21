@@ -453,10 +453,22 @@ test('status shows AUTO switch progress and HEADLESS continuation without duplic
   const selectedFrame = render();
   assert.match(selectedFrame.replace(/\x1b\[[0-9;]*m/g, ''),
     /Selected instance: Spadrig\nChoose account \[1-3\] · \[O\] Open\/focus · \[T\] Stop · Esc cancel/);
+  env.CODEX_INSTANCE_SELECTION_ERROR = 'Account switch blocked: CREDENTIAL_REPROVISION_NEEDED:Spadrig';
+  const blockedFrame = render();
+  assert.match(blockedFrame.replace(/\x1b\[[0-9;]*m/g, ''),
+    /Selected instance: Spadrig\nChoose account[^\n]*\nAccount switch blocked: CREDENTIAL_REPROVISION_NEEDED:Spadrig/);
+  delete env.CODEX_INSTANCE_SELECTION_ERROR;
   assert.doesNotMatch(selectedFrame, /RECOMMENDATION:|Select instance \[1\], then account/);
   assert.match(require('../lib/codex-status-viewport').layoutStatusFrame(selectedFrame,
     { rows: 28, columns: 110 }).lines.join('\n'), /Selected instance: Spadrig/);
   delete env.CODEX_SELECTED_INSTANCE_ID;
+  env.CODEX_INSTANCE_SWITCH_FEEDBACK = 'Account switch failed (75): EXCLUSIVE_CODEX_OPERATION_IN_PROGRESS';
+  const failedFrame = render();
+  assert.match(failedFrame.replace(/\x1b\[[0-9;]*m/g, ''),
+    /ACCOUNT SWITCH FAILED: Account switch failed \(75\): EXCLUSIVE_CODEX_OPERATION_IN_PROGRESS/);
+  assert.match(require('../lib/codex-status-viewport').layoutStatusFrame(failedFrame,
+    { rows: 28, columns: 110 }).lines.join('\n'), /ACCOUNT SWITCH FAILED/);
+  delete env.CODEX_INSTANCE_SWITCH_FEEDBACK;
   fs.writeFileSync(switchFile, JSON.stringify({ source: 'manual', phase: 'switching',
     sourceAccountId: 'source', targetAccountId: 'target', updatedAtMs: Date.now() }));
   assert.match(render(), /ACCOUNT SWITCH:[\s\S]*AUTO_SPINNER source@example\.tes → target@example\.tes · switching auth/);

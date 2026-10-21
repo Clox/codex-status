@@ -127,6 +127,12 @@ base_frame=''
 raw_frame=''
 selected_instance_id=''
 export CODEX_SELECTED_INSTANCE_ID=''
+selection_error=''
+export CODEX_INSTANCE_SELECTION_ERROR=''
+instance_switch_pid=''
+instance_switch_log=''
+instance_switch_feedback=''
+export CODEX_INSTANCE_SWITCH_FEEDBACK=''
 attention_json='{"worthy":false,"observationKey":null}'
 active_source_row=''
 ui_tick=0
@@ -157,8 +163,39 @@ launch_detached() {
 }
 
 launch_instance_switch() {
-  setsid -f "$HOME/.local/bin/codex-instance" switch-key "$1" "$2" \
-    {status_lock_fd}>&- </dev/null >>"$status_runtime_dir/instance-switch.log" 2>&1
+  [[ -x $HOME/.local/bin/codex-instance ]] || return 1
+  instance_switch_log=$(mktemp "$status_runtime_dir/instance-switch.XXXXXXXX.log") || return 1
+  chmod 600 "$instance_switch_log"
+  setsid "$HOME/.local/bin/codex-instance" switch-key "$1" "$2" \
+    {status_lock_fd}>&- </dev/null >"$instance_switch_log" 2>&1 &
+  instance_switch_pid=$!
+}
+
+finish_instance_switch() {
+  [[ -n $instance_switch_pid ]] || return 0
+  kill -0 "$instance_switch_pid" 2>/dev/null && return 0
+  local result detail
+  if wait "$instance_switch_pid"; then
+    instance_switch_feedback='Account switched and verified'
+    copy_feedback=$instance_switch_feedback
+    copy_feedback_until=$((SECONDS + 4))
+  else
+    result=$?
+    detail=$(tail -n 2 "$instance_switch_log" | tr '\n' ' ')
+    instance_switch_feedback="Account switch failed (${result}): ${detail:-UNKNOWN}"
+    copy_feedback=$instance_switch_feedback
+    copy_feedback_until=$((SECONDS + 8))
+  fi
+  CODEX_INSTANCE_SWITCH_FEEDBACK=$instance_switch_feedback
+  export CODEX_INSTANCE_SWITCH_FEEDBACK
+  pending_source_row=''
+  pending_since=0
+  pending_spinner_index=0
+  instance_switch_pid=''
+  rm -f -- "$instance_switch_log"
+  instance_switch_log=''
+  refresh_local_frame
+  last_drawn_input=''
 }
 
 launch_usage_refresh() {
@@ -296,7 +333,7 @@ process_snapshot() {
       pending_spinner_index=0
       frame=$(printf '%s\n' "$raw_frame" |
         CODEX_STATUS_RANKING=1 CODEX_STATUS_COLUMNS="$columns" CODEX_STATUS_NOW_MS="$status_now_ms" "$USAGE_ANNOTATOR")
-    elif [[ -n $pending_source_row && $((SECONDS - pending_since)) -ge 2 ]] &&
+    elif [[ -z $instance_switch_pid && -n $pending_source_row && $((SECONDS - pending_since)) -ge 2 ]] &&
         ! pgrep -f "^${ACCOUNT_SWITCHER} ([123]|--key [A-Za-z0-9_-]+) --desktop( |$)" >/dev/null 2>&1; then
       pending_source_row=''
       pending_since=0
@@ -374,6 +411,7 @@ while true; do
   else
     collector_tick=$((collector_tick + 1))
   fi
+  finish_instance_switch
   if [[ -z $collector_pid ]] && ((collector_tick >= 10)); then
     start_local_collection
     collector_tick=0
@@ -416,42 +454,70 @@ while true; do
           else
             CODEX_SELECTED_INSTANCE_ID=$selected_instance_id
             export CODEX_SELECTED_INSTANCE_ID
+            selection_error=''
+            CODEX_INSTANCE_SELECTION_ERROR=''
+            export CODEX_INSTANCE_SELECTION_ERROR
+            instance_switch_feedback=''
+            CODEX_INSTANCE_SWITCH_FEEDBACK=''
+            export CODEX_INSTANCE_SWITCH_FEEDBACK
             refresh_local_frame
           fi
           last_drawn_input=''
         else
+          if [[ -n $instance_switch_pid ]]; then
+            selection_error='An account switch is already running'
+            CODEX_INSTANCE_SELECTION_ERROR=$selection_error
+            export CODEX_INSTANCE_SELECTION_ERROR
+            refresh_local_frame
+            continue
+          fi
           source_row=$(printf '%s\n' "$key_map" | awk -v rank="$key" '$1 == rank { print $2; exit }')
           launcher_account=$(printf '%s\n' "$key_map" | awk -v rank="$key" '$1 == rank { print $4; exit }')
           if [[ ! $source_row =~ ^[1-9][0-9]*$ ]]; then
-            notify-send 'Codex-kontobyte stoppat' 'Kunde inte koppla rankingen till ett konto. Vänta på nästa uppdatering.' 2>/dev/null || true
+            selection_error='Account number could not be mapped; wait for status refresh'
+            CODEX_INSTANCE_SELECTION_ERROR=$selection_error
+            export CODEX_INSTANCE_SELECTION_ERROR
+            refresh_local_frame
             continue
           fi
           if [[ ! $launcher_account =~ ^[A-Za-z0-9_-]+$ || $launcher_account == - ]]; then
-            notify-send 'Codex-kontobyte stoppat' 'Kunde inte entydigt identifiera kontot. Öppna kontomenyn med K.' 2>/dev/null || true
+            selection_error='Account identity is ambiguous; open account manager with K'
+            CODEX_INSTANCE_SELECTION_ERROR=$selection_error
+            export CODEX_INSTANCE_SELECTION_ERROR
+            refresh_local_frame
             continue
           fi
           availability=$("$HOME/.local/bin/codex-instance" availability "$selected_instance_id" "$launcher_account" 2>&1) || {
-            copy_feedback="Account switch blocked: ${availability//$'\n'/ }"
-            copy_feedback_until=$((SECONDS + 5))
-            selected_instance_id=''
-            CODEX_SELECTED_INSTANCE_ID=''
-            export CODEX_SELECTED_INSTANCE_ID
+            selection_error="Account switch blocked: ${availability//$'\n'/ }"
+            CODEX_INSTANCE_SELECTION_ERROR=$selection_error
+            export CODEX_INSTANCE_SELECTION_ERROR
             refresh_local_frame
             continue
           }
           case "$availability" in
-            already-active) copy_feedback='Account already active; no change' ;;
-            in-use:*) copy_feedback="Account in use by ${availability#in-use:}" ;;
+            already-active) selection_error='Account already active; no change' ;;
+            in-use:*) selection_error="Account in use by ${availability#in-use:}" ;;
             available)
-              launch_instance_switch "$selected_instance_id" "$launcher_account"
-              copy_feedback='Account switch started'
+              if launch_instance_switch "$selected_instance_id" "$launcher_account"; then
+                pending_source_row=$source_row
+                pending_since=$SECONDS
+                instance_switch_feedback=''
+                CODEX_INSTANCE_SWITCH_FEEDBACK=''
+                export CODEX_INSTANCE_SWITCH_FEEDBACK
+                copy_feedback='Account switch started'
+                copy_feedback_until=$((SECONDS + 4))
+                selected_instance_id=''
+                CODEX_SELECTED_INSTANCE_ID=''
+                export CODEX_SELECTED_INSTANCE_ID
+                selection_error=''
+              else
+                selection_error='Account switch could not be launched'
+              fi
               ;;
-            *) copy_feedback='Account state unverified; no switch' ;;
+            *) selection_error="Account state unverified: ${availability//$'\n'/ }" ;;
           esac
-          copy_feedback_until=$((SECONDS + 4))
-          selected_instance_id=''
-          CODEX_SELECTED_INSTANCE_ID=''
-          export CODEX_SELECTED_INSTANCE_ID
+          CODEX_INSTANCE_SELECTION_ERROR=$selection_error
+          export CODEX_INSTANCE_SELECTION_ERROR
           refresh_local_frame
           last_drawn_input=''
         fi
@@ -502,6 +568,9 @@ while true; do
           selected_instance_id=''
           CODEX_SELECTED_INSTANCE_ID=''
           export CODEX_SELECTED_INSTANCE_ID
+          selection_error=''
+          CODEX_INSTANCE_SELECTION_ERROR=''
+          export CODEX_INSTANCE_SELECTION_ERROR
           copy_feedback='Instance selection cancelled'
           copy_feedback_until=$((SECONDS + 3))
           refresh_local_frame
@@ -559,6 +628,9 @@ while true; do
           selected_instance_id=''
           CODEX_SELECTED_INSTANCE_ID=''
           export CODEX_SELECTED_INSTANCE_ID
+          selection_error=''
+          CODEX_INSTANCE_SELECTION_ERROR=''
+          export CODEX_INSTANCE_SELECTION_ERROR
           copy_feedback='Instance selection cancelled'
           copy_feedback_until=$((SECONDS + 3))
           refresh_local_frame
