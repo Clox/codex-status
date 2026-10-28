@@ -15,6 +15,7 @@ export ACCOUNT_1 ACCOUNT_2 ACCOUNT_3
 export PATH="$NODE_BIN_DIR:${PATH:-/usr/local/bin:/usr/bin:/bin}"
 export RESET_CREDITS_CACHE
 USAGE_REFRESHER=${USAGE_REFRESHER:-"$HOME/.local/bin/codex-usage-refresh"}
+INSTANCE_OBSERVER=${INSTANCE_OBSERVER:-"$HOME/.local/bin/codex-instance-observe"}
 USAGE_CACHE=${USAGE_CACHE:-"${XDG_CACHE_HOME:-$HOME/.cache}/codex-account-switcher/usage.json"}
 STATUS_VIEWPORT_BIN=${CODEX_STATUS_VIEWPORT_BIN:-"$(dirname "$0")/codex-status-viewport"}
 AUTH_REPAIRER=${AUTH_REPAIRER:-"$HOME/.local/bin/codex-auth-repair"}
@@ -114,6 +115,7 @@ auto_spinner_frames=('/' '-' '\' '|')
 auto_spinner_index=0
 key_map=''
 last_background_refresh=-10
+last_instance_observe=-5
 paused_rendering=0
 copy_feedback=''
 copy_feedback_until=0
@@ -251,7 +253,9 @@ draw_current_frame() {
 runtime_signature() {
   stat -c '%n:%Y:%s' "$CODEX_AUTO_CONTINUE_STATE" "$CODEX_RESUME_STATE" \
     "$CODEX_EVENT_STATE" "$CODEX_STATUS_PREFERENCES" "$CODEX_ACCOUNT_SWITCH_STATE" \
-    "$pool_switch_state_path" 2>/dev/null || true
+    "$pool_switch_state_path" \
+    "${XDG_CACHE_HOME:-$HOME/.cache}"/codex-status/instances/*/state/turn-events.json \
+    2>/dev/null || true
 }
 
 refresh_local_frame() {
@@ -404,6 +408,11 @@ while true; do
     launch_usage_refresh
     "$RESET_CREDITS_REFRESHER" >/dev/null 2>&1 || true
     last_background_refresh=$SECONDS
+  fi
+  if ((SECONDS - last_instance_observe >= 5)); then
+    setsid -f flock -n "$status_runtime_dir/instance-observe.lock" "$INSTANCE_OBSERVER" \
+      {status_lock_fd}>&- </dev/null >>"$status_runtime_dir/instance-observe.log" 2>&1 || true
+    last_instance_observe=$SECONDS
   fi
 
   if finish_local_collection; then

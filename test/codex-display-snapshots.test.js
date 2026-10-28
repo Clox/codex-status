@@ -173,6 +173,56 @@ test('account rows mark every instance-active account in bold and leave unused a
   assert.match(plain(two[2]), /^ 03 /);
   assert.doesNotMatch(two[2], /^\x1b\[1m/);
   assert.match(renderStatus(root, env, inputFile).stdout, /Rosetta · key-b · stopped/);
+  const instanceLines = frame => frame.split('\n').filter(line =>
+    /^[12]  (Spadrig|Rosetta) · /.test(plain(line)));
+  fs.writeFileSync(env.CODEX_EVENT_STATE, JSON.stringify({ version: 4,
+    exhaustions: { 'account-b': { verified: true } } }));
+  const bExhausted = renderStatus(root, env, inputFile).stdout;
+  assert.equal(instanceLines(bExhausted).length, 2);
+  assert.doesNotMatch(instanceLines(bExhausted)[0], /\x1b\[1;31m/);
+  assert.match(instanceLines(bExhausted)[1], /^\x1b\[1;31m2  Rosetta · key-b · stopped\x1b\[0m$/);
+  assert.match(plain(rows(bExhausted)[1]), /EXHAU/);
+  fs.writeFileSync(env.CODEX_EVENT_STATE, JSON.stringify({ version: 4,
+    exhaustions: { 'account-a': { verified: true } } }));
+  const aExhausted = instanceLines(renderStatus(root, env, inputFile).stdout);
+  assert.match(aExhausted[0], /^\x1b\[1;31m1  Spadrig · key-a · stopped\x1b\[0m$/);
+  assert.doesNotMatch(aExhausted[1], /\x1b\[1;31m/);
+  fs.rmSync(env.CODEX_EVENT_STATE);
+  const nowMs = Date.now();
+  fs.writeFileSync(env.USAGE_CACHE, JSON.stringify({
+    worker: { heartbeatAtMs: nowMs },
+    accounts: { 'account-b': {
+      primary: { remainingPercent: 0, resetsAt: nowMs / 1000 + 7200 },
+      secondary: { remainingPercent: 56, resetsAt: nowMs / 1000 + 86400 },
+      rateLimitReachedTypeObserved: true,
+      rateLimitReachedType: { type: 'rate_limit_reached', details: 'default' },
+      refresh: { lastSuccessAt: nowMs, lastAttemptAt: nowMs,
+        errorKind: null, consecutiveFailures: 0 },
+    } },
+  }));
+  const serverExhausted = renderStatus(root, env, inputFile).stdout;
+  assert.match(instanceLines(serverExhausted)[1], /^\x1b\[1;31m2  Rosetta · key-b · stopped\x1b\[0m$/);
+  assert.doesNotMatch(instanceLines(serverExhausted)[0], /\x1b\[1;31m/);
+  assert.match(plain(rows(serverExhausted)[1]), /EXHAU/);
+  fs.rmSync(env.USAGE_CACHE);
+  const secondaryState = path.join(b.runtime, 'state', 'turn-events.json');
+  fs.mkdirSync(path.dirname(secondaryState), { recursive: true });
+  const secondaryEvent = { version: 4, worker: { heartbeatAtMs: Date.now(), errorKind: null },
+    exhaustions: { 'account-b': { accountId: 'account-b', verified: true,
+      threadIdentityVerified: true, source: 'rollout-terminal' } } };
+  fs.writeFileSync(secondaryState, JSON.stringify(secondaryEvent));
+  const localExhausted = renderStatus(root, env, inputFile).stdout;
+  assert.match(plain(rows(localExhausted)[1]), /EXHAU/);
+  assert.match(instanceLines(localExhausted)[1], /^\x1b\[1;31m2  Rosetta · key-b · stopped\x1b\[0m$/);
+  assert.doesNotMatch(instanceLines(localExhausted)[0], /\x1b\[1;31m/);
+  secondaryEvent.worker.heartbeatAtMs = Date.now() - 30_000;
+  fs.writeFileSync(secondaryState, JSON.stringify(secondaryEvent));
+  assert.doesNotMatch(plain(rows(renderStatus(root, env, inputFile).stdout)[1]), /EXHAU/);
+  secondaryEvent.worker.heartbeatAtMs = Date.now();
+  secondaryEvent.exhaustions['account-b'].accountId = 'account-c';
+  fs.writeFileSync(secondaryState, JSON.stringify(secondaryEvent));
+  assert.doesNotMatch(plain(rows(renderStatus(root, env, inputFile).stdout)[1]), /EXHAU/);
+  fs.rmSync(secondaryState);
   for (const account of accounts) fs.writeFileSync(path.join(home, 'accounts',
     `${account.chatgpt_account_id}.auth.json`), JSON.stringify({ tokens: {
     account_id: account.chatgpt_account_id, access_token: 'old',

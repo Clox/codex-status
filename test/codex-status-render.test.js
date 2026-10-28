@@ -7,6 +7,7 @@ const {
   normalizeAccountRow,
   recommendationLines,
   renderAccountTableRow,
+  statusLabel,
 } = require('../lib/codex-status-render');
 const { rankAccounts, recommendAccount } = require('../lib/codex-account-ranking');
 
@@ -207,6 +208,28 @@ test('OK status is never used for stale, unverified, explicitly unusable, or exh
   assert.doesNotMatch(render(rankAccounts([unusable], { nowMs: NOW_MS })[0]), /\x1b\[1;32mOK/);
   assert.doesNotMatch(render(rankAccounts([normalize()], { nowMs: NOW_MS })[0]), /\x1b\[1;32mOK/);
   assert.doesNotMatch(render(rankAccounts([exhausted], { nowMs: NOW_MS })[0]), /\x1b\[1;32mOK/);
+});
+
+test('fresh explicit server rate limit gives EXHAU without a terminal observer event', () => {
+  const account = { chatgpt_account_id: 'account-c', email: 'account-c@example.com' };
+  const base = {
+    primary: { remainingPercent: 0, resetsAt: NOW_MS / 1000 + 7200 },
+    secondary: { remainingPercent: 56, resetsAt: NOW_MS / 1000 + 86400 },
+    refresh: { lastSuccessAt: NOW_MS, lastAttemptAt: NOW_MS, errorKind: null, consecutiveFailures: 0 },
+  };
+  const reached = normalize({ account, serverEntry: {
+    ...base, rateLimitReachedTypeObserved: true,
+    rateLimitReachedType: { type: 'rate_limit_reached', details: 'default' },
+  } });
+  assert.equal(reached.verifiedExhausted, false);
+  assert.equal(statusLabel(reached), 'EXHAU');
+  assert.match(render(rankAccounts([reached], { nowMs: NOW_MS })[0]), /\x1b\[1;31mEXHAU/);
+  assert.notEqual(statusLabel(normalize({ account, serverEntry: base })), 'EXHAU');
+  assert.notEqual(statusLabel(normalize({ account, serverEntry: {
+    ...base, rateLimitReachedTypeObserved: true,
+    rateLimitReachedType: { type: 'rate_limit_reached' },
+    refresh: { ...base.refresh, lastSuccessAt: NOW_MS - 4 * 60_000 },
+  } })), 'EXHAU');
 });
 
 test('verified account-level exhaustion is rendered without inventing a 5H or weekly pool', () => {

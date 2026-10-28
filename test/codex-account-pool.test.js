@@ -156,7 +156,50 @@ test('default can select its current pool snapshot despite B stale inactive copy
   fs.writeFileSync(path.join(f.home, 'accounts', '1.auth.json'), JSON.stringify({
     tokens: { account_id: 'account-b', access_token: 'synthetic-b-old' },
   }));
-  assert.throws(() => assertCredentialAvailable('key-b', 'default', instances, pool, f.loc),
+  assert.equal(assertCredentialAvailable('key-b', 'default', instances, pool, f.loc).accountKey, 'key-b');
+});
+
+test('B can select a current pool snapshot despite old inactive default metadata', async t => {
+  const f = fixture(t);
+  migrateDefault(f.loc, f.env);
+  const b = createInstance('rosetta', 'Rosetta', f.loc, f.env);
+  const updated = path.join(f.root, 'updated-b.auth.json');
+  fs.writeFileSync(updated, JSON.stringify({ auth_mode: 'chatgpt', tokens: {
+    account_id: 'account-b', access_token: 'synthetic-b-updated',
+  } }));
+  const member = updateCredential('key-b', updated, f.loc, { verified: true });
+  assert.equal(member.generation, 2);
+  const defaultSnapshot = path.join(f.home, 'accounts', '1.auth.json');
+  fs.copyFileSync(updated, defaultSnapshot);
+  writeProvisioned(f.loc, { version: 1, instances: { default: {
+    'key-b': { generation: 1, stale: true },
+  } } });
+  const beforeA = ['auth.json', 'accounts/registry.json', 'accounts/0.auth.json', 'accounts/1.auth.json']
+    .map(name => digest(fs.readFileSync(path.join(f.home, name))));
+  const pool = readPool(f.loc);
+  assert.equal(assertCredentialAvailable('key-b', 'rosetta', readInstances(f.loc, f.env), pool, f.loc).accountKey, 'key-b');
+  const calls = [];
+  await provisionAccount('rosetta', 'key-b', f.loc, f.env, {
+    run: fakeAuthCalls(calls), processSnapshot: [],
+  });
+  assert.deepEqual(calls.map(value => value.args[0]), ['import', 'switch']);
+  assert.ok(calls.every(value => value.home === b.codexHome));
+  assert.equal(instanceActive(b, readPool(f.loc)).accountKey, 'key-b');
+  assert.deepEqual(['auth.json', 'accounts/registry.json', 'accounts/0.auth.json', 'accounts/1.auth.json']
+    .map(name => digest(fs.readFileSync(path.join(f.home, name)))), beforeA);
+});
+
+test('B still blocks when the inactive default snapshot differs from pool', t => {
+  const f = fixture(t);
+  migrateDefault(f.loc, f.env);
+  createInstance('rosetta', 'Rosetta', f.loc, f.env);
+  const updated = path.join(f.root, 'updated-b.auth.json');
+  fs.writeFileSync(updated, JSON.stringify({ auth_mode: 'chatgpt', tokens: {
+    account_id: 'account-b', access_token: 'synthetic-b-updated',
+  } }));
+  updateCredential('key-b', updated, f.loc, { verified: true });
+  const pool = readPool(f.loc);
+  assert.throws(() => assertCredentialAvailable('key-b', 'rosetta', readInstances(f.loc, f.env), pool, f.loc),
     /CREDENTIAL_REPROVISION_NEEDED:Spadrig/);
 });
 
@@ -348,4 +391,86 @@ test('failed instance deletion leaves pool credentials and provisioned state int
   assert.throws(() => deleteInstanceWithAccounts('rosetta', 'DELETE rosetta', f.loc, f.env), /INSTANCE_LAUNCH_PENDING/);
   assert.equal(readPool(f.loc).accounts.find(value => value.accountKey === 'key-b').needsRepair, undefined);
   assert.deepEqual(readProvisioned(f.loc), state);
+});
+
+for (const id of ['default', 'rosetta']) {
+  test(`${id}: stale running account applies with verified home and leaves peer untouched`, async t => {
+    const f = fixture(t);
+    migrateDefault(f.loc, f.env);
+    const b = createInstance('rosetta', 'Rosetta', f.loc, f.env);
+    await provisionAccount('rosetta', 'key-b', f.loc, f.env, { run: fakeAuthCalls([]), processSnapshot: [] });
+    const registry = readInstances(f.loc, f.env);
+    const selected = registry.instances.find(p => p.instanceId === id);
+    const peer = registry.instances.find(p => p.instanceId !== id);
+    const key = id === 'default' ? 'key-a' : 'key-b';
+    const updated = path.join(f.root, 'updated.auth.json');
+    fs.writeFileSync(updated, JSON.stringify({ tokens: { account_id: id === 'default' ? 'account-a' : 'account-b', access_token: 'new' } }));
+    updateCredential(key, updated, f.loc, { verified: true });
+    const before = fs.readFileSync(path.join(peer.codexHome, 'auth.json'));
+    const entries = registry.instances.flatMap((p, n) => [
+      { pid: 10 + n * 10, ppid: 1, startTicks: '1', exe: DESKTOP,
+        cmdline: `${DESKTOP} --user-data-dir=${p.desktopProfile}`, env: {} },
+      { pid: 11 + n * 10, ppid: 10 + n * 10, startTicks: '2', exe: '/usr/lib/chatgpt/resources/codex',
+        cmdline: 'codex app-server', env: p.instanceId === 'default' ? { HOME: f.root } : { CODEX_HOME: p.codexHome } },
+    ]);
+    const calls = [];
+    const options = { processSnapshot: entries, assertSafe: () => {}, run: fakeAuthCalls(calls),
+      stop: async target => { assert.equal(target, id); },
+      start: target => { assert.equal(target, id); return { record: selected }; }, wait: async () => {} };
+    const server = entries.find(p => p.ppid === (id === 'default' ? 10 : 20));
+    const originalEnv = server.env;
+    server.env = { CODEX_HOME: peer.codexHome };
+    await assert.rejects(reprovisionActive(id, f.loc, f.env, options), /INSTANCE_HOME_UNVERIFIED/);
+    assert.equal(calls.length, 0);
+    server.env = originalEnv;
+    await reprovisionActive(id, f.loc, f.env, options);
+    assert.ok(calls.every(p => p.home === selected.codexHome));
+    assert.equal(activeCredentialState(selected, instanceActive(selected, readPool(f.loc)), readPool(f.loc), f.loc).stale, false);
+    assert.deepEqual(fs.readFileSync(path.join(peer.codexHome, 'auth.json')), before);
+  });
+
+  test(`${id}: stale current account can switch directly to a fresh pool account`, async t => {
+    const f = fixture(t);
+    migrateDefault(f.loc, f.env);
+    const b = createInstance('rosetta', 'Rosetta', f.loc, f.env);
+    // Leave default signed out for B to own A, so B can later switch to B.
+    if (id === 'rosetta') {
+      fs.rmSync(path.join(f.home, 'auth.json'));
+      fs.rmSync(path.join(f.home, 'accounts', 'registry.json'));
+      await provisionAccount(id, 'key-a', f.loc, f.env, { run: fakeAuthCalls([]), processSnapshot: [] });
+    }
+    const newer = path.join(f.root, 'new-a.auth.json');
+    fs.writeFileSync(newer, JSON.stringify({ tokens: { account_id: 'account-a', access_token: 'new' } }));
+    updateCredential('key-a', newer, f.loc, { verified: true });
+    const selected = readInstances(f.loc, f.env).instances.find(p => p.instanceId === id);
+    assert.equal(activeCredentialState(selected, instanceActive(selected, readPool(f.loc)), readPool(f.loc), f.loc).stale, true);
+    const calls = [];
+    await provisionAccount(id, 'key-b', f.loc, f.env, { run: fakeAuthCalls(calls), processSnapshot: [] });
+    assert.deepEqual(calls.map(p => p.args[0]), ['import', 'switch']);
+    assert.ok(calls.every(p => p.home === selected.codexHome));
+    assert.equal(instanceActive(selected, readPool(f.loc)).accountKey, 'key-b');
+  });
+}
+
+test('default pool switch rolls back auth and metadata when target generation verification fails', async t => {
+  const f = fixture(t);
+  migrateDefault(f.loc, f.env);
+  const before = ['auth.json', 'accounts/registry.json', 'accounts/0.auth.json', 'accounts/1.auth.json']
+    .map(name => fs.readFileSync(path.join(f.home, name)));
+  const provisionedBefore = readProvisioned(f.loc);
+  const run = fakeAuthCalls([]);
+  await assert.rejects(provisionAccount('default', 'key-b', f.loc, f.env, {
+    processSnapshot: [], run: (command, args, options) => {
+      const result = run(command, args, options);
+      if (args[0] === 'switch') {
+        const auth = JSON.parse(fs.readFileSync(path.join(f.home, 'auth.json')));
+        auth.tokens.access_token = 'incorrect-generation';
+        fs.writeFileSync(path.join(f.home, 'auth.json'), JSON.stringify(auth));
+      }
+      return result;
+    },
+  }), /INSTANCE_CREDENTIAL_GENERATION_UNVERIFIED/);
+  assert.deepEqual(['auth.json', 'accounts/registry.json', 'accounts/0.auth.json', 'accounts/1.auth.json']
+    .map(name => fs.readFileSync(path.join(f.home, name))), before);
+  assert.deepEqual(readProvisioned(f.loc), provisionedBefore);
 });

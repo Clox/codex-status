@@ -122,11 +122,21 @@ is older. `[R]` can repair an account while it is active in an instance.
 The repair leaves that instance's live auth untouched. Use `[I]` → `[P]`
 or `codex-instance apply-credentials rosetta` to import and activate the
 latest snapshot for the same account. A running instance is restarted only
-when its own turn observer verifies that no turns are active. Secondary
-instances without an observer must be stopped explicitly before applying;
-the command never stops them on an unverified turn state.
+when its own turn observer verifies that no turns are active. The status window's
+secondary quota scans do not certify active-turn safety for credential
+application. A running secondary instance must still be stopped explicitly
+before applying; the command never stops it on an unverified turn state.
+Default Apply credentials keeps the existing configured home (`~/.codex`).
+Ownership verification accepts the default app-server's own `HOME/.codex` when
+`CODEX_HOME` is absent, compares canonical paths, and rejects conflicting homes.
+Default manual switches import and verify the target pool generation under the
+assignment/account locks; stale current credentials need not be applied first.
+Auth files and generation metadata are restored if verification fails before launch.
 
-Secondary instances still do not have status collectors, observers or
+While the status window is open, it scans each secondary instance's own rollouts
+every five seconds and records verified quota exhaustion under that instance's
+runtime state. It does not start another Desktop or increase server polling.
+Secondary instances still do not have independent status collectors or
 AUTO/HEADLESS schedulers. The existing account and AUTO flows belong to
 `default`; HEADLESS refuses to stop another Desktop instance. The existing
 systemd timer and observer units remain unchanged.

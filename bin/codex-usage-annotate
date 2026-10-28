@@ -26,6 +26,7 @@ const {
   accountIdentifiers,
   normalizeAccountRow,
   renderAccountTableRow,
+  statusLabel,
 } = require(path.join(__dirname, '..', 'lib', 'codex-status-render'));
 const { quotaAvailabilitySnapshot } = require(path.join(__dirname, '..', 'lib', 'codex-quota-transition'));
 const {
@@ -264,6 +265,7 @@ for (const [lineIndex, visible] of visibleLines.entries()) {
 let instanceView = null;
 let instanceViewError = null;
 const activeAccountKeys = new Set();
+const secondaryExhaustedAccountIds = new Set();
 try {
   const loc = instanceLocations();
   const pool = readPool(loc);
@@ -275,6 +277,17 @@ try {
     catch { active = { accountKey: 'unverified' }; }
     activeByInstance.set(instance.instanceId, active);
     if (active?.accountKey && active.accountKey !== 'unverified') activeAccountKeys.add(active.accountKey);
+    if (instance.instanceId !== 'default' && active?.accountId) {
+      try {
+        const observed = JSON.parse(fs.readFileSync(path.join(instance.runtime, 'state', 'turn-events.json'), 'utf8'));
+        const exhaustion = observed.exhaustions?.[active.accountId];
+        if (observerHealth(observed, nowMs).healthy && exhaustion?.verified === true &&
+            exhaustion.accountId === active.accountId && exhaustion.threadIdentityVerified === true &&
+            exhaustion.source === 'rollout-terminal') {
+          secondaryExhaustedAccountIds.add(active.accountId);
+        }
+      } catch {}
+    }
   }
   instanceView = { loc, pool, registry, activeByInstance };
 } catch (error) { instanceViewError = error; }
@@ -290,6 +303,7 @@ const shownRows = sourceRows.map(row => ({
   ...row,
   active: verifiedActiveAccountId ? row.accountId === verifiedActiveAccountId : row.active,
   usedByInstance: Boolean(row.accountKey && activeAccountKeys.has(row.accountKey)),
+  verifiedExhausted: row.verifiedExhausted || secondaryExhaustedAccountIds.has(row.accountId),
 }));
 const rankedRows = rankingEnabled
   ? rankAccounts(shownRows, { nowMs })
@@ -541,6 +555,9 @@ try {
   const { loc, pool, registry, activeByInstance } = instanceView;
   const provisioned = readProvisioned(loc);
   const instances = runningInstances(registry);
+  const exhaustedAccountKeys = new Set(rankedRows
+    .filter(row => row.accountKey && statusLabel(row) === 'EXHAU')
+    .map(row => row.accountKey));
   instancesSection = `\x1b[1;36mINSTANCES:\x1b[0m\n${instances.map((instance, index) =>
     { const active = activeByInstance.get(instance.instanceId);
       const account = active?.accountKey === 'unverified' ? 'unverified' :
@@ -556,8 +573,9 @@ try {
       const stale = activeStale ? ' · credentials stale (I → P to apply)' :
         staleEntries.length ? ` · ${staleEntries.length} credential${staleEntries.length === 1 ? '' : 's'} stale` : '';
       const turns = instance.instanceId === 'default' && activeTurns.length ? ` · ${activeTurns.length} turns` : '';
-      return `${index + 1}  ${instance.displayName} · ${account} · ${instance.roots.length ? 'running' : 'stopped'}${turns}${stale}` +
+      const line = `${index + 1}  ${instance.displayName} · ${account} · ${instance.roots.length ? 'running' : 'stopped'}${turns}${stale}` +
         `${instance.enabled ? '' : ' · disabled'}`;
+      return exhaustedAccountKeys.has(active?.accountKey) ? `\x1b[1;31m${line}\x1b[0m` : line;
     }).join('\n')}`;
   const selected = instances.find(value => value.instanceId === process.env.CODEX_SELECTED_INSTANCE_ID);
   if (selected) accountSelectionLines = [

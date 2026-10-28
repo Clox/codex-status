@@ -163,7 +163,12 @@ if [[ $launch_desktop == true ]] && desktop_running; then
 fi
 
 "$INSTANCE_MANAGER" record-release default >/dev/null || exit 75
-if ! CODEX_AUTH_BIN="$CODEX_AUTH_BIN" "$ACCOUNT_SWITCH_CORE" "$CODEX_HOME" "$expected_account_key"; then
+# The pool transaction acquires and revalidates assignment/account locks itself.
+node "$operation_lock_helper" release "$account_lock_dir" "$operation_pid" "$account_lock_generation"
+account_lock_generation=''
+node "$operation_lock_helper" release "$assignment_lock_dir" "$operation_pid" "$assignment_lock_generation"
+assignment_lock_generation=''
+if ! CODEX_AUTH_BIN="$CODEX_AUTH_BIN" "$ACCOUNT_SWITCH_CORE" "$CODEX_HOME" "$expected_account_key" --pool; then
   message='Kontobytet eller dess auth-verifiering misslyckades. Desktop startas inte.'
   notify-send 'Codex-kontobyte stoppat' "$message" 2>/dev/null || true
   printf '%s\n' "$message" >&2

@@ -9,10 +9,20 @@ if (!codexHome || !targetAccountKey) {
   process.stderr.write('Usage: codex-account-switch-core <CODEX_HOME> <account-key>\n');
   process.exit(64);
 }
-try {
+async function main() {
+  if (process.argv[4] === '--pool') {
+    const { locations, readRegistry, instanceById } = require('../lib/codex-instances');
+    const { provisionAccount } = require('../lib/codex-account-pool');
+    const loc = locations();
+    const primary = instanceById(readRegistry(loc), 'default');
+    if (codexHome !== primary.codexHome) throw new Error('INSTANCE_HOME_UNVERIFIED');
+    return provisionAccount('default', targetAccountKey, loc, process.env,
+      { authBin: process.env.CODEX_AUTH_BIN || 'codex-auth' });
+  }
   runAccountSwitch({ codexHome, targetAccountKey, authBin: process.env.CODEX_AUTH_BIN || 'codex-auth',
     source: 'manual' });
-} catch (error) {
+}
+main().catch(error => {
   process.stderr.write(`Account switch failed: ${error.message}\n`);
   process.exitCode = 3;
-}
+});

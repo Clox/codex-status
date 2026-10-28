@@ -1,0 +1,29 @@
+#!/usr/bin/env node
+'use strict';
+
+const fs = require('node:fs');
+const path = require('node:path');
+const { spawnSync } = require('node:child_process');
+const { locations, readRegistry, instanceNamespaces } =
+  require(path.join(__dirname, '..', 'lib', 'codex-instances'));
+
+const loc = locations();
+const usageCache = process.env.USAGE_CACHE || path.join(loc.cacheHome, 'codex-account-switcher', 'usage.json');
+const observer = path.join(__dirname, 'codex-turn-observer');
+
+for (const instance of readRegistry(loc).instances) {
+  if (instance.instanceId === 'default' || !instance.enabled) continue;
+  if (!fs.existsSync(path.join(instance.codexHome, 'accounts', 'registry.json'))) continue;
+  const state = instanceNamespaces(instance).state;
+  const result = spawnSync(process.execPath, [observer, '--once'], {
+    env: { ...process.env, CODEX_HOME: instance.codexHome,
+      CODEX_EVENT_STATE: path.join(state, 'turn-events.json'),
+      CODEX_RESUME_STATE: path.join(state, 'manual-resume.json'),
+      USAGE_CACHE: usageCache },
+    timeout: 4_000,
+    stdio: 'ignore',
+  });
+  if (result.error || result.status !== 0) {
+    process.stderr.write(`Instance observer failed for ${instance.instanceId}: ${result.error?.code || result.status}\n`);
+  }
+}

@@ -153,6 +153,22 @@ try:
     pool = json.loads((root / 'config' / 'codex-status' / 'account-pool' / 'registry.json').read_text())
     assert next(a for a in pool['accounts'] if a['accountKey'] == beta['account_key'])['generation'] == 2
 
+    # Both the current account and target's local copy may lag the pool.
+    # The switch must import the target directly, without applying current first.
+    beta_auth['tokens']['access_token'] = 'synthetic-old-local-generation'
+    beta_source.write_text(json.dumps(beta_auth))
+    gamma_source = next(p for p in (home / 'accounts').glob('*.auth.json')
+                        if json.loads(p.read_text())['tokens']['account_id'] == 'gamma')
+    gamma_new = json.loads(gamma_source.read_text())
+    gamma_new['tokens']['access_token'] = 'synthetic-new-gamma'
+    gamma_update = root / 'gamma-update.auth.json'
+    gamma_update.write_text(json.dumps(gamma_new))
+    update = run(['node', '-e',
+                  'const {updateCredential}=require(process.argv[1]); '
+                  'updateCredential(process.argv[2],process.argv[3],undefined,{verified:true})',
+                  str(repo / 'lib' / 'codex-account-pool.js'), by_id['gamma']['account_key'], str(gamma_update)])
+    assert update.returncode == 0, update.stderr
+
     beta_key = base64.urlsafe_b64encode(beta['account_key'].encode()).decode().rstrip('=')
     available = run([manager, 'availability', 'default', beta_key])
     assert available.returncode == 0 and available.stdout.strip() == 'available', available.stderr
@@ -185,6 +201,7 @@ esac
     assert default_switch.returncode == 0, default_switch.stderr
     assert state()[0]['active_account_key'] == beta['account_key']
     assert json.loads((home / 'auth.json').read_text())['tokens']['account_id'] == 'beta'
+    assert json.loads((home / 'auth.json').read_text())['tokens']['access_token'] == 'synthetic-updated-generation'
     assert json.loads((b_home / 'accounts' / 'registry.json').read_text())['active_account_key'] == alpha['account_key']
     assert {str(p): hashlib.sha256(p.read_bytes()).hexdigest()
             for p in [b_home / 'auth.json', b_home / 'accounts' / 'registry.json']} == b_before

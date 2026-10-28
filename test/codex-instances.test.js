@@ -235,3 +235,31 @@ test('delete rejects default and running B, requires exact confirmation, and rem
   assert.equal(fs.readFileSync(legacy, 'utf8'), 'legacy');
   assert.deepEqual(readRegistry(loc, env).instances.map(value => value.instanceId), ['default']);
 });
+
+test('default inherits home only from its own app-server; canonical aliases work and conflicts fail closed', async t => {
+  const { env, loc } = fixture(t);
+  const b = createInstance('rosetta', 'Rosetta', loc, env);
+  const a = readRegistry(loc, env).instances[0];
+  fs.mkdirSync(a.codexHome);
+  const entries = fakeProcesses(a, b);
+  entries.find(p => p.pid === 12).env = { HOME: env.HOME };
+  assert.deepEqual(ownedRoots(a, entries), [{ pid: 10, startTicks: '100' }]);
+  assert.deepEqual(ownedRoots(b, entries), [{ pid: 20, startTicks: '200' }]);
+  const alias = path.join(env.HOME, 'home-alias');
+  fs.symlinkSync(a.codexHome, alias);
+  entries.find(p => p.pid === 12).env.CODEX_HOME = alias;
+  assert.equal(ownedRoots(a, entries).length, 1);
+  for (const bad of [b.codexHome, '', 'relative']) {
+    entries.find(p => p.pid === 12).env.CODEX_HOME = bad;
+    assert.deepEqual(ownedRoots(a, entries), []);
+    await assert.rejects(stopInstance('default', loc, env, {
+      snapshot: () => entries, signal: () => assert.fail('must not signal'),
+    }), /INSTANCE_HOME_UNVERIFIED/);
+  }
+  entries.find(p => p.pid === 12).env = { HOME: env.HOME };
+  entries[0].env.CODEX_HOME = b.codexHome;
+  assert.deepEqual(ownedRoots(a, entries), []);
+  delete entries[0].env.CODEX_HOME;
+  entries.find(p => p.pid === 21).env = { HOME: env.HOME };
+  assert.deepEqual(ownedRoots(b, entries), []);
+});
