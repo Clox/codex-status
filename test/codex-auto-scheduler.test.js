@@ -99,12 +99,14 @@ test('status UI renders active-turn waiting and a timer that subsequently stops'
     assert.doesNotMatch(running.stdout, /AUTO CONTROLLER\/TIMER INACTIVE/);
     const stopped = render({ CODEX_TEST_TIMER_ACTIVE: '0' });
     assert.equal(stopped.status, 0, stopped.stderr);
-    assert.match(stopped.stdout, /AUTO CONTROLLER\/TIMER INACTIVE/);
+    assert.match(stopped.stdout, /Diagnostics: \d+ \[D\]/);
+    assert.doesNotMatch(stopped.stdout, /ACTION REQUIRED:[\s\S]*AUTO CONTROLLER\/TIMER INACTIVE/);
     fs.writeFileSync(autoState, JSON.stringify({ status: 'waiting', waitingReason: 'active-turns',
       heartbeatAtMs: NOW - MAX_HEARTBEAT_AGE_MS - 1 }));
     const stale = render();
     assert.equal(stale.status, 0, stale.stderr);
-    assert.match(stale.stdout, /AUTO CONTROLLER HEARTBEAT STALE/);
+    assert.match(stale.stdout, /Diagnostics: \d+ \[D\]/);
+    assert.doesNotMatch(stale.stdout, /ACTION REQUIRED:[\s\S]*AUTO CONTROLLER HEARTBEAT STALE/);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

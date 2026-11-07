@@ -47,7 +47,7 @@ function fakeAuthCalls(calls) {
     if (args[0] === 'import') {
       const auth = JSON.parse(fs.readFileSync(args[1], 'utf8'));
       const id = auth.tokens.account_id;
-      const key = id === 'account-b' ? 'key-b' : 'key-a';
+      const key = id === 'account-c' ? 'key-c' : id === 'account-b' ? 'key-b' : 'key-a';
       const existing = fs.readdirSync(dir).filter(name => name.endsWith('.auth.json'))
         .find(name => JSON.parse(fs.readFileSync(path.join(dir, name))).tokens.account_id === id);
       fs.copyFileSync(args[1], path.join(dir, existing || `${id}.auth.json`));
@@ -189,18 +189,67 @@ test('B can select a current pool snapshot despite old inactive default metadata
     .map(name => digest(fs.readFileSync(path.join(f.home, name)))), beforeA);
 });
 
-test('B still blocks when the inactive default snapshot differs from pool', t => {
+test('B can switch despite stale inactive default snapshot; active holder and unsafe pool still block', async t => {
   const f = fixture(t);
+  const aRegistryPath = path.join(f.home, 'accounts', 'registry.json');
+  const aRegistry = JSON.parse(fs.readFileSync(aRegistryPath));
+  aRegistry.accounts.push({ account_key: 'key-c', chatgpt_account_id: 'account-c', email: 'c@example.test' });
+  fs.writeFileSync(aRegistryPath, JSON.stringify(aRegistry));
+  const cAuth = { auth_mode: 'chatgpt', tokens: {
+    account_id: 'account-c', access_token: 'synthetic-c',
+  } };
+  fs.writeFileSync(path.join(f.home, 'accounts', '2.auth.json'), JSON.stringify(cAuth));
   migrateDefault(f.loc, f.env);
-  createInstance('rosetta', 'Rosetta', f.loc, f.env);
+  const b = createInstance('rosetta', 'Rosetta', f.loc, f.env);
+  const calls = [];
+  const options = { run: fakeAuthCalls(calls), processSnapshot: [] };
+  await provisionAccount('rosetta', 'key-c', f.loc, f.env, options);
+  assert.equal(instanceActive(b, readPool(f.loc)).accountKey, 'key-c');
   const updated = path.join(f.root, 'updated-b.auth.json');
   fs.writeFileSync(updated, JSON.stringify({ auth_mode: 'chatgpt', tokens: {
     account_id: 'account-b', access_token: 'synthetic-b-updated',
   } }));
   updateCredential('key-b', updated, f.loc, { verified: true });
   const pool = readPool(f.loc);
-  assert.throws(() => assertCredentialAvailable('key-b', 'rosetta', readInstances(f.loc, f.env), pool, f.loc),
-    /CREDENTIAL_REPROVISION_NEEDED:Spadrig/);
+  const latestB = pool.accounts.find(value => value.accountKey === 'key-b');
+  assert.equal(latestB.generation, 2);
+  assert.notEqual(digest(fs.readFileSync(path.join(f.home, 'accounts', '1.auth.json'))), latestB.snapshotHash);
+  const oldA = ['auth.json', 'accounts/registry.json', 'accounts/0.auth.json',
+    'accounts/1.auth.json', 'accounts/2.auth.json'].map(name => fs.readFileSync(path.join(f.home, name)));
+  const a = readInstances(f.loc, f.env).instances[0];
+  assert.equal(instanceActive(a, pool).accountKey, 'key-a');
+  assert.equal(assertCredentialAvailable('key-b', 'rosetta', readInstances(f.loc, f.env), pool, f.loc).accountKey, 'key-b');
+  const entries = [
+    { pid: 10, ppid: 1, startTicks: '10', exe: DESKTOP,
+      cmdline: `${DESKTOP} --user-data-dir=${a.desktopProfile}`, env: { CODEX_HOME: a.codexHome } },
+    { pid: 20, ppid: 1, startTicks: '20', exe: DESKTOP,
+      cmdline: `${DESKTOP} --user-data-dir=${b.desktopProfile}`, env: { CODEX_HOME: b.codexHome } },
+  ];
+  const switched = await provisionAccount('rosetta', 'key-b', f.loc, f.env, {
+    ...options, processSnapshot: entries,
+    stop: async id => { calls.push({ stop: id }); },
+    start: id => { calls.push({ start: id }); return { record: b }; },
+    wait: async record => { assert.equal(record.instanceId, 'rosetta'); },
+  });
+  assert.equal(switched.unchanged, false);
+  assert.deepEqual(calls.filter(call => call.args).map(call => call.args[0]), ['import', 'switch', 'import', 'switch']);
+  assert.ok(calls.filter(call => call.args).every(call => call.home === b.codexHome));
+  assert.deepEqual(calls.filter(call => call.stop || call.start), [{ stop: 'rosetta' }, { start: 'rosetta' }]);
+  assert.equal(instanceActive(b, readPool(f.loc)).accountKey, 'key-b');
+  assert.equal(digest(fs.readFileSync(path.join(b.codexHome, 'auth.json'))), latestB.snapshotHash);
+  assert.equal(readProvisioned(f.loc).instances.rosetta['key-b'].generation, 2);
+  assert.deepEqual(['auth.json', 'accounts/registry.json', 'accounts/0.auth.json',
+    'accounts/1.auth.json', 'accounts/2.auth.json'].map(name => fs.readFileSync(path.join(f.home, name))), oldA);
+  await assert.rejects(provisionAccount('rosetta', 'key-a', f.loc, f.env, options),
+    /ACCOUNT_IN_USE_BY:Spadrig/);
+  assert.equal(readSwitchState(f.loc).errorKind, 'ACCOUNT_IN_USE_BY:Spadrig');
+  assert.equal(calls.length, 6);
+  assert.deepEqual(['auth.json', 'accounts/registry.json', 'accounts/0.auth.json',
+    'accounts/1.auth.json', 'accounts/2.auth.json'].map(name => fs.readFileSync(path.join(f.home, name))), oldA);
+  const invalidPool = structuredClone(pool);
+  invalidPool.accounts.find(value => value.accountKey === 'key-b').snapshotHash = '0'.repeat(64);
+  assert.throws(() => assertCredentialAvailable('key-b', 'rosetta', readInstances(f.loc, f.env), invalidPool, f.loc),
+    /POOL_SNAPSHOT_UNVERIFIED/);
 });
 
 test('switch of a running B targets only B stop and start even when A also runs', async t => {

@@ -269,6 +269,7 @@ install -m 0644 "$lib_source/codex-turn-continuation.js" "$local_lib/codex-turn-
 install -m 0644 "$lib_source/codex-manual-resume.js" "$local_lib/codex-manual-resume.js"
 install -m 0644 "$lib_source/codex-vscode-normalize.js" "$local_lib/codex-vscode-normalize.js"
 install -m 0644 "$lib_source/codex-usage-format.js" "$local_lib/codex-usage-format.js"
+install -m 0644 "$lib_source/codex-problems.js" "$local_lib/codex-problems.js"
 install -m 0644 "$systemd_source/codex-five-hour-activation.service" "$systemd_user_dir/codex-five-hour-activation.service"
 install -m 0644 "$systemd_source/codex-five-hour-activation.timer" "$systemd_user_dir/codex-five-hour-activation.timer"
 install -m 0644 "$systemd_source/codex-auto-continue.service" "$systemd_user_dir/codex-auto-continue.service"

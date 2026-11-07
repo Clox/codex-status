@@ -119,6 +119,10 @@ copies are marked for reprovisioning rather than changed silently.
 The account table reports authentication for the pool's latest snapshot;
 the instance list separately reports `credentials stale` when a local copy
 is older. `[R]` can repair an account while it is active in an instance.
+The `ACTION REQUIRED` section lists repairs and manual continuation decisions.
+Technical warnings and resolved events appear under `[D] Diagnostics`; the
+main view shows their count. Press `[D]` again to return. AUTO still reports its
+current RUNNING, WAIT, or BLOCKED state independently of that problem list.
 The repair leaves that instance's live auth untouched. Use `[I]` → `[P]`
 or `codex-instance apply-credentials rosetta` to import and activate the
 latest snapshot for the same account. A running instance is restarted only

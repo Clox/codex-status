@@ -18,7 +18,7 @@ const { migrateDefault, updateCredential } = require('../lib/codex-account-pool'
 const THREAD = '01a0e2d5-e5e2-74e1-9ad1-3194bda82e93';
 const TURN = '01a0e463-9851-7ed2-9c87-52290cf748a9';
 
-function renderStatus(root, env, inputFile) {
+function renderStatus(root, env, inputFile, diagnostics = false) {
   const outputFile = path.join(root, 'status-output');
   const errorFile = path.join(root, 'status-error');
   const descriptors = [fs.openSync(inputFile, 'r'), fs.openSync(outputFile, 'w'),
@@ -26,7 +26,7 @@ function renderStatus(root, env, inputFile) {
   let result;
   try {
     result = spawnSync(process.execPath,
-      [path.join(__dirname, '..', 'bin', 'codex-usage-annotate')],
+      [path.join(__dirname, '..', 'bin', 'codex-usage-annotate'), ...(diagnostics ? ['--diagnostics'] : [])],
       { env, stdio: descriptors, timeout: 5_000 });
   } finally {
     for (const descriptor of descriptors) fs.closeSync(descriptor);
@@ -391,16 +391,17 @@ test('unavailable turns use a separate section, exact blocks, ID fallback, and r
   let result = render();
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /INTERRUPTED CODEX TURNS:[\s\S]*…bda82e94 \| quota-interrupted-after-work/);
-  assert.match(result.stdout, /UNAVAILABLE INTERRUPTED TURNS:[\s\S]*Spadrig · Förbättra blankettvyn \| …bda82e93 \| rollout missing · awaiting retirement/);
+  assert.doesNotMatch(result.stdout, /UNAVAILABLE INTERRUPTED TURNS:|…bda82e93/);
+  assert.match(renderStatus(root, env, inputFile, true).stdout, /ROLLOUT_NOT_IN_ACTIVE_CODEX_HOME/);
   assert.doesNotMatch(result.stdout, /AUTO-CONTINUE BLOCKED[^\n]*ROLLOUT_NOT_IN_ACTIVE_CODEX_HOME/);
-  assert.doesNotMatch(result.stdout.split('UNAVAILABLE INTERRUPTED TURNS:')[0], /…bda82e93/);
   fs.writeFileSync(env.CODEX_STATUS_PREFERENCES, JSON.stringify({ version: 2, autoMode: 'HEADLESS' }));
   fs.writeFileSync(auto, JSON.stringify({ status: 'waiting', waitingReason: 'active-turns',
     candidateBlocks: { [oldKey]: { threadId: THREAD, failedTurnId: TURN,
       actionRequired: true, reason: 'ROLLOUT_METADATA_UNVERIFIED' } } }));
   result = render();
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /UNAVAILABLE INTERRUPTED TURNS:[\s\S]*rollout metadata unverified · unavailable/);
+  assert.doesNotMatch(result.stdout, /UNAVAILABLE INTERRUPTED TURNS:|ROLLOUT_METADATA_UNVERIFIED/);
+  assert.match(renderStatus(root, env, inputFile, true).stdout, /ROLLOUT_METADATA_UNVERIFIED/);
   assert.doesNotMatch(result.stdout, /AUTO-CONTINUE BLOCKED[^\n]*ROLLOUT_METADATA_UNVERIFIED|rollout metadata unverified · action required|AUTO: HEADLESS · BLOCKED/);
   assert.match(result.stdout, /AUTO: HEADLESS · WAIT: active-turns/);
   fs.writeFileSync(resume, JSON.stringify({ attempts: {}, retiredCandidates: {

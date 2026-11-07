@@ -208,5 +208,41 @@ esac
     blocked = run([manager, 'availability', 'rosetta', beta_key])
     assert blocked.stdout.strip() == 'in-use:Spadrig'
     print('PASS: default gamma → beta uses the manager switch path despite B stale inactive beta; B unchanged')
+
+    # Reverse direction: A keeps an old inactive alpha snapshot while B changes
+    # from beta to the newest verified alpha generation.
+    gamma_key = base64.urlsafe_b64encode(by_id['gamma']['account_key'].encode()).decode().rstrip('=')
+    to_gamma = run([manager, 'switch-key', 'default', gamma_key], {
+        'CODEX_INSTANCE_MANAGER': str(manager_shim),
+        'TEST_REAL_INSTANCE_MANAGER': manager,
+        'TEST_DESKTOP_MARKER': str(root / 'fake-desktop-running'),
+    })
+    assert to_gamma.returncode == 0, to_gamma.stderr
+    to_beta = run([manager, 'switch-key', 'rosetta', beta_key])
+    assert to_beta.returncode == 0, to_beta.stderr
+    assert state()[0]['active_account_key'] == by_id['gamma']['account_key']
+    assert json.loads((b_home / 'accounts' / 'registry.json').read_text())['active_account_key'] == beta['account_key']
+    alpha_source = next(p for p in (home / 'accounts').glob('*.auth.json')
+                        if json.loads(p.read_text())['tokens']['account_id'] == 'alpha')
+    alpha_new = json.loads(alpha_source.read_text())
+    alpha_new['tokens']['access_token'] = 'synthetic-new-alpha'
+    alpha_update = root / 'alpha-update.auth.json'
+    alpha_update.write_text(json.dumps(alpha_new))
+    update = run(['node', '-e',
+                  'const {updateCredential}=require(process.argv[1]); '
+                  'updateCredential(process.argv[2],process.argv[3],undefined,{verified:true})',
+                  str(repo / 'lib' / 'codex-account-pool.js'), alpha['account_key'], str(alpha_update)])
+    assert update.returncode == 0, update.stderr
+    a_before = protected_hashes()
+    available = run([manager, 'availability', 'rosetta', alpha_key])
+    assert available.returncode == 0 and available.stdout.strip() == 'available', available.stderr
+    to_alpha = run([manager, 'switch-key', 'rosetta', alpha_key])
+    assert to_alpha.returncode == 0, to_alpha.stderr
+    assert protected_hashes() == a_before
+    assert json.loads((b_home / 'auth.json').read_text())['tokens']['access_token'] == 'synthetic-new-alpha'
+    assert json.loads((b_home / 'accounts' / 'registry.json').read_text())['active_account_key'] == alpha['account_key']
+    blocked = run([manager, 'availability', 'rosetta', gamma_key])
+    assert blocked.returncode == 0 and blocked.stdout.strip() == 'in-use:Spadrig', blocked.stderr
+    print('PASS: B beta → alpha imports newest pool generation despite A stale inactive alpha; A unchanged')
 finally:
     shutil.rmtree(root)

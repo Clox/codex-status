@@ -40,6 +40,7 @@ const {
   currentResumeProblemLines,
   emptyResumeState,
   interruptedCandidateProblemLines,
+  isCompletedObserverTimeoutAttempt,
   normalizeResumeState,
   pendingInterruptedTurns,
 } = require(path.join(__dirname, '..', 'lib', 'codex-manual-resume'));
@@ -61,6 +62,8 @@ const { displayMetadata } = require(path.join(__dirname, '..', 'lib', 'codex-dis
 const { resolveActiveAccount } = require(path.join(__dirname, '..', 'lib', 'codex-account-state'));
 const { displaySwitchState, readSwitchState } = require(path.join(__dirname, '..', 'lib', 'codex-account-switch-core'));
 const { autoDisplayPlan } = require(path.join(__dirname, '..', 'lib', 'codex-auto-display'));
+const { ACTION_REQUIRED, DIAGNOSTIC, HISTORY, problem, formatDiagnostic } =
+  require(path.join(__dirname, '..', 'lib', 'codex-problems'));
 const { readRegistry: readInstanceRegistry, runningInstances, locations: instanceLocations } =
   require(path.join(__dirname, '..', 'lib', 'codex-instances'));
 const { readPool, instanceActive, readProvisioned, activeCredentialState, readSwitchState: readPoolSwitchState } =
@@ -112,6 +115,7 @@ const mappingOnly = stableMapping || process.argv.includes('--key-map');
 const resumeMappingOnly = process.argv.includes('--resume-map');
 const attentionOnly = process.argv.includes('--attention-state');
 const availabilityOnly = process.argv.includes('--availability-state');
+const diagnosticsOnly = process.argv.includes('--diagnostics');
 const rankingEnabled = mappingOnly || resumeMappingOnly || attentionOnly || availabilityOnly || process.env.CODEX_STATUS_RANKING === '1';
 const pendingSourceCandidate = process.env.CODEX_PENDING_SOURCE_ROW || process.env.CODEX_PENDING_ROW || '';
 const pendingSourceRow = /^[1-9][0-9]*$/.test(pendingSourceCandidate)
@@ -439,28 +443,126 @@ if (rankedRows.some(row => row.usageQuality === 'unverified')) {
 const usageQualityLine = usageQualityNotes.length > 0
   ? `\x1b[2m${usageQualityNotes.join('; ')}.\x1b[0m`
   : null;
-const problems = [
-  turnObserverHealth.healthy
-    ? null
-    : `TURN OBSERVER ERROR: turn-state is UNVERIFIED${turnObserverHealth.errorKind ? ` (${turnObserverHealth.errorKind})` : ''}; aktiva turns visas inte förrän observern återhämtat sig.`,
-  activationWorkerProblem(fiveHourWorkerHealth),
-  activationHoldsError
-    ? `ACTIVATION HOLD CONFIG ERROR / ACTION REQUIRED: ${activationHoldsError}; activation-workern avbryter säkert tills konfigurationen rättats.`
-    : null,
-  statusPreferencesError
-    ? `AUTO-CONTINUE CONFIG ERROR / ACTION REQUIRED: ${statusPreferencesError}; AUTO-CONTINUE är fail-closed OFF.`
-    : null,
-  ...(autoContinueProblemLines(autoContinueState, statusPreferences.autoContinue === true,
-    { candidateKeys: pendingCandidateKeys, resumeState, eventState }) || []),
-  schedulerHealth.healthy ? null : `${schedulerHealth.reason} / ACTION REQUIRED`,
-  ...interruptedCandidateProblemLines(eventState, resumeState, {
-    autoContinue: statusPreferences.autoContinue === true,
-  }),
-  ...rankedRows.flatMap(row => [
-    usageProblemLine(row),
-    activationProblemLine(row, activationState.accounts?.[row.accountId]),
-  ]),
-].filter(Boolean);
+const issues = [];
+const addIssue = (classification, source, explanation, details = {}) => {
+  if (explanation) issues.push(problem({ classification, source, explanation, ...details }));
+};
+if (!turnObserverHealth.healthy) addIssue(DIAGNOSTIC, 'Turn observer',
+  'Turn-state är overifierat; observern försöker återhämta sig.',
+  { errorKind: turnObserverHealth.errorKind, state: 'unverified',
+    timestamp: eventState.updatedAtMs, disposition: 'retry/auto-recovery' });
+addIssue(DIAGNOSTIC, '5H worker', activationWorkerProblem(fiveHourWorkerHealth),
+  { errorKind: fiveHourWorkerHealth.fatalErrorKind, state: 'unhealthy',
+    timestamp: fiveHourWorkerHealth.heartbeatAtMs, disposition: 'system service/heartbeat' });
+addIssue(ACTION_REQUIRED, '5H configuration', activationHoldsError &&
+  `Activation hold-konfigurationen måste rättas: ${activationHoldsError}`,
+  { errorKind: activationHoldsError, state: 'invalid configuration', disposition: 'manual configuration' });
+addIssue(ACTION_REQUIRED, 'AUTO configuration', statusPreferencesError &&
+  `AUTO-konfigurationen måste rättas: ${statusPreferencesError}`,
+  { errorKind: statusPreferencesError, state: 'invalid configuration', disposition: 'manual configuration' });
+if (!schedulerHealth.healthy) addIssue(DIAGNOSTIC, 'AUTO scheduler', schedulerHealth.reason,
+  { errorKind: schedulerHealth.reason, state: 'unhealthy', disposition: 'service retry' });
+const unavailableKeys = new Set(unavailableInterruptedCandidates.map(({ candidate }) =>
+  JSON.stringify([candidate.threadId, candidate.turnId])));
+const actionableEventState = { ...eventState,
+  interruptedTurns: Object.fromEntries(Object.entries(eventState.interruptedTurns || {})
+    .filter(([, candidate]) => !unavailableKeys.has(JSON.stringify([candidate.threadId, candidate.turnId])))) };
+for (const line of interruptedCandidateProblemLines(actionableEventState, resumeState,
+  { autoContinue: statusPreferences.autoContinue === true })) {
+  addIssue(ACTION_REQUIRED, 'Continuation', line, { state: 'manual intervention', disposition: 'manual' });
+}
+for (const row of rankedRows) {
+  const usageLine = usageProblemLine(row);
+  if (usageLine) addIssue(REPAIRABLE_ERROR_KINDS.has(row.errorKind) ? ACTION_REQUIRED : DIAGNOSTIC,
+    'Usage', usageLine.replace(' / ACTION REQUIRED', ''),
+    { subject: row.label, errorKind: row.errorKind, state: row.usageQuality,
+      timestamp: row.usageFetchedAtMs || row.usageUpdatedAtMs,
+      disposition: REPAIRABLE_ERROR_KINDS.has(row.errorKind) ? '[R] repair authentication' : 'retry/auto-recovery' });
+  const activation = activationState.accounts?.[row.accountId];
+  const activationLine = activationProblemLine(row, activation);
+  if (activationLine) addIssue(DIAGNOSTIC, '5H activation',
+    activationLine.replace(' / ACTION REQUIRED', ''),
+    { subject: row.label, errorKind: activation.errorKind, state: activation.phase,
+      timestamp: activation.updatedAtMs || activation.failedAtMs,
+      disposition: activation.phase === 'cooldown' ? 'waiting/retry' : 'historical activation attempt' });
+}
+for (const [key, block] of Object.entries(autoContinueState.candidateBlocks || {})) {
+  const current = pendingCandidateKeys.has(key);
+  const candidate = Object.values(eventState.interruptedTurns || {}).find(item =>
+    JSON.stringify([item.threadId, item.turnId]) === key);
+  const subject = candidate
+    ? formatInterruptedCandidate(candidate, rankedRows.find(row => row.accountId === candidate.accountId)?.label ||
+      'unknown account', metadataForThread(candidate.threadId), 'unavailable', tableWidth)
+    : `thread …${String(block.threadId || '').slice(-8)}`;
+  addIssue(current ? DIAGNOSTIC : HISTORY, 'AUTO candidate',
+    'Den avbrutna turnen kan inte verifieras säkert för automatisk fortsättning.',
+    { subject,
+      errorKind: block.reason, state: current ? 'unavailable' : 'historical',
+      timestamp: block.updatedAtMs || block.createdAtMs,
+      disposition: current ? 'other healthy candidates continue; inspect if needed' : 'history' });
+  if (current && block.requiredAction) addIssue(ACTION_REQUIRED, 'AUTO candidate',
+    `thread …${String(block.threadId || '').slice(-8)}: ${block.requiredAction}`,
+    { subject: block.threadId, errorKind: block.reason, state: 'blocked', disposition: 'manual' });
+}
+if (autoContinueState.errorKind && autoContinueState.status !== 'blocked') {
+  addIssue(HISTORY, 'AUTO controller', 'Tidigare controllerfel.',
+    { errorKind: autoContinueState.errorKind, state: autoContinueState.status,
+      timestamp: autoContinueState.lastAttemptAtMs, disposition: 'history' });
+}
+if (resumeState.lastError?.errorKind) {
+  addIssue(HISTORY, 'Continuation history', 'Tidigare försök före commit.',
+    { subject: `thread …${String(resumeState.lastError.threadId || '').slice(-8)}`,
+      errorKind: resumeState.lastError.errorKind, state: 'pre-commit failure',
+      timestamp: resumeState.lastError.failedAtMs, disposition: 'history' });
+}
+const manualAutoKinds = new Set(['MANUAL_DRAFT_JOURNAL_UNVERIFIED', 'AUTO_BLOCKED_VSCODE_CODEX_ACTIVE']);
+for (const line of autoContinueProblemLines(autoContinueState, statusPreferences.autoContinue === true &&
+    autoContinueState.status === 'blocked',
+  { candidateKeys: pendingCandidateKeys, resumeState, eventState }) || []) {
+  if (line.includes('AUTO-CONTINUE BLOCKED:') || line.includes('AUTO-CONTINUE BLOCKED / ACTION REQUIRED: …')) continue;
+  const kind = autoContinueState.errorKind || line.match(/\(([A-Z0-9_]+)\)/)?.[1] || '';
+  const manual = manualAutoKinds.has(kind) || line.includes('VS Code Codex är aktivt');
+  addIssue(manual ? ACTION_REQUIRED : DIAGNOSTIC, 'AUTO controller',
+    line.replace(' / ACTION REQUIRED', ''),
+    { errorKind: kind, state: autoContinueState.status,
+      timestamp: autoContinueState.updatedAtMs,
+      disposition: manual ? 'manual intervention' : 'retry/technical investigation' });
+}
+for (const line of currentResumeProblemLines(resumeState, eventState)) {
+  addIssue(ACTION_REQUIRED, 'Manual resume', line.replace(' / ACTION REQUIRED', ''),
+    { state: 'committed/uncertain', disposition: 'manual intervention' });
+}
+for (const attempt of Object.values(resumeState.attempts || {})) {
+  if (['PREFILL_STARTED', 'SEND_UNCONFIRMED', 'SEND_CONFLICT'].includes(attempt.status)) continue;
+  if (attempt.status === 'MANUAL_REQUIRED_AFTER_COMMIT' &&
+      !isCompletedObserverTimeoutAttempt(attempt, eventState)) continue;
+  if (!attempt.errorKind) continue;
+  addIssue(HISTORY, 'Continuation history', 'Tidigare continuation-försök.',
+    { subject: `thread …${String(attempt.threadId || '').slice(-8)}`,
+      errorKind: attempt.errorKind, state: attempt.status,
+      timestamp: attempt.completedAtMs || attempt.failedAtMs, disposition: 'history' });
+}
+for (const [source, entries] of [
+  ['Desktop restore', autoContinueState.desktopRestoreHistory],
+  ['Desktop navigation', autoContinueState.desktopNavigationHistory],
+  ['AUTO exclusivity', autoContinueState.exclusivityHistory],
+]) {
+  for (const entry of Array.isArray(entries) ? entries.slice(-8) : []) {
+    addIssue(HISTORY, source, 'Tidigare tekniskt controllerproblem.',
+      { errorKind: entry.errorKind || entry.failureReason, state: entry.status || 'historical',
+        timestamp: entry.completedAtMs || entry.updatedAtMs || entry.atMs,
+        disposition: 'history' });
+  }
+}
+if (diagnosticsOnly) {
+  const diagnostics = issues.filter(issue => issue.classification !== ACTION_REQUIRED);
+  process.stdout.write(`DIAGNOSTICS (${diagnostics.length}) [D] back\n\n${diagnostics.length
+    ? diagnostics.map(issue => `[${issue.classification}] ${formatDiagnostic(issue)}`).join('\n\n')
+    : 'No diagnostics or history.'}\n\nAUTO: diagnostics`);
+  process.exit(0);
+}
+const problems = issues.filter(issue => issue.classification === ACTION_REQUIRED).map(issue => issue.explanation);
+const diagnosticCount = issues.filter(issue => issue.classification !== ACTION_REQUIRED).length;
 const repairableProblemCount = rankedRows.filter(row =>
   row.usageQuality === 'unverified' && REPAIRABLE_ERROR_KINDS.has(row.errorKind)
 ).length;
@@ -531,9 +633,8 @@ const unavailableTurnsSection = unavailableInterruptedCandidates.length > 0
         metadataForThread(candidate.threadId), unavailableCandidateState(block), tableWidth)}\x1b[0m`;
     }).join('\n')}`
   : '';
-problems.push(...currentResumeProblemLines(resumeState, eventState));
 const problemSection = problems.length > 0
-  ? `\n\x1b[1;31mACCOUNT PROBLEMS:\x1b[0m\n${problems.map(line => `\x1b[0m  • ${line}\x1b[0m`).join('\n')}${repairableProblemCount > 0 ? '\n\x1b[1;33m  Press [R] to repair authentication\x1b[0m' : ''}`
+  ? `\n\x1b[1;31mACTION REQUIRED:\x1b[0m\n${problems.map(line => `\x1b[0m  • ${line}\x1b[0m`).join('\n')}${repairableProblemCount > 0 ? '\n\x1b[1;33m  Press [R] to repair authentication\x1b[0m' : ''}`
   : '';
 const footerParts = [
   activeTurnsSection,
@@ -541,9 +642,9 @@ const footerParts = [
   accountSwitchSection,
   queuedTurnsSection,
   interruptedTurnsSection,
-  unavailableTurnsSection,
   informationSection,
   problemSection,
+  diagnosticCount ? `\x1b[2mDiagnostics: ${diagnosticCount} [D]\x1b[0m` : '',
   usageQualityLine,
 ].filter(Boolean).map(section => section.replace(/^\n/, ''));
 footerParts.push(`\x1b[1;35m${autoContinueStatusLine(statusPreferences, autoContinueState, nowMs, { operation })}\x1b[0m`);
