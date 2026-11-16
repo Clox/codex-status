@@ -13,7 +13,7 @@ const { formatInterruptedCandidate, partitionInterruptedCandidates } =
   require('../lib/codex-interrupted-label');
 const { turnKey } = require('../lib/codex-turn-observer');
 const { locations, createInstance } = require('../lib/codex-instances');
-const { migrateDefault, updateCredential } = require('../lib/codex-account-pool');
+const { migrateDefault, poolPaths, readProvisioned, updateCredential } = require('../lib/codex-account-pool');
 
 const THREAD = '01a0e2d5-e5e2-74e1-9ad1-3194bda82e93';
 const TURN = '01a0e463-9851-7ed2-9c87-52290cf748a9';
@@ -231,11 +231,32 @@ test('account rows mark every instance-active account in bold and leave unused a
     fs.readFileSync(path.join(home, 'accounts', 'account-b.auth.json')));
   const loc = locations(env);
   migrateDefault(loc, env);
+  fs.copyFileSync(path.join(home, 'accounts', 'account-a.auth.json'), path.join(home, 'auth.json'));
+  const rosettaBeforeInactiveStale = instanceLines(renderStatus(root, env, inputFile).stdout)[1];
+  const provisionedPath = poolPaths(loc).provisioned;
+  const provisioned = readProvisioned(loc);
+  provisioned.instances.default ||= {};
+  provisioned.instances.default['key-b'] = { generation: 1, stale: true };
+  provisioned.instances.default['key-c'] = { generation: 1, stale: true };
+  fs.writeFileSync(provisionedPath, JSON.stringify(provisioned));
+  const inactiveStale = renderStatus(root, env, inputFile).stdout;
+  const inactiveStaleLine = instanceLines(inactiveStale)[0];
+  assert.match(plain(inactiveStaleLine), /Spadrig · a@example\.test · stopped$/);
+  assert.doesNotMatch(inactiveStaleLine, /\x1b\[1;31m/);
+  assert.doesNotMatch(plain(inactiveStaleLine), /stale/);
+  assert.equal(instanceLines(inactiveStale)[1], rosettaBeforeInactiveStale);
+  assert.match(renderStatus(root, env, inputFile, true).stdout,
+    /Inactive credential snapshots · Spadrig[\s\S]*2 inactive account snapshots stale; active credentials unaffected/);
+  const activeAuth = fs.readFileSync(path.join(home, 'auth.json'));
+  fs.rmSync(path.join(home, 'auth.json'));
+  const brokenActive = instanceLines(renderStatus(root, env, inputFile).stdout)[0];
+  assert.match(brokenActive, /^\x1b\[1;31m1  Spadrig · unverified · stopped/);
+  fs.writeFileSync(path.join(home, 'auth.json'), activeAuth);
   const updated = path.join(root, 'updated-b.auth.json');
   fs.writeFileSync(updated, JSON.stringify({ tokens: { account_id: 'account-b', access_token: 'new' } }));
   updateCredential('key-b', updated, loc, { verified: true });
   assert.match(renderStatus(root, env, inputFile).stdout,
-    /Rosetta · b@example\.test · stopped · credentials stale \(I → P to apply\)/);
+    /Rosetta · b@example\.test · stopped · credentials unverified/);
 });
 
 test('observer captures candidate display metadata at creation and preserves it after sources disappear', t => {

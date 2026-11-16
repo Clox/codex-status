@@ -11,7 +11,7 @@ const { DESKTOP } = require('../lib/codex-instances');
 const { poolPaths, readPool, migrateDefault, instanceActive, provisionAccount,
   updateCredential, acquireAccountLock, snapshotPath, digest,
   deleteInstanceWithAccounts, readProvisioned, writeProvisioned, readSwitchState,
-  assertCredentialAvailable, activeCredentialState, reprovisionActive } = require('../lib/codex-account-pool');
+  assertCredentialAvailable, activeCredentialState, reprovisionActive, reconcileActive } = require('../lib/codex-account-pool');
 const { classify } = require('../lib/codex-operation-lock');
 
 function fixture(t) {
@@ -509,7 +509,8 @@ test('default pool switch rolls back auth and metadata when target generation ve
   const provisionedBefore = readProvisioned(f.loc);
   const run = fakeAuthCalls([]);
   await assert.rejects(provisionAccount('default', 'key-b', f.loc, f.env, {
-    processSnapshot: [], run: (command, args, options) => {
+    processSnapshot: [], verify: async () => false,
+    run: (command, args, options) => {
       const result = run(command, args, options);
       if (args[0] === 'switch') {
         const auth = JSON.parse(fs.readFileSync(path.join(f.home, 'auth.json')));
@@ -522,4 +523,163 @@ test('default pool switch rolls back auth and metadata when target generation ve
   assert.deepEqual(['auth.json', 'accounts/registry.json', 'accounts/0.auth.json', 'accounts/1.auth.json']
     .map(name => fs.readFileSync(path.join(f.home, name))), before);
   assert.deepEqual(readProvisioned(f.loc), provisionedBefore);
+});
+
+for (const scenario of ['both-local-files-changed', 'active-auth-only-changed']) {
+  test(`reconciliation promotes verified active credential: ${scenario}`, async t => {
+    const f = fixture(t);
+    migrateDefault(f.loc, f.env);
+    const b = createInstance('rosetta', 'Rosetta', f.loc, f.env);
+    const selected = scenario === 'both-local-files-changed' ? readInstances(f.loc, f.env).instances[0] : b;
+    const key = selected.instanceId === 'default' ? 'key-a' : 'key-b';
+    if (selected === b) await provisionAccount('rosetta', key, f.loc, f.env, {
+      processSnapshot: [], run: fakeAuthCalls([]),
+    });
+    const wantedGeneration = selected.instanceId === 'default' ? 3 : 4;
+    for (let generation = 2; generation <= wantedGeneration; generation++) {
+      const newerPool = path.join(f.root, `pool-${generation}.auth.json`);
+      fs.writeFileSync(newerPool, JSON.stringify({ auth_mode: 'chatgpt', tokens: {
+        account_id: selected.instanceId === 'default' ? 'account-a' : 'account-b',
+        access_token: `pool-${generation}`,
+      } }));
+      updateCredential(key, newerPool, f.loc, { verified: true });
+    }
+    await reprovisionActive(selected.instanceId, f.loc, f.env, {
+      processSnapshot: [], run: fakeAuthCalls([]),
+    });
+    const otherSnapshot = selected === b ? path.join(f.home, 'accounts', '1.auth.json') : null;
+    const otherBefore = otherSnapshot ? fs.readFileSync(otherSnapshot) : null;
+    if (selected === b) {
+      const state = readProvisioned(f.loc);
+      state.instances.default = { 'key-b': { generation: 1, stale: false } };
+      writeProvisioned(f.loc, state);
+    }
+    const before = readPool(f.loc).accounts.find(item => item.accountKey === key);
+    assert.equal(before.generation, wantedGeneration);
+    if (selected.instanceId === 'default') writeProvisioned(f.loc, { version: 1, instances: {
+      default: { [key]: { generation: before.generation, stale: false } },
+    } });
+    const oldPoolBytes = fs.readFileSync(snapshotPath(poolPaths(f.loc), key, before.generation));
+    const authPath = path.join(selected.codexHome, 'auth.json');
+    const localPath = path.join(selected.codexHome, 'accounts', selected === b ? 'account-b.auth.json' : '1.auth.json');
+    // The fixture's default A snapshot is 0.auth.json.
+    const actualLocal = selected === b ? localPath : path.join(selected.codexHome, 'accounts', '0.auth.json');
+    const newer = { auth_mode: 'chatgpt', tokens: { account_id: before.accountId, access_token: 'fresh-local' } };
+    fs.writeFileSync(authPath, JSON.stringify(newer));
+    if (scenario === 'both-local-files-changed') fs.writeFileSync(actualLocal, JSON.stringify(newer));
+    const localBefore = fs.readFileSync(actualLocal);
+    const kind = activeCredentialState(selected, instanceActive(selected, readPool(f.loc)), readPool(f.loc), f.loc).kind;
+    assert.equal(kind, 'local-auth-unpublished');
+    await assert.rejects(reprovisionActive(selected.instanceId, f.loc, f.env, {
+      processSnapshot: [], run: () => assert.fail('must not overwrite local credential'),
+    }), /CREDENTIAL_RECONCILIATION_LOCAL_AUTH_UNPUBLISHED/);
+    let verificationCount = 0;
+    const result = await reconcileActive(selected.instanceId, f.loc, f.env, {
+      verify: async (auth, id) => {
+        verificationCount++;
+        assert.equal(auth.tokens.account_id, id);
+        assert.equal(auth.tokens.access_token, 'fresh-local');
+        return true;
+      },
+    });
+    assert.equal(verificationCount, 1);
+    assert.equal(result.generation, before.generation + 1);
+    const after = readPool(f.loc).accounts.find(item => item.accountKey === key);
+    assert.equal(after.snapshotHash, digest(fs.readFileSync(authPath)));
+    assert.deepEqual(fs.readFileSync(snapshotPath(poolPaths(f.loc), key, before.generation)), oldPoolBytes);
+    assert.deepEqual(fs.readFileSync(actualLocal), localBefore);
+    if (otherSnapshot) {
+      assert.deepEqual(fs.readFileSync(otherSnapshot), otherBefore);
+      assert.equal(readProvisioned(f.loc).instances.default['key-b'].stale, true);
+    }
+    assert.equal(activeCredentialState(selected, instanceActive(selected, readPool(f.loc)), readPool(f.loc), f.loc).kind,
+      scenario === 'both-local-files-changed' ? 'current' : 'local-snapshot-behind-active');
+  });
+}
+
+test('verified older pool generation is the only applyable divergence', async t => {
+  const f = fixture(t);
+  migrateDefault(f.loc, f.env);
+  const selected = readInstances(f.loc, f.env).instances[0];
+  const updated = path.join(f.root, 'new.auth.json');
+  fs.writeFileSync(updated, JSON.stringify({ tokens: { account_id: 'account-a', access_token: 'new-pool' } }));
+  updateCredential('key-a', updated, f.loc, { verified: true });
+  assert.equal(activeCredentialState(selected, instanceActive(selected, readPool(f.loc)), readPool(f.loc), f.loc).kind,
+    'instance-behind-pool');
+  await reprovisionActive('default', f.loc, f.env, { processSnapshot: [], run: fakeAuthCalls([]) });
+  assert.equal(activeCredentialState(selected, instanceActive(selected, readPool(f.loc)), readPool(f.loc), f.loc).kind,
+    'current');
+});
+
+test('reconciliation rejects a competing pool publication before touching credentials', async t => {
+  const f = fixture(t);
+  migrateDefault(f.loc, f.env);
+  const selected = readInstances(f.loc, f.env).instances[0];
+  fs.writeFileSync(path.join(selected.codexHome, 'auth.json'), JSON.stringify({ tokens: {
+    account_id: 'account-a', access_token: 'local-fresh',
+  } }));
+  const competing = path.join(f.root, 'competing.auth.json');
+  fs.writeFileSync(competing, JSON.stringify({ tokens: { account_id: 'account-a', access_token: 'other-fresh' } }));
+  let verified = false;
+  await assert.rejects(reconcileActive('default', f.loc, f.env, {
+    beforeLock: () => updateCredential('key-a', competing, f.loc, { verified: true }),
+    verify: async () => { verified = true; return true; },
+  }), /POOL_CREDENTIAL_CHANGED_DURING_RECONCILIATION/);
+  assert.equal(verified, false);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(selected.codexHome, 'auth.json'))).tokens.access_token, 'local-fresh');
+});
+
+test('ambiguous identity and failed server validity never publish local credentials', async t => {
+  const f = fixture(t);
+  migrateDefault(f.loc, f.env);
+  const selected = readInstances(f.loc, f.env).instances[0];
+  const initial = readPool(f.loc).accounts[0];
+  writeProvisioned(f.loc, { version: 1, instances: { default: {
+    'key-a': { generation: initial.generation, stale: false },
+  } } });
+  fs.writeFileSync(path.join(selected.codexHome, 'auth.json'), JSON.stringify({ tokens: {
+    account_id: 'wrong-account', access_token: 'local-fresh',
+  } }));
+  await assert.rejects(reconcileActive('default', f.loc, f.env, { verify: async () => true }),
+    /INSTANCE_ACTIVE_ACCOUNT_UNVERIFIED/);
+  fs.writeFileSync(path.join(selected.codexHome, 'auth.json'), JSON.stringify({ tokens: {
+    account_id: 'account-a', access_token: 'local-fresh',
+  } }));
+  await assert.rejects(reconcileActive('default', f.loc, f.env, {
+    processSnapshot: [{ pid: 10, ppid: 1, startTicks: '1', exe: DESKTOP,
+      cmdline: `${DESKTOP} --user-data-dir=${selected.desktopProfile}`,
+      env: { CODEX_HOME: path.join(f.root, 'wrong-home') } }],
+    verify: async () => assert.fail('wrong home must not reach server'),
+  }), /INSTANCE_HOME_UNVERIFIED/);
+  await assert.rejects(reconcileActive('default', f.loc, f.env, { verify: async () => false }),
+    /LOCAL_CREDENTIAL_NOT_VERIFIED/);
+  assert.equal(readPool(f.loc).accounts[0].generation, initial.generation);
+});
+
+test('switch publishes a verified credential refreshed during codex-auth switch', async t => {
+  const f = fixture(t);
+  migrateDefault(f.loc, f.env);
+  const selected = readInstances(f.loc, f.env).instances[0];
+  const before = readPool(f.loc).accounts.find(item => item.accountKey === 'key-b');
+  const run = fakeAuthCalls([]);
+  const result = await provisionAccount('default', 'key-b', f.loc, f.env, {
+    processSnapshot: [], verify: async (auth, id) =>
+      auth.tokens.account_id === id && auth.tokens.access_token === 'refreshed-during-switch',
+    run: (command, args, options) => {
+      const outcome = run(command, args, options);
+      if (args[0] === 'switch') {
+        const authPath = path.join(selected.codexHome, 'auth.json');
+        const auth = JSON.parse(fs.readFileSync(authPath));
+        auth.tokens.access_token = 'refreshed-during-switch';
+        fs.writeFileSync(authPath, JSON.stringify(auth));
+      }
+      return outcome;
+    },
+  });
+  assert.equal(result.unchanged, false);
+  const member = readPool(f.loc).accounts.find(item => item.accountKey === 'key-b');
+  assert.equal(member.generation, before.generation + 1);
+  assert.equal(member.snapshotHash, digest(fs.readFileSync(path.join(selected.codexHome, 'auth.json'))));
+  assert.equal(activeCredentialState(selected, instanceActive(selected, readPool(f.loc)), readPool(f.loc), f.loc).kind,
+    'local-snapshot-behind-active');
 });

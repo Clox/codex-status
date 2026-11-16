@@ -447,6 +447,24 @@ const issues = [];
 const addIssue = (classification, source, explanation, details = {}) => {
   if (explanation) issues.push(problem({ classification, source, explanation, ...details }));
 };
+if (instanceView && !instanceViewError) {
+  try {
+    const { loc, pool, registry, activeByInstance } = instanceView;
+    const provisioned = readProvisioned(loc);
+    for (const instance of registry.instances) {
+      const activeKey = activeByInstance.get(instance.instanceId)?.accountKey;
+      const inactiveStale = Object.entries(provisioned.instances[instance.instanceId] || {})
+        .filter(([key, value]) => {
+          if (key === activeKey) return false;
+          const expected = pool?.accounts.find(account => account.accountKey === key)?.generation;
+          return value.stale === true || (expected && value.generation < expected);
+        });
+      if (inactiveStale.length) addIssue(DIAGNOSTIC, 'Inactive credential snapshots',
+        `${inactiveStale.length} inactive account snapshot${inactiveStale.length === 1 ? '' : 's'} stale; active credentials unaffected.`,
+        { subject: instance.displayName, state: 'inactive only', disposition: 'informational' });
+    }
+  } catch (error) { instanceViewError = error; }
+}
 if (!turnObserverHealth.healthy) addIssue(DIAGNOSTIC, 'Turn observer',
   'Turn-state är overifierat; observern försöker återhämta sig.',
   { errorKind: turnObserverHealth.errorKind, state: 'unverified',
@@ -654,7 +672,6 @@ let accountSelectionLines = [];
 try {
   if (instanceViewError) throw instanceViewError;
   const { loc, pool, registry, activeByInstance } = instanceView;
-  const provisioned = readProvisioned(loc);
   const instances = runningInstances(registry);
   const exhaustedAccountKeys = new Set(rankedRows
     .filter(row => row.accountKey && statusLabel(row) === 'EXHAU')
@@ -664,19 +681,19 @@ try {
       const account = active?.accountKey === 'unverified' ? 'unverified' :
         pool?.accounts.find(value => value.accountKey === active?.accountKey)?.email ||
         (active ? active.accountKey : 'not signed in');
-      const staleEntries = Object.entries(provisioned.instances[instance.instanceId] || {})
-        .filter(([key, value]) => {
-          const expected = pool?.accounts.find(item => item.accountKey === key)?.generation;
-          return value.stale === true || (expected && value.generation < expected);
-        });
-      const activeStale = pool && active && active.accountKey !== 'unverified' &&
-        activeCredentialState(instance, active, pool, loc).stale;
-      const stale = activeStale ? ' · credentials stale (I → P to apply)' :
-        staleEntries.length ? ` · ${staleEntries.length} credential${staleEntries.length === 1 ? '' : 's'} stale` : '';
+      const credential = pool && active && active.accountKey !== 'unverified'
+        ? activeCredentialState(instance, active, pool, loc) : null;
+      const stale = credential?.kind === 'instance-behind-pool' ? ' · credentials behind pool (I → P to apply)' :
+        credential?.kind === 'local-auth-unpublished' ? ' · local credentials unpublished (I → R to reconcile)' :
+        credential?.kind === 'local-snapshot-behind-active' ? ' · active credential published; local account snapshot differs' :
+        credential?.stale ? ' · credentials unverified' : '';
       const turns = instance.instanceId === 'default' && activeTurns.length ? ` · ${activeTurns.length} turns` : '';
       const line = `${index + 1}  ${instance.displayName} · ${account} · ${instance.roots.length ? 'running' : 'stopped'}${turns}${stale}` +
         `${instance.enabled ? '' : ' · disabled'}`;
-      return exhaustedAccountKeys.has(active?.accountKey) ? `\x1b[1;31m${line}\x1b[0m` : line;
+      const activeCredentialProblem = active?.accountKey === 'unverified' ||
+        credential?.kind === 'ambiguous' || credential?.kind === 'instance-behind-pool';
+      return exhaustedAccountKeys.has(active?.accountKey) || activeCredentialProblem
+        ? `\x1b[1;31m${line}\x1b[0m` : line;
     }).join('\n')}`;
   const selected = instances.find(value => value.instanceId === process.env.CODEX_SELECTED_INSTANCE_ID);
   if (selected) accountSelectionLines = [

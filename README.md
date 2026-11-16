@@ -116,16 +116,21 @@ from the pool is held back from another instance until repair or a future
 verified refresh handoff updates the pool. Auth repair updates the pool only
 after server verification and increments the generation; older provisioned
 copies are marked for reprovisioning rather than changed silently.
-The account table reports authentication for the pool's latest snapshot;
-the instance list separately reports `credentials stale` when a local copy
-is older. `[R]` can repair an account while it is active in an instance.
+The account table reports authentication for the pool's latest snapshot.
+The instance list distinguishes a copy proven older than the pool from an
+active credential changed locally after provisioning. `[R]` can repair an
+account while it is active in an instance.
 The `ACTION REQUIRED` section lists repairs and manual continuation decisions.
 Technical warnings and resolved events appear under `[D] Diagnostics`; the
 main view shows their count. Press `[D]` again to return. AUTO still reports its
 current RUNNING, WAIT, or BLOCKED state independently of that problem list.
 The repair leaves that instance's live auth untouched. Use `[I]` → `[P]`
-or `codex-instance apply-credentials rosetta` to import and activate the
-latest snapshot for the same account. A running instance is restarted only
+only when the instance is shown as behind the pool. Use `[I]` → `[R]` or
+`codex-instance reconcile-credentials ID` to verify changed active auth against
+the server and publish it as a new pool generation. Identity, server, and
+concurrent update checks must pass before publication. When active auth differs
+from its local account snapshot, reconciliation publishes the verified active
+auth and reports that the local snapshot still differs. A running instance is restarted only
 when its own turn observer verifies that no turns are active. The status window's
 secondary quota scans do not certify active-turn safety for credential
 application. A running secondary instance must still be stopped explicitly

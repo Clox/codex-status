@@ -12,7 +12,7 @@ const {
 } = require(path.join(__dirname, '..', 'lib', 'codex-instances'));
 const { readPool, migrateDefault, instanceActive, provisionAccount, poolPaths,
   accountLockPath, recordRelease, deleteInstanceWithAccounts, assignments,
-  assertCredentialAvailable, activeCredentialState, reprovisionActive } = require(path.join(__dirname, '..', 'lib', 'codex-account-pool'));
+  assertCredentialAvailable, activeCredentialState, reprovisionActive, reconcileActive } = require(path.join(__dirname, '..', 'lib', 'codex-account-pool'));
 
 const loc = locations();
 const [command = 'menu', instanceId, ...rest] = process.argv.slice(2);
@@ -29,8 +29,12 @@ function showList() {
     const account = active?.accountKey === 'unverified' ? 'unverified' :
       pool?.accounts.find(value => value.accountKey === active?.accountKey)?.email ||
       (active ? active.accountKey : 'not signed in');
-    const stale = pool && active && active.accountKey !== 'unverified' &&
-      activeCredentialState(instance, active, pool, loc).stale ? ' · credentials stale' : '';
+    const credential = pool && active && active.accountKey !== 'unverified'
+      ? activeCredentialState(instance, active, pool, loc) : null;
+    const stale = credential?.kind === 'instance-behind-pool' ? ' · credentials behind pool' :
+      credential?.kind === 'local-auth-unpublished' ? ' · local credentials unpublished' :
+      credential?.kind === 'local-snapshot-behind-active' ? ' · active credential published; local snapshot differs' :
+      credential?.stale ? ' · credentials unverified' : '';
     stdout.write(`${index + 1}  ${instance.displayName} (${instance.instanceId}) · ` +
       `${account} · ${instance.roots.length ? 'running' : 'stopped'}${stale}${instance.enabled ? '' : ' · disabled'}\n`);
   }
@@ -59,7 +63,7 @@ async function menu() {
     while (true) {
       stdout.write('\nINSTANCES:\n');
       showList();
-      const action = (await terminal.question('\n[L] List  [C] Create  [N] Rename  [A] Change account  [P] Apply credentials  [S] Start  [T] Stop  [E] Enable  [B] Disable  [U] Clear stale launch  [D] Delete  [Enter] Exit: ')).trim().toLowerCase();
+      const action = (await terminal.question('\n[L] List  [C] Create  [N] Rename  [A] Change account  [P] Apply credentials  [R] Reconcile credentials  [S] Start  [T] Stop  [E] Enable  [B] Disable  [U] Clear stale launch  [D] Delete  [Enter] Exit: ')).trim().toLowerCase();
       if (!action) return;
       if (action === 'l') continue;
       try {
@@ -82,6 +86,10 @@ async function menu() {
         } else if (action === 'p') {
           const outcome = await reprovisionActive(id, loc);
           stdout.write(outcome.unchanged ? 'Credentials already current.\n' : 'Latest pool credentials applied and verified.\n');
+        } else if (action === 'r') {
+          const outcome = await reconcileActive(id, loc);
+          stdout.write(outcome.unchanged ? 'Credentials already current.\n' :
+            `Local credentials server-verified and published as pool generation ${outcome.generation}.\n`);
         } else if (action === 's') {
           const launch = startInstance(id, loc);
           const root = await waitForRoot(launch.record);
@@ -153,6 +161,11 @@ async function main() {
   if (command === 'apply-credentials') {
     const outcome = await reprovisionActive(instanceId, loc);
     return void stdout.write(outcome.unchanged ? 'Credentials already current.\n' : 'Latest pool credentials applied and verified.\n');
+  }
+  if (command === 'reconcile-credentials') {
+    const outcome = await reconcileActive(instanceId, loc);
+    return void stdout.write(outcome.unchanged ? 'Credentials already current.\n' :
+      `Local credentials server-verified and published as pool generation ${outcome.generation}.\n`);
   }
   if (command === 'is-running') {
     const entry = list().find(value => value.instanceId === instanceId);
